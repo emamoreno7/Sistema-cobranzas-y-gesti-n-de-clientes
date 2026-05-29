@@ -22,6 +22,23 @@ import {
 import { BrandingFooter } from './components/BrandingFooter';
 import { DashboardLogsSistema } from './components/Dashboard';
 import { devWarn } from './utils/devConsole';
+import {
+  type Proveedor,
+  type InversionProveedor,
+  TASA_INVERSION_PROVEEDOR,
+  PLAZO_INVERSION_PROVEEDOR_DIAS,
+  CP_PROVEEDOR_TOKEN_KEY,
+  slugLoginProveedor,
+  generarPasswordProveedor,
+  calcularMontosInversion,
+  diasRestantesInversion,
+  loginProveedorLocal,
+  validarTokenProveedor,
+  fetchInversionesProveedorToken,
+  crearProveedorAdminRpc,
+  mapProveedorRow,
+  mapInversionRow,
+} from './proveedoresInversion';
 
 const MSJ_SESION_EXPIRADA_CLIENTE =
   'Tu sesión ha expirado. Por favor, vuelve a iniciar sesión para guardar los cambios.';
@@ -47,6 +64,11 @@ interface Cliente {
   apellido?: string; dni?: string;
   fechaNacimiento?: string;
   dniFrenteUrl?: string; dniDorsoUrl?: string;
+  /** Video corto del negocio (máx. 30 s); retención 30 días en storage. */
+  videoVerificacionUrl?: string;
+  videoVerificacionPath?: string;
+  videoVerificacionSubidoAt?: string;
+  videoVerificacionExpiraAt?: string;
   lat?: number; lng?: number; coordenadaErr?: string;
   saldo: number; quota: number; frecuencia: 'diaria' | 'semanal' | 'quincenal' | 'mensual';
   fechaAlta: string; activo: boolean; ultimaVisita?: string;
@@ -56,6 +78,8 @@ interface Cliente {
   orden_ruta?: number | null;
   /** Columna BD; útil para depurar visibilidad por cobrador / RLS. */
   cobrador_id?: string | null;
+  /** principal | mensual — aislamiento de cartera. */
+  ambito?: string;
 }
 
 function esUuidClienteId(v: unknown): boolean {
@@ -244,6 +268,7 @@ type ParamsRegistroCobranzaDirectaSupabase = {
   fecha_pago: string;
   cuota_numero: number;
   es_registro_no_pago?: boolean;
+  ambito?: string;
 };
 
 async function insertarDebugErrorSupabase(context: string, payload: unknown) {
@@ -353,6 +378,7 @@ async function registrarCobranzaDirectaSupabase(
     fecha_pago: params.fecha_pago,
     cuota_numero: nCuota,
     es_registro_no_pago: Boolean(params.es_registro_no_pago),
+    ambito: String(params.ambito ?? AMBITO_DATOS_PRINCIPAL).trim() || AMBITO_DATOS_PRINCIPAL,
   };
 
   dbgSupabaseTbl('pagos', 'insert', { cliente_id: clienteUuid, ficha_id: creditoUuid, cuota_numero: nCuota });
@@ -600,7 +626,44 @@ async function actualizarCreditoEstadoConReintentos(
   return { ok: false, error: lastErr };
 }
 
-type OpcionesGuardarCliente = { dniFiles?: { frente?: File; dorso?: File } };
+type OpcionesGuardarCliente = { dniFiles?: { frente?: File; dorso?: File }; videoNegocio?: File };
+
+const BUCKET_VIDEO_VERIFICACION_CLIENTE = 'clientes-videos-verificacion';
+const DIAS_RETENCION_VIDEO_CLIENTE = 30;
+const MAX_DURACION_VIDEO_CLIENTE_SEG = 30;
+const MAX_BYTES_VIDEO_CLIENTE = 25 * 1024 * 1024;
+
+class ErrorSubidaVideoCliente extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ErrorSubidaVideoCliente';
+  }
+}
+
+async function obtenerDuracionVideoSegundos(file: File): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      URL.revokeObjectURL(url);
+      resolve(Number.isFinite(video.duration) ? video.duration : 0);
+    };
+    video.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('No se pudo leer la duración del video.'));
+    };
+    video.src = url;
+  });
+}
+
+function videoVerificacionClienteVigente(cliente: Partial<Cliente> | null | undefined): boolean {
+  const url = String(cliente?.videoVerificacionUrl || '').trim();
+  if (!url) return false;
+  const exp = cliente?.videoVerificacionExpiraAt;
+  if (!exp) return true;
+  return new Date(String(exp)).getTime() >= Date.now();
+}
 
 /** Plan de vencimientos impreso en el dorso de la ficha / PDF. */
 type PlanPago = 'Diario' | 'Quincenal' | 'Mensual';
@@ -655,6 +718,7 @@ type LogAuditoriaRemoto = {
 };
 interface Config {
   moneda: string; simboloMoneda: string; moraPorciento: number; nombreEmpresa: string; telefonoEmpresa: string; direccionEmpresa: string; ruc: string; numeroWhatsappAdmin: string; interesCreditoM: number; interesCreditoP: number;
+  porcentajeComisionVendedor: number;
   modoExterior: boolean;
 }
 interface VisitaFallida { clienteId: string; fecha: string; hora: string; motivo: 'no_domicilio' | 'sin_dinero' | 'promesa_pago' | 'local_cerrado'; lat: number; lng: number; observaciones?: string; promesaFecha?: string; }
@@ -680,12 +744,23 @@ interface Credito {
   estado: 'PENDIENTE' | 'PENDIENTE_APROBACION' | 'ACTIVO' | 'VIGENTE' | 'APROBADO' | 'RECHAZADO' | 'FINALIZADO';
   interes_aplicado: number;
   created_at?: string;
-  /** A_FECHA: cuotas desde el día siguiente a la aprobación. POST_FECHA: desde fecha_inicio_cuotas_post. */
+  /** Referencia administrativa; cuotas en ruta desde día siguiente a la aprobación (A_FECHA). */
   inicio_cuotas_modo?: 'A_FECHA' | 'POST_FECHA' | string;
   fecha_inicio_cuotas_post?: string | null;
   cobrador_notif_email?: string | null;
   /** Auditoría: solicitud con fecha pasada (admin/root). */
   es_retroactivo?: boolean;
+  /** UUID/auth del vendedor que originó la venta (rol vendedor). */
+  vendedor_id?: string | null;
+  /** Comisión generada al aprobar el crédito. */
+  comision_vendedor?: number;
+  comision_liquidada?: boolean;
+}
+interface VendedorComisionResumen {
+  id: string;
+  username: string;
+  comision_acumulada: number;
+  creditos_pendientes: number;
 }
 interface PagoRegistro {
   id: string;
@@ -800,10 +875,21 @@ const genId = () => `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 const MARCA_PRIMARIA = 'DotCom';
 const MARCA_DESCRIPTOR = 'Sistema de Gestión';
 const MARCA_COMPLETA = `${MARCA_PRIMARIA} ${MARCA_DESCRIPTOR}`;
-const M: Config = { moneda: 'ARS', simboloMoneda: '$', moraPorciento: 2, nombreEmpresa: MARCA_COMPLETA, telefonoEmpresa: '+54 11 0000 0000', direccionEmpresa: 'Calle Principal 123', ruc: '00-00000000-0', numeroWhatsappAdmin: '', interesCreditoM: 30, interesCreditoP: 30, modoExterior: false };
+const M: Config = { moneda: 'ARS', simboloMoneda: '$', moraPorciento: 2, nombreEmpresa: MARCA_COMPLETA, telefonoEmpresa: '+54 11 0000 0000', direccionEmpresa: 'Calle Principal 123', ruc: '00-00000000-0', numeroWhatsappAdmin: '', interesCreditoM: 30, interesCreditoP: 30, porcentajeComisionVendedor: 5, modoExterior: false };
 const PLAN_SEMANAL_OPCIONES = [4, 6, 8, 10, 12, 17, 44];
 const PLAN_DIARIO_OPCIONES = [26, 39, 52, 65, 78, 117, 286];
 const PLAN_MENSUAL_OPCIONES = [3, 6, 9, 12, 18, 24];
+const AMBITO_DATOS_PRINCIPAL = 'principal';
+const AMBITO_DATOS_MENSUAL = 'mensual';
+const PAGINAS_MODULO_MENSUAL = new Set([
+  'dashboard', 'clientes', 'creditos', 'ruta', 'simulador_mensual', 'recibos_mensuales',
+]);
+
+function opcionesCantidadPlazoCredito(plazoUnidad: 'Días' | 'Semanas' | 'Meses'): number[] {
+  if (plazoUnidad === 'Días') return PLAN_DIARIO_OPCIONES;
+  if (plazoUnidad === 'Meses') return PLAN_MENSUAL_OPCIONES;
+  return PLAN_SEMANAL_OPCIONES;
+}
 
 function redondearPesos(n: number): number {
   return Math.round(Number(n) || 0);
@@ -937,6 +1023,10 @@ function mapClienteFilaSupabase(c: Record<string, unknown> | null | undefined): 
     direccion: String(row.direccion ?? ''),
     dniFrenteUrl: String(row.dni_frente_url ?? row.dniFrenteUrl ?? ''),
     dniDorsoUrl: String(row.dni_dorso_url ?? row.dniDorsoUrl ?? ''),
+    videoVerificacionUrl: String(row.video_verificacion_url ?? row.videoVerificacionUrl ?? ''),
+    videoVerificacionPath: row.video_verificacion_path != null ? String(row.video_verificacion_path) : '',
+    videoVerificacionSubidoAt: row.video_verificacion_subido_at != null ? String(row.video_verificacion_subido_at) : undefined,
+    videoVerificacionExpiraAt: row.video_verificacion_expira_at != null ? String(row.video_verificacion_expira_at) : undefined,
     lat: row.lat != null ? Number(row.lat) : undefined,
     lng: row.lng != null ? Number(row.lng) : undefined,
     saldo: Number(row.saldo ?? 0),
@@ -985,25 +1075,6 @@ function clienteTieneCreditoActivoEnRuta(clienteId: string, creditos: Credito[],
     if (resumenCuotasRutaCredito(c, pagos).enRuta) return true;
   }
   return false;
-}
-
-/** Misma visibilidad que un crédito del cobrador, usando `clientes.cobrador_id`. */
-function clienteEsDeCobradorParaRuta(
-  cli: Cliente,
-  rol: string | null | undefined,
-  authUserId: string | null | undefined,
-  user: string | null | undefined,
-  loginEmail: string | null | undefined,
-): boolean {
-  const cid = String(cli.cobrador_id ?? '').trim();
-  if (!cid) return false;
-  return creditoVisibleParaSesion(
-    { cobrador_id: cid, creado_por: cid } as Credito,
-    rol,
-    authUserId,
-    user,
-    loginEmail,
-  );
 }
 
 /** Crédito ficticio solo UI: permite listar en Ruta del Día al cliente de alta hoy sin crédito ACTIVO en planilla. */
@@ -1242,29 +1313,247 @@ function isRootLike(rol: string | null | undefined) {
 function puedeCargaRetroactivaCredito(rol: string | null | undefined) {
   return isAdminOrRoot(rol);
 }
+
+const MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO = 7;
+
+/** Validación al crear crédito: no más de 7 días hacia adelante desde hoy. */
+function validarFechaInicioCredito(fecha: string, puedeRetro: boolean): string | null {
+  const f = String(fecha || '').slice(0, 10);
+  if (!f) return 'Indicá la fecha de inicio del crédito.';
+  const h = hoy();
+  const maxFut = addDias(h, MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO);
+  if (!puedeRetro && f < h) return 'La fecha de inicio no puede ser anterior a hoy.';
+  if (f > h && f > maxFut) return `La fecha de inicio no puede ser más de ${MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO} días en el futuro.`;
+  return null;
+}
+
+/**
+ * Referencia para armar vencimientos de cuotas (no es la fecha de inicio del formulario salvo retroactivo).
+ * Cobro en ruta: primera cuota = día siguiente al alta/aprobación (fechaActivacion al aprobar).
+ */
+function fechaBasePlanCuotasCredito(credito: Credito, fechaActivacion?: string): string {
+  if (credito.es_retroactivo) {
+    return String(credito.fecha_inicio || hoy()).slice(0, 10);
+  }
+  if (fechaActivacion) return String(fechaActivacion).slice(0, 10);
+  if (credito.created_at) return String(credito.created_at).slice(0, 10);
+  return hoy();
+}
 function rolNormalizadoDb(r: string | null | undefined) {
   const v = (r || '').trim().toLowerCase();
-  if (v === 'admin' || v === 'cobrador' || v === 'super' || v === 'root') return v;
+  if (v === 'admin' || v === 'cobrador' || v === 'vendedor' || v === 'proveedor' || v === 'super' || v === 'root' || v === 'mensual') return v;
   return 'cobrador';
+}
+function esUsuarioMensualSesion(rol: string | null | undefined) {
+  return rolNormalizadoDb(rol) === 'mensual';
+}
+function ambitoDatosSesion(rol: string | null | undefined): typeof AMBITO_DATOS_PRINCIPAL | typeof AMBITO_DATOS_MENSUAL {
+  return esUsuarioMensualSesion(rol) ? AMBITO_DATOS_MENSUAL : AMBITO_DATOS_PRINCIPAL;
+}
+function esProveedorSesion(rol: string | null | undefined) {
+  return (rol || '').toLowerCase() === 'proveedor';
+}
+/** Cobrador o vendedor: ven solo su cartera / datos propios (no panel global como admin). */
+function esRolCampoRestringido(rol: string | null | undefined) {
+  const v = (rol || '').toLowerCase();
+  return v === 'cobrador' || v === 'vendedor';
+}
+function esVendedorSesion(rol: string | null | undefined) {
+  return (rol || '').toLowerCase() === 'vendedor';
+}
+function esUsuarioVendedorPorIdentidad(params: {
+  loginEmail: string | null | undefined;
+  usernameState: string | null | undefined;
+  rol: string | null | undefined;
+  authUser?: AuthMetaInput;
+}): boolean {
+  if (esVendedorSesion(params.rol)) return true;
+  const perfil = resolverPerfilDesdeSesion(params);
+  if (perfil?.rolDefecto === 'vendedor') return true;
+  const email = normalizarEmail(params.loginEmail);
+  return email.startsWith('vendedor@');
+}
+
+function idsReferenciaVendedor(v: { id: string; username: string; email?: string }): string[] {
+  const raw = [v.id, v.username, v.email, `${v.username}@emd.com`];
+  return [...new Set(raw.map(x => String(x ?? '').trim()).filter(Boolean))];
+}
+/** Sábado de corte de la semana en curso (liquidación semanal). */
+function sabadoCorteSemana(ref?: string): string {
+  const base = ref || hoy();
+  const d = new Date(`${base}T12:00:00`);
+  const dow = d.getDay();
+  const diasAtras = dow === 6 ? 0 : dow + 1;
+  return addDias(base, -diasAtras);
+}
+function proximoSabadoDesde(ref?: string): string {
+  const base = ref || hoy();
+  const d = new Date(`${base}T12:00:00`);
+  const dow = d.getDay();
+  if (dow === 6) return base;
+  return addDias(base, 6 - dow);
+}
+function calcularComisionVentaVendedor(montoSolicitado: number, porcentaje: number): number {
+  const capital = redondearPesos(Number(montoSolicitado) || 0);
+  const pct = Number(porcentaje) || 0;
+  if (capital <= 0 || pct <= 0) return 0;
+  return redondearPesos(capital * (pct / 100));
+}
+function creditoPerteneceAVendedor(c: Credito, vendedorIds: string[]): boolean {
+  const vid = String(c.vendedor_id ?? c.cobrador_id ?? c.creado_por ?? '').trim();
+  if (!vid) return false;
+  const set = new Set(vendedorIds.map(x => x.toLowerCase()));
+  if (set.has(vid.toLowerCase())) return true;
+  const emailNotif = String(c.cobrador_notif_email ?? '').trim().toLowerCase();
+  if (emailNotif && set.has(emailNotif)) return true;
+  const localNotif = emailNotif.includes('@') ? emailNotif.split('@')[0] : '';
+  if (localNotif && set.has(localNotif)) return true;
+  return false;
+}
+async function buscarUsuarioVendedorEnBd(vendedorAuthId: string, usernameHint: string) {
+  const local = String(usernameHint || '').trim().toLowerCase();
+  const id = String(vendedorAuthId || '').trim();
+  let q = supabase.from('usuarios').select('id, username, comision_acumulada').eq('rol', 'vendedor').eq('activo', true);
+  if (id && local) q = q.or(`id.eq.${id},username.eq.${local}`);
+  else if (id) q = q.eq('id', id);
+  else if (local) q = q.eq('username', local);
+  else return null;
+  const { data } = await q.limit(1).maybeSingle();
+  return data as { id: string; username: string; comision_acumulada: number } | null;
+}
+async function incrementarComisionAcumuladaVendedor(vendedorAuthId: string, usernameHint: string, monto: number) {
+  const usr = await buscarUsuarioVendedorEnBd(vendedorAuthId, usernameHint);
+  if (!usr) return;
+  const nueva = redondearPesos(Number(usr.comision_acumulada) + monto);
+  await supabase.from('usuarios').update({ comision_acumulada: nueva }).eq('id', usr.id);
 }
 function normalizarEmail(email: string | null | undefined) {
   return String(email ?? '').trim().toLowerCase();
 }
-
-/** Correos demo → nombre visible (login, header, reportes, cartones). */
-const ETIQUETA_USUARIO_POR_EMAIL: Record<string, string> = {
-  'emamoreno7@hotmail.com': 'MarcosP',
-  'cobrador1@emd.com': 'MatiasM',
-  'cobrador2@emd.com': 'Vendedor',
-};
-
-const ETIQUETA_USUARIO_POR_LOCAL: Record<string, string> = {
-  emamoreno7: 'MarcosP',
-  cobrador1: 'MatiasM',
-  cobrador2: 'Vendedor',
-};
+function normalizarLoginUsuario(raw: string | null | undefined) {
+  return String(raw ?? '').trim().toLowerCase();
+}
 
 type AuthMetaInput = { user_metadata?: Record<string, unknown> } | null | undefined;
+
+/** Perfiles del sistema: login visible + correo interno de Supabase Auth. */
+type PerfilUsuarioSistema = {
+  login: string;
+  authEmail: string;
+  nombre: string;
+  rolDefecto: 'root' | 'admin' | 'cobrador' | 'vendedor' | 'mensual';
+  esAdmin?: boolean;
+  accesoRapido?: boolean;
+  /** Username en tabla `usuarios` (puede diferir del login). */
+  usernameBd?: string;
+};
+
+const USUARIOS_SISTEMA: PerfilUsuarioSistema[] = [
+  { login: 'marcos', authEmail: 'emamoreno7@hotmail.com', nombre: 'Marcos', rolDefecto: 'root', esAdmin: true, accesoRapido: true, usernameBd: 'emamoreno7' },
+  { login: 'matias', authEmail: 'cobrador1@emd.com', nombre: 'Matias', rolDefecto: 'cobrador', accesoRapido: true, usernameBd: 'cobrador1' },
+  { login: 'vendedor', authEmail: 'cobrador2@emd.com', nombre: 'Vendedor', rolDefecto: 'vendedor', accesoRapido: true, usernameBd: 'cobrador2' },
+  { login: 'root', authEmail: 'root@emd.com', nombre: 'Root', rolDefecto: 'root', esAdmin: true, accesoRapido: true, usernameBd: 'root' },
+  { login: 'mensual', authEmail: 'mensual1@emd.com', nombre: 'Mensual', rolDefecto: 'mensual', accesoRapido: true, usernameBd: 'mensual' },
+];
+
+/** Alias legacy (correos viejos, MatiasM/MarcosP, cobrador1…) → login canónico. */
+const ALIAS_LOGIN_USUARIO: Record<string, string> = {
+  cobrador1: 'matias',
+  cobrador2: 'vendedor',
+  emamoreno7: 'marcos',
+  marcosp: 'marcos',
+  matiasm: 'matias',
+  mensaul: 'mensual',
+};
+
+const ETIQUETA_USUARIO_POR_EMAIL: Record<string, string> = Object.fromEntries(
+  USUARIOS_SISTEMA.map(u => [normalizarEmail(u.authEmail), u.nombre]),
+);
+
+const ETIQUETA_USUARIO_POR_LOCAL: Record<string, string> = Object.fromEntries(
+  USUARIOS_SISTEMA.flatMap(u => {
+    const filas: [string, string][] = [[u.login, u.nombre]];
+    if (u.usernameBd) filas.push([u.usernameBd.toLowerCase(), u.nombre]);
+    return filas;
+  }),
+);
+
+/** Textos guardados en BD con nombres anteriores. */
+const ETIQUETA_USUARIO_LEGACY: Record<string, string> = {
+  matiasm: 'Matias',
+  marcosp: 'Marcos',
+  cobrador1: 'Matias',
+  cobrador2: 'Vendedor',
+  emamoreno7: 'Marcos',
+};
+
+function resolverPerfilDesdeLoginCanonico(login: string): PerfilUsuarioSistema | null {
+  const k = normalizarLoginUsuario(login);
+  if (!k) return null;
+  const canon = ALIAS_LOGIN_USUARIO[k] ?? k;
+  return USUARIOS_SISTEMA.find(u => u.login === canon) ?? null;
+}
+
+function resolverPerfilDesdeAuthEmail(email: string | null | undefined): PerfilUsuarioSistema | null {
+  const e = normalizarEmail(email);
+  if (!e) return null;
+  return USUARIOS_SISTEMA.find(u => normalizarEmail(u.authEmail) === e) ?? null;
+}
+
+function resolverPerfilDesdeEntradaLogin(input: string | null | undefined): PerfilUsuarioSistema | null {
+  const raw = String(input ?? '').trim();
+  if (!raw) return null;
+  if (raw.includes('@')) return resolverPerfilDesdeAuthEmail(raw);
+  return resolverPerfilDesdeLoginCanonico(raw);
+}
+
+function resolverPerfilDesdeSesion(params: {
+  loginEmail: string | null | undefined;
+  usernameState: string | null | undefined;
+}): PerfilUsuarioSistema | null {
+  return resolverPerfilDesdeAuthEmail(params.loginEmail)
+    || resolverPerfilDesdeEntradaLogin(params.usernameState)
+    || null;
+}
+
+function loginDesdeAlmacenado(stored: string | null | undefined): string {
+  if (!stored) return '';
+  const perfil = resolverPerfilDesdeEntradaLogin(stored);
+  if (perfil) return perfil.login;
+  const s = stored.trim();
+  return s.includes('@') ? s.split('@')[0] : s;
+}
+
+function esUsuarioAdminLogin(stored: string | null | undefined): boolean {
+  const perfil = resolverPerfilDesdeEntradaLogin(String(stored ?? ''));
+  if (perfil?.esAdmin) return true;
+  const e = normalizarEmail(stored);
+  return e.includes('admin');
+}
+
+function idsReferenciaPerfil(perfil: PerfilUsuarioSistema | null): string[] {
+  if (!perfil) return [];
+  const local = perfil.authEmail.split('@')[0] || '';
+  return [...new Set([perfil.login, perfil.authEmail, local, perfil.usernameBd ?? ''].filter(Boolean))];
+}
+
+/** Vendedores conocidos (Auth/demo) aunque no existan aún en tabla `usuarios`. */
+const PERFILES_VENDEDOR_SISTEMA: { email: string; username: string }[] = USUARIOS_SISTEMA
+  .filter(u => u.rolDefecto === 'vendedor')
+  .map(u => ({ email: u.authEmail, username: u.usernameBd ?? u.login }));
+
+/** Accesos rápidos en login: admin ve todos; cobrador/vendedor solo el suyo. */
+function accesosRapidosLoginVisibles(): { label: string; login: string }[] {
+  const todos = USUARIOS_SISTEMA
+    .filter(u => u.accesoRapido)
+    .map(u => ({ label: u.nombre, login: u.login }));
+  if (typeof localStorage === 'undefined') return [];
+  const lastRaw = localStorage.getItem('cp_last_login_user');
+  const lastLogin = loginDesdeAlmacenado(lastRaw);
+  if (!lastLogin) return [];
+  if (esUsuarioAdminLogin(lastRaw) || esUsuarioAdminLogin(lastLogin)) return todos;
+  return todos.filter(a => a.login === lastLogin);
+}
 
 /** Nombre para saludo y cabecera: metadata Supabase, mapa demo, o parte local del correo. */
 function nombreParaMostrarSesion(params: {
@@ -1288,24 +1577,25 @@ function nombreParaMostrarSesion(params: {
   return u || 'Usuario';
 }
 
-/** MarcosP (admin): acceso total a aprobación de créditos, borrados y configuración avanzada. */
+/** Admin principal (Marcos): aprobación de créditos, borrados y configuración avanzada. */
 function esUsuarioMarcosP(params: {
   loginEmail: string | null | undefined;
   usernameState: string | null | undefined;
   authUser?: AuthMetaInput;
 }): boolean {
-  if (normalizarEmail(params.loginEmail) === 'emamoreno7@hotmail.com') return true;
-  return nombreParaMostrarSesion(params) === 'MarcosP';
+  const perfil = resolverPerfilDesdeSesion(params);
+  return perfil?.esAdmin === true;
 }
 
-/** Cobradores con reglas restringidas (MatiasM / Vendedor). */
+/** Cobradores / vendedores con reglas restringidas (no admin). */
 function esUsuarioCobradorMatiasOVendedor(params: {
   loginEmail: string | null | undefined;
   usernameState: string | null | undefined;
   authUser?: AuthMetaInput;
 }): boolean {
-  const t = nombreParaMostrarSesion(params);
-  return t === 'MatiasM' || t === 'Vendedor';
+  const perfil = resolverPerfilDesdeSesion(params);
+  if (!perfil || perfil.esAdmin) return false;
+  return perfil.rolDefecto === 'cobrador' || perfil.rolDefecto === 'vendedor';
 }
 
 /** Cobrador en movimientos, PDF, cartones, tablas (email, local o texto guardado). */
@@ -1318,6 +1608,7 @@ function etiquetaCobradorMovimiento(raw: string | null | undefined): string {
     return ETIQUETA_USUARIO_POR_EMAIL[n] || (s.includes('@') ? s.split('@')[0] : s);
   }
   if (ETIQUETA_USUARIO_POR_LOCAL[lower]) return ETIQUETA_USUARIO_POR_LOCAL[lower];
+  if (ETIQUETA_USUARIO_LEGACY[lower]) return ETIQUETA_USUARIO_LEGACY[lower];
   return s;
 }
 
@@ -1331,9 +1622,97 @@ function fichaIdUuid(raw: string | null | undefined): string {
   if (!s) return '';
   return s.toLowerCase();
 }
+async function verificarClaveModuloMensual(login: string, clave: string): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.rpc('verificar_clave_modulo_mensual', {
+      p_login: String(login ?? '').trim(),
+      p_clave: String(clave ?? ''),
+    });
+    if (error) {
+      devWarn('verificar_clave_modulo_mensual:', error);
+      return false;
+    }
+    return Boolean(data);
+  } catch {
+    return false;
+  }
+}
+
+/** Tras validar clave local, intenta signUp (solo si Auth no existe) y signIn con mensual1@emd.com. */
+async function provisionarAuthModuloMensual(authEmail: string, password: string): Promise<{ ok: boolean; error?: string }> {
+  const { error: signInFirstErr } = await supabase.auth.signInWithPassword({ email: authEmail, password });
+  if (!signInFirstErr) return { ok: true };
+
+  const { error: signUpErr } = await supabase.auth.signUp({
+    email: authEmail,
+    password,
+  });
+  if (signUpErr) {
+    const msg = String(signUpErr.message || '').toLowerCase();
+    const yaRegistrado = msg.includes('already registered') || msg.includes('already been registered')
+      || signUpErr.code === 'user_already_exists';
+    const emailInvalido = msg.includes('invalid') && msg.includes('email');
+    if (emailInvalido) {
+      return {
+        ok: false,
+        error: 'Supabase no acepta el correo automático. Creá manualmente en Authentication → Users: mensual1@emd.com con clave Emamoreno7 (Auto Confirm).',
+      };
+    }
+    if (!yaRegistrado) {
+      return { ok: false, error: signUpErr.message };
+    }
+  }
+  const { error: signInErr } = await supabase.auth.signInWithPassword({ email: authEmail, password });
+  if (signInErr) {
+    return {
+      ok: false,
+      error: 'Creá en Supabase Auth el usuario mensual1@emd.com con clave Emamoreno7 (Auto Confirm User activado).',
+    };
+  }
+  return { ok: true };
+}
+
+async function resolverRolUsuarioSesion(authUserId: string | null | undefined, email: string): Promise<string> {
+  const emailNorm = normalizarEmail(email);
+  const localPart = emailNorm.split('@')[0] || '';
+  const perfil = resolverPerfilDesdeAuthEmail(emailNorm);
+  const usernamesBd = [...new Set([localPart, perfil?.login, perfil?.usernameBd].filter(Boolean))] as string[];
+  try {
+    let query = supabase.from('usuarios').select('rol').eq('activo', true);
+    if (authUserId && usernamesBd.length) {
+      const orParts = [`id.eq.${authUserId}`, ...usernamesBd.map(u => `username.eq.${u}`)];
+      query = query.or(orParts.join(','));
+    } else if (authUserId) {
+      query = query.eq('id', authUserId);
+    } else if (usernamesBd.length === 1) {
+      query = query.eq('username', usernamesBd[0]);
+    } else if (usernamesBd.length > 1) {
+      query = query.or(usernamesBd.map(u => `username.eq.${u}`).join(','));
+    } else {
+      return rolNormalizadoDb(rolDesdeEmail(emailNorm));
+    }
+    const { data } = await query.limit(1).maybeSingle();
+    if (data?.rol) {
+      const rolDb = rolNormalizadoDb(String(data.rol));
+      const rolEmail = rolNormalizadoDb(rolDesdeEmail(emailNorm));
+      /** Correos vendedor demo prevalecen si en BD quedó rol cobrador por error. */
+      if (rolEmail === 'vendedor') return 'vendedor';
+      return rolDb;
+    }
+  } catch {
+    /* tabla usuarios opcional en algunos entornos */
+  }
+  return rolNormalizadoDb(rolDesdeEmail(emailNorm));
+}
+
 function rolDesdeEmail(email: string | null | undefined) {
+  const perfil = resolverPerfilDesdeAuthEmail(email);
+  if (perfil) return perfil.rolDefecto;
   const e = normalizarEmail(email);
-  if (e === 'emamoreno7@hotmail.com' || e.includes('admin') || e.includes('root')) return 'root';
+  if (e.endsWith('@proveedor.local')) return 'proveedor';
+  if (e.startsWith('mensual1@') || e.startsWith('mensual@')) return 'mensual';
+  if (e.includes('admin') || e.includes('root')) return 'root';
+  if (e.startsWith('vendedor@')) return 'vendedor';
   return 'cobrador';
 }
 
@@ -1369,15 +1748,15 @@ function addUnidad(fecha: string, unidad: 'Días' | 'Semanas' | 'Meses', cantida
   if (unidad === 'Meses') d.setMonth(d.getMonth() + cantidad);
   return d.toISOString().split('T')[0];
 }
-function generarPlanillaCredito(credito: Credito): CuotaPlanilla[] {
+function generarPlanillaCredito(credito: Credito, opts?: { fechaActivacion?: string }): CuotaPlanilla[] {
   const cuotas = Math.max(1, Number(credito.cuotas ?? credito.plazo_cantidad) || 1);
   const unidad = plazoUnidadPlanillaCredito(credito);
   const total = redondearPesos(Number(credito.monto_total ?? credito.total_con_interes) || 0);
   const montosPorCuota = distribuirMontoEnCuotas(total, cuotas);
-  const basePrimeraCuota = addDias(String(credito.fecha_inicio), 1);
+  const basePrimeraCuota = addDias(fechaBasePlanCuotasCredito(credito, opts?.fechaActivacion), 1);
   return Array.from({ length: cuotas }, (_, i) => {
     const nro = i + 1;
-    /** Primera cuota: siempre mañana; siguientes según unidad del plan. */
+    /** Primera cuota: día siguiente al alta/aprobación; siguientes según unidad del plan. */
     const vencimiento = nro === 1 ? basePrimeraCuota : addUnidad(basePrimeraCuota, unidad, nro - 1);
     const pagadoIncluyeEsta = montosPorCuota.slice(0, nro).reduce((s, m) => s + m, 0);
     const saldo = Math.max(0, total - pagadoIncluyeEsta);
@@ -1385,11 +1764,11 @@ function generarPlanillaCredito(credito: Credito): CuotaPlanilla[] {
   });
 }
 
-async function sincronizarCuotasCreditoSupabase(credito: Credito) {
+async function sincronizarCuotasCreditoSupabase(credito: Credito, opts?: { fechaActivacion?: string }) {
   const creditoUuidNorm = normalizarUuidPostgrest(credito.id);
   const clienteUuidNorm = normalizarUuidPostgrest(credito.cliente_id);
   if (!creditoUuidNorm || !clienteUuidNorm) return;
-  const planilla = generarPlanillaCredito(credito);
+  const planilla = generarPlanillaCredito(credito, opts);
   if (planilla.length === 0) return;
   const rows = planilla.map(c => ({
     credito_id: creditoUuidNorm,
@@ -1481,7 +1860,7 @@ function cuotasDeAtrasoCredito(credito: Credito, pagos: PagoRegistro[], hRef: st
   if (pendientes <= 0) return 0;
   const u = plazoUnidadPlanillaCredito(credito);
   if (u === 'Días') {
-    const dias = diasTranscurridosDesdeInicioExclDomingos(String(credito.fecha_inicio), hRef);
+    const dias = diasTranscurridosDesdeInicioExclDomingos(fechaBasePlanCuotasCredito(credito), hRef);
     return Math.max(0, Math.min(dias - pe.length, pendientes));
   }
   let c = 0;
@@ -1861,7 +2240,9 @@ function cobradorIdsParaFiltroSesion(session: { user?: { id?: string; email?: st
   } catch {
     username = '';
   }
-  return Array.from(new Set([uid, email, username].filter(Boolean)));
+  const perfil = resolverPerfilDesdeAuthEmail(email) || resolverPerfilDesdeEntradaLogin(username);
+  const extras = idsReferenciaPerfil(perfil);
+  return Array.from(new Set([uid, email, username, ...extras].filter(Boolean)));
 }
 
 /**
@@ -2250,6 +2631,19 @@ export default function App() {
   const [logsAuditoriaActor, setLogsAuditoriaActor] = useState('');
   const [logsAuditoriaCreditoId, setLogsAuditoriaCreditoId] = useState('');
   const [mCierreCajaResumen, setMCierreCajaResumen] = useState<string | null>(null);
+  const [proveedores, setProveedores] = useState<Proveedor[]>([]);
+  const [inversionesProveedor, setInversionesProveedor] = useState<InversionProveedor[]>([]);
+  const [proveedorLocal, setProveedorLocal] = useState<Proveedor | null>(null);
+  const [mNuevoProveedor, setMNuevoProveedor] = useState(false);
+  const [mCredencialesProveedor, setMCredencialesProveedor] = useState<{
+    nombre: string;
+    login: string;
+    password: string;
+  } | null>(null);
+  const [formNuevoProv, setFormNuevoProv] = useState({ nombre: '', login: '', telefono: '' });
+  const [formIngresoExt, setFormIngresoExt] = useState({ proveedorId: '', monto: '', nota: '', fecha: hoy() });
+  const [guardandoIngresoExt, setGuardandoIngresoExt] = useState(false);
+  const [guardandoProveedor, setGuardandoProveedor] = useState(false);
   const [mDetalleCliente, setMDetalleCliente] = useState<Cliente | null>(null);
   /** Tras aprobación / notificación: resaltar envío de cartón por WhatsApp para este crédito. */
   const [cartonDestacarCreditoId, setCartonDestacarCreditoId] = useState<string | null>(null);
@@ -2269,6 +2663,8 @@ export default function App() {
   const [mCreditoRevision, setMCreditoRevision] = useState<Credito | null>(null);
   /** Lista para el selector de cobrador en revisión (solo admin/root): `usuarios` con rol cobrador. */
   const [cobradoresRevision, setCobradoresRevision] = useState<Array<{ valor: string; label: string }>>([]);
+  const [vendedoresComisionAdmin, setVendedoresComisionAdmin] = useState<VendedorComisionResumen[]>([]);
+  const [liquidandoComisionId, setLiquidandoComisionId] = useState<string | null>(null);
   const [mPlanilla, setMPlanilla] = useState<{ tipo: 'ficha'; ficha: Ficha; cliente: Cliente } | { tipo: 'credito'; credito: Credito; cliente: Cliente | null } | null>(null);
   const [cartonSharePayload, setCartonSharePayload] = useState<CartonSharePayload | null>(null);
   const cartonShareRef = useRef<HTMLDivElement | null>(null);
@@ -2314,8 +2710,8 @@ export default function App() {
 
   /** Listas seguras para .map/.find (evita crash si el estado llegó null/undefined). */
   const clientesOrEmpty = Array.isArray(clientes) ? clientes : [];
-  const pagosOrEmpty = Array.isArray(pagos) ? pagos : [];
   const creditosOrEmpty = Array.isArray(creditos) ? creditos : [];
+  const pagosOrEmpty = Array.isArray(pagos) ? pagos : [];
   const visitasFallidasOrEmpty = Array.isArray(data.visitasFallidas) ? data.visitasFallidas : [];
   const fichasOrEmpty = Array.isArray(fichas) ? fichas : [];
   const notificacionesOrEmpty = Array.isArray(notificaciones) ? notificaciones : [];
@@ -2336,6 +2732,47 @@ export default function App() {
     }),
     [loginEmail, user, authUserMeta],
   );
+  const esUsuarioVendedorSesion = useMemo(
+    () => esUsuarioVendedorPorIdentidad({
+      loginEmail,
+      usernameState: user,
+      rol,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    }),
+    [loginEmail, user, rol, authUserMeta],
+  );
+  const esProveedorUsuario = useMemo(() => esProveedorSesion(rol), [rol]);
+  const esUsuarioMensualUsuario = useMemo(() => esUsuarioMensualSesion(rol), [rol]);
+  const proveedorSesion = useMemo(() => {
+    if (proveedorLocal) return proveedorLocal;
+    if (!esProveedorUsuario) return null;
+    const email = normalizarEmail(loginEmail);
+    return proveedores.find(p => normalizarEmail(p.auth_email) === email) ?? null;
+  }, [proveedorLocal, esProveedorUsuario, proveedores, loginEmail]);
+  const misInversionesProveedor = useMemo(() => {
+    if (!proveedorSesion) return [];
+    return inversionesProveedor.filter(i => i.proveedor_id === proveedorSesion.id && i.estado === 'activa');
+  }, [proveedorSesion, inversionesProveedor]);
+  const inversionesExternasAdmin = useMemo(() => {
+    return inversionesProveedor
+      .filter(i => i.estado === 'activa')
+      .map(inv => ({
+        ...inv,
+        proveedor: proveedores.find(p => p.id === inv.proveedor_id),
+      }));
+  }, [inversionesProveedor, proveedores]);
+
+  useEffect(() => {
+    if (esProveedorUsuario && page !== 'mi_inversion' && page !== 'login') {
+      setPage('mi_inversion');
+    }
+  }, [esProveedorUsuario, page]);
+
+  useEffect(() => {
+    if (esUsuarioMensualUsuario && page !== 'login' && !PAGINAS_MODULO_MENSUAL.has(page)) {
+      setPage('dashboard');
+    }
+  }, [esUsuarioMensualUsuario, page]);
 
   type SavePatch = Partial<AppMeta> & Partial<{ clientes: Cliente[]; fichas: Ficha[]; gastos: Gasto[] }>;
 
@@ -2376,6 +2813,23 @@ export default function App() {
   const fetchData = useCallback(async (): Promise<{ clientes: Cliente[] } | undefined> => {
     setLoading(true);
     try {
+      const provToken = typeof localStorage !== 'undefined' ? localStorage.getItem(CP_PROVEEDOR_TOKEN_KEY) : null;
+      let sesionLocalProveedor = false;
+      try {
+        const cp = typeof localStorage !== 'undefined' ? localStorage.getItem('cp_session') : null;
+        if (cp) {
+          const parsed = JSON.parse(cp) as { rol?: string; local?: boolean };
+          sesionLocalProveedor = parsed.rol === 'proveedor' && parsed.local === true;
+        }
+      } catch {
+        sesionLocalProveedor = false;
+      }
+      if (provToken && sesionLocalProveedor) {
+        const inv = await fetchInversionesProveedorToken(provToken);
+        setInversionesProveedor(inv);
+        return undefined;
+      }
+
       const { data: authWrap } = await supabase.auth.getSession();
       const session = authWrap?.session ?? null;
 
@@ -2387,19 +2841,37 @@ export default function App() {
         rolFetch = 'cobrador';
       }
 
-      /** Admin en panel: sin filtrar creditos por cobrador (usa rol en estado, localStorage y correo MarcosP). */
       const emailSesionFetch = normalizarEmail(session?.user?.email);
+      /** Admin en panel: sin filtrar por cobrador (usa rol en estado, localStorage y correo MarcosP). */
       const verTodosLosCreditos =
         isAdminOrRoot(rolFetch)
         || isAdminOrRoot(rol)
-        || emailSesionFetch === 'emamoreno7@hotmail.com';
+        || resolverPerfilDesdeAuthEmail(emailSesionFetch)?.esAdmin === true;
+
+      if (verTodosLosCreditos) {
+        void supabase.rpc('purge_videos_verificacion_clientes_expirados').then(({ error: errPurge }) => {
+          if (errPurge) devWarn('purge_videos_verificacion_clientes_expirados:', errPurge);
+        });
+      }
 
       const cobradorIdsFilter = !verTodosLosCreditos ? cobradorIdsParaFiltroSesion(session) : [];
-      let creditosQuery = supabase.from('creditos').select('*').order('created_at', { ascending: false });
-      if (!verTodosLosCreditos) {
+      const ambitoFetch = ambitoDatosSesion(rolFetch || rol);
+
+      /** Clientes: misma cartera para admin, cobrador y vendedor (sin filtro por rol). */
+      const clientesQuery = supabase.from('clientes').select('*').eq('ambito', ambitoFetch).order('created_at', { ascending: false });
+      let pagosQuery = supabase.from('pagos').select('*').eq('ambito', ambitoFetch).order('fecha_pago', { ascending: false });
+      let gastosQuery = supabase.from('gastos').select('*').order('fecha', { ascending: false });
+      let creditosQuery = supabase.from('creditos').select('*').eq('ambito', ambitoFetch).order('created_at', { ascending: false });
+      if (esUsuarioMensualSesion(rolFetch || rol)) {
+        gastosQuery = supabase.from('gastos').select('*').limit(0);
+      } else if (!verTodosLosCreditos) {
         if (cobradorIdsFilter.length === 0) {
+          pagosQuery = supabase.from('pagos').select('*').limit(0);
+          gastosQuery = supabase.from('gastos').select('*').limit(0);
           creditosQuery = supabase.from('creditos').select('*').limit(0);
         } else {
+          pagosQuery = pagosQuery.in('cobrador_id', cobradorIdsFilter);
+          gastosQuery = gastosQuery.in('cobrador_id', cobradorIdsFilter);
           creditosQuery = creditosQuery.in('cobrador_id', cobradorIdsFilter);
         }
       }
@@ -2412,11 +2884,11 @@ export default function App() {
         { data: gastosDb, error: gastosErr },
         { data: configDb, error: configErr },
       ] = await Promise.all([
-        supabase.from('clientes').select('*').order('created_at', { ascending: false }),
-        supabase.from('pagos').select('*').order('fecha_pago', { ascending: false }),
+        clientesQuery,
+        pagosQuery,
         creditosQuery,
         supabase.from('notificaciones').select('*').order('created_at', { ascending: false }),
-        supabase.from('gastos').select('*').order('fecha', { ascending: false }),
+        gastosQuery,
         supabase.from('configuracion').select('*').order('updated_at', { ascending: false }).limit(1).maybeSingle(),
       ]);
 
@@ -2462,6 +2934,9 @@ export default function App() {
           fecha_inicio_cuotas_post: c?.fecha_inicio_cuotas_post != null ? String(c.fecha_inicio_cuotas_post).slice(0, 10) : null,
           cobrador_notif_email: c?.cobrador_notif_email != null ? String(c.cobrador_notif_email).trim() : null,
           es_retroactivo: Boolean(c?.es_retroactivo),
+          vendedor_id: c?.vendedor_id != null ? String(c.vendedor_id) : null,
+          comision_vendedor: redondearPesos(Number(c?.comision_vendedor ?? 0)),
+          comision_liquidada: Boolean(c?.comision_liquidada),
         };
       }) : [];
       const pagosRaw = Array.isArray(pagosDb) ? (pagosDb as any[]) : [];
@@ -2557,11 +3032,13 @@ export default function App() {
         const cfg = configDb as any;
         const interesM = Number(cfg?.interes_credito_m ?? cfg?.interesCreditoM ?? cfg?.porcentaje_interes);
         const interesP = Number(cfg?.interes_credito_p ?? cfg?.interesCreditoP ?? cfg?.porcentaje_interes);
+        const pctComision = Number(cfg?.porcentaje_comision_vendedor ?? cfg?.porcentajeComisionVendedor);
         setData(prev => {
           const merged = {
             ...prev.config,
             ...(Number.isFinite(interesM) ? { interesCreditoM: interesM } : {}),
             ...(Number.isFinite(interesP) ? { interesCreditoP: interesP } : {}),
+            ...(Number.isFinite(pctComision) ? { porcentajeComisionVendedor: pctComision } : {}),
           };
           localStorage.setItem('cp_interes_credito_m', String(merged.interesCreditoM));
           localStorage.setItem('cp_interes_credito_p', String(merged.interesCreditoP));
@@ -2569,6 +3046,25 @@ export default function App() {
           localStorage.setItem('cp_data_v2', JSON.stringify(next));
           return next;
         });
+      }
+      try {
+        const { data: provDb, error: provErr } = await supabase
+          .from('proveedores')
+          .select('*')
+          .eq('activo', true)
+          .order('nombre');
+        if (!provErr && Array.isArray(provDb)) {
+          setProveedores(provDb.map(r => mapProveedorRow(r as Record<string, unknown>)));
+        }
+        const { data: invDb, error: invErr } = await supabase
+          .from('inversiones_proveedor')
+          .select('*')
+          .order('fecha_ingreso', { ascending: false });
+        if (!invErr && Array.isArray(invDb)) {
+          setInversionesProveedor(invDb.map(r => mapInversionRow(r as Record<string, unknown>)));
+        }
+      } catch {
+        /* tablas de proveedores opcionales hasta migración 017 */
       }
       return { clientes: mappedClientes };
     } catch (error) {
@@ -2684,6 +3180,7 @@ export default function App() {
       porcentaje_interes: Number(cNorm.interesCreditoP ?? cNorm.interesCreditoM ?? 0),
       interes_credito_m: Number(cNorm.interesCreditoM ?? 0),
       interes_credito_p: Number(cNorm.interesCreditoP ?? 0),
+      porcentaje_comision_vendedor: Number(cNorm.porcentajeComisionVendedor ?? 5),
       nombre_empresa: cNorm.nombreEmpresa,
       telefono_empresa: telefonoEmpresaNorm,
       direccion_empresa: cNorm.direccionEmpresa,
@@ -2706,12 +3203,40 @@ export default function App() {
 
   useEffect(() => {
     const run = async () => {
+      const provToken = typeof window !== 'undefined' ? localStorage.getItem(CP_PROVEEDOR_TOKEN_KEY) : null;
+      let cpLocal: { username?: string; rol?: string; local?: boolean } = {};
+      try {
+        const cpRaw = window.localStorage.getItem('cp_session');
+        if (cpRaw) cpLocal = JSON.parse(cpRaw) as typeof cpLocal;
+      } catch {
+        cpLocal = {};
+      }
+
+      if (provToken && cpLocal.local && cpLocal.rol === 'proveedor') {
+        const prov = await validarTokenProveedor(provToken);
+        if (prov) {
+          setProveedorLocal(prov);
+          setUser(prov.login);
+          setRol('proveedor');
+          setLoginEmail(prov.auth_email || null);
+          setAuthUserId(null);
+          setAuthUserMeta(null);
+          setPage('mi_inversion');
+          setSessionReady(true);
+          const inv = await fetchInversionesProveedorToken(provToken);
+          setInversionesProveedor(inv);
+          return;
+        }
+        localStorage.removeItem(CP_PROVEEDOR_TOKEN_KEY);
+      }
+
       const { data: sess } = await supabase.auth.getSession();
       const email = sess.session?.user?.email?.trim().toLowerCase();
       setAuthUserId(sess.session?.user?.id ?? null);
       setAuthUserMeta((sess.session?.user?.user_metadata as Record<string, unknown> | undefined) ?? null);
       if (!email) {
         localStorage.removeItem('cp_session');
+        setProveedorLocal(null);
         setUser(null);
         setAuthUserId(null);
         setAuthUserMeta(null);
@@ -2721,6 +3246,8 @@ export default function App() {
         setSessionReady(true);
         return;
       }
+      setProveedorLocal(null);
+      localStorage.removeItem(CP_PROVEEDOR_TOKEN_KEY);
       const sesionLocal = window.localStorage.getItem('cp_session');
       let local: { username?: string; rol?: string } = {};
       if (sesionLocal) {
@@ -2730,9 +3257,11 @@ export default function App() {
           local = {};
         }
       }
-      const rolUsuario = rolNormalizadoDb(local.rol || rolDesdeEmail(email));
-      const usernameSesion = ((local.username || email.split('@')[0]) || '').trim();
+      const rolUsuario = await resolverRolUsuarioSesion(sess.session?.user?.id ?? null, email);
+      const perfil = resolverPerfilDesdeAuthEmail(email);
+      const usernameSesion = (perfil?.login || local.username || email.split('@')[0] || '').trim();
       localStorage.setItem('cp_session', JSON.stringify({ username: usernameSesion, rol: rolUsuario }));
+      if (perfil?.login) localStorage.setItem('cp_last_login_user', perfil.login);
       setUser(usernameSesion);
       setRol(rolUsuario);
       setLoginEmail(email);
@@ -2783,7 +3312,7 @@ export default function App() {
       const { data, error } = await supabase
         .from('usuarios')
         .select('id, username')
-        .eq('rol', 'cobrador')
+        .in('rol', ['cobrador', 'vendedor'])
         .eq('activo', true)
         .order('username');
       if (cancelled) return;
@@ -2803,6 +3332,166 @@ export default function App() {
       cancelled = true;
     };
   }, [mCreditoRevision, esMarcosPUsuario]);
+
+  const fetchVendedoresComisionAdmin = useCallback(async () => {
+    if (!esMarcosPUsuario) {
+      setVendedoresComisionAdmin([]);
+      return;
+    }
+    const { data: vends, error } = await supabase
+      .from('usuarios')
+      .select('id, username, comision_acumulada')
+      .eq('rol', 'vendedor')
+      .eq('activo', true)
+      .order('username');
+    if (error) devWarn('fetch vendedores comisiones (usuarios):', error);
+
+    const porClave = new Map<string, { id: string; username: string; comision_acumulada: number }>();
+    for (const v of (vends ?? []) as Array<{ id: string; username: string; comision_acumulada: number }>) {
+      const username = String(v.username || '').trim();
+      if (!username) continue;
+      porClave.set(username.toLowerCase(), {
+        id: String(v.id),
+        username,
+        comision_acumulada: Number(v.comision_acumulada) || 0,
+      });
+    }
+    for (const perfil of PERFILES_VENDEDOR_SISTEMA) {
+      const username = perfil.username.trim();
+      if (!porClave.has(username.toLowerCase())) {
+        porClave.set(username.toLowerCase(), {
+          id: username,
+          username,
+          comision_acumulada: 0,
+        });
+      }
+    }
+    for (const c of creditosOrEmpty) {
+      const vid = String(c.vendedor_id ?? '').trim();
+      if (!vid) continue;
+      const usernameGuess = vid.includes('@') ? vid.split('@')[0] : vid;
+      const clave = usernameGuess.toLowerCase();
+      if (!porClave.has(clave)) {
+        porClave.set(clave, { id: vid, username: usernameGuess, comision_acumulada: 0 });
+      }
+    }
+
+    const resumen: VendedorComisionResumen[] = [...porClave.values()].map(v => {
+      const ids = idsReferenciaVendedor({ id: v.id, username: v.username, email: `${v.username}@emd.com` });
+      const creditosPend = creditosOrEmpty.filter(c =>
+        !c.comision_liquidada
+        && Number(c.comision_vendedor) > 0
+        && creditoPerteneceAVendedor(c, ids),
+      );
+      const sumCreditos = creditosPend.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0);
+      const acum = redondearPesos(Math.max(Number(v.comision_acumulada) || 0, sumCreditos));
+      return {
+        id: String(v.id),
+        username: String(v.username),
+        comision_acumulada: acum,
+        creditos_pendientes: creditosPend.length,
+      };
+    }).sort((a, b) => b.comision_acumulada - a.comision_acumulada);
+
+    setVendedoresComisionAdmin(resumen);
+  }, [esMarcosPUsuario, creditosOrEmpty]);
+
+  useEffect(() => {
+    if (!user || !esMarcosPUsuario) return;
+    void fetchVendedoresComisionAdmin();
+  }, [user, esMarcosPUsuario, fetchVendedoresComisionAdmin, creditosOrEmpty.length]);
+
+  const miResumenComisionVendedor = useMemo(() => {
+    if (!esUsuarioVendedorSesion) return null;
+    const ids = cobradorIdsParaFiltroSesion(
+      loginEmail ? { user: { id: authUserId ?? undefined, email: loginEmail } } : null,
+    );
+    const pendientes = creditosOrEmpty.filter(c =>
+      !c.comision_liquidada
+      && Number(c.comision_vendedor) > 0
+      && creditoPerteneceAVendedor(c, ids),
+    );
+    const total = redondearPesos(pendientes.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0));
+    return {
+      total,
+      pendientes,
+      corteSemana: sabadoCorteSemana(),
+      proximoSabado: proximoSabadoDesde(),
+    };
+  }, [esUsuarioVendedorSesion, creditosOrEmpty, authUserId, loginEmail]);
+
+  const handleLiquidarComisionVendedor = useCallback(async (v: VendedorComisionResumen) => {
+    if (!esMarcosPUsuario) return;
+    if (v.comision_acumulada <= 0) {
+      alert('Este vendedor no tiene comisiones pendientes de liquidar.');
+      return;
+    }
+    const ok = window.confirm(
+      `¿Liquidar ${fmt(v.comision_acumulada)} de comisiones a ${etiquetaCobradorMovimiento(v.username)}?\n`
+      + 'Se registrará el pago, se reiniciará el acumulado y quedará historial de la semana.',
+    );
+    if (!ok) return;
+    setLiquidandoComisionId(v.id);
+    try {
+      const ids = idsReferenciaVendedor({ id: v.id, username: v.username, email: `${v.username}@emd.com` });
+      const creditosPend = creditosOrEmpty.filter(c =>
+        !c.comision_liquidada && Number(c.comision_vendedor) > 0 && creditoPerteneceAVendedor(c, ids),
+      );
+      const montoTotal = redondearPesos(
+        creditosPend.length > 0
+          ? creditosPend.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0)
+          : v.comision_acumulada,
+      );
+      const actor = nombreParaMostrarSesion({
+        loginEmail,
+        usernameState: user,
+        authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+      });
+      const semanaCorte = sabadoCorteSemana();
+      const { error: insErr } = await supabase.from('liquidaciones_comision_vendedor').insert([{
+        vendedor_id: v.id,
+        vendedor_username: v.username,
+        semana_corte: semanaCorte,
+        monto_total: montoTotal,
+        cantidad_creditos: creditosPend.length,
+        pagado_por: actor || 'Marcos',
+        notas: `Liquidación semanal — corte ${semanaCorte}`,
+      }]);
+      if (insErr) throw insErr;
+      if (creditosPend.length > 0) {
+        const idsCred = creditosPend.map(c => fichaIdUuid(c.id)).filter(Boolean);
+        for (const cid of idsCred) {
+          await supabase.from('creditos').update({ comision_liquidada: true }).eq('id', cid);
+        }
+      }
+      await supabase.from('usuarios').update({ comision_acumulada: 0 }).or(`id.eq.${v.id},username.eq.${v.username}`);
+      const emailVendedor = resolverPerfilDesdeEntradaLogin(v.username)?.authEmail
+        ?? `${String(v.username).trim().toLowerCase()}@emd.com`;
+      try {
+        await supabase.from('notificaciones').insert([{
+          titulo: 'Comisión liquidada',
+          mensaje: `Se registró el pago de ${fmt(montoTotal)} por tus ventas (corte semana ${semanaCorte}). El acumulado pendiente fue reiniciado.`,
+          destinatario_rol: 'vendedor',
+          destinatario_usuario: normalizarEmail(emailVendedor),
+          leido: false,
+        }]);
+      } catch {
+        /* aviso opcional */
+      }
+      await fetchData();
+      await fetchVendedoresComisionAdmin();
+      audit('CONFIG_CAMBIO', `Comisión liquidada a ${v.username}: ${fmt(montoTotal)} (corte ${semanaCorte})`);
+      alert(`Comisión liquidada: ${fmt(montoTotal)}. El acumulado del vendedor fue reiniciado.`);
+    } catch (e: unknown) {
+      console.error('handleLiquidarComisionVendedor:', e);
+      alert('No se pudo registrar la liquidación. Revisá la conexión o ejecutá la migración de comisiones en Supabase.');
+    } finally {
+      setLiquidandoComisionId(null);
+    }
+  }, [
+    esMarcosPUsuario, creditosOrEmpty, loginEmail, user, authUserMeta,
+    fetchData, fetchVendedoresComisionAdmin, audit,
+  ]);
 
   /** Una vez al día: inserta en Supabase registros $0 de no pago para cuotas vencidas sin cobro efectivo (idempotente con índice único). */
   useEffect(() => {
@@ -3042,7 +3731,7 @@ export default function App() {
         break;
     }
     return list;
-  }, [clientes, search, filterStatus]);
+  }, [clientesOrEmpty, search, filterStatus]);
 
   const getFichasCliente = useCallback((id: string) => fichasOrEmpty.filter(f => normalizarId(f.clienteId) === normalizarId(id)), [fichasOrEmpty]);
 
@@ -3383,46 +4072,122 @@ export default function App() {
     setLoading(true);
     const usernameTrim = username.trim();
     const passwordTrim = password.trim();
-    const normalized = usernameTrim.toLowerCase();
-    // Email explícito si el usuario pegó un correo; si no, reglas legacy compatibles con accesos rápidos.
-    const authEmail = usernameTrim.includes('@')
-      ? usernameTrim.toLowerCase()
-      : normalized === 'emamoreno7'
-        ? 'emamoreno7@hotmail.com'
-        : `${usernameTrim}@emd.com`.toLowerCase();
-    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-      email: authEmail,
-      password: passwordTrim,
-    });
-    if (authError) {
-      console.error('Supabase login error:', authError.message, authError.code);
-      audit('LOGIN_FAILED', `Login fallido: ${usernameTrim}`);
-      await logAuditDb('LOGIN_FAILED', `Login fallido: ${usernameTrim}`);
+    const perfilLogin = resolverPerfilDesdeEntradaLogin(usernameTrim);
+
+    if (perfilLogin) {
+      const authEmail = perfilLogin.authEmail;
+      let authData: Awaited<ReturnType<typeof supabase.auth.signInWithPassword>>['data'] | null = null;
+      let authError: Awaited<ReturnType<typeof supabase.auth.signInWithPassword>>['error'] | null = null;
+
+      const intentoAuth = await supabase.auth.signInWithPassword({
+        email: authEmail,
+        password: passwordTrim,
+      });
+      authData = intentoAuth.data;
+      authError = intentoAuth.error;
+
+      if (authError && perfilLogin.rolDefecto === 'mensual') {
+        let claveLocalOk = await verificarClaveModuloMensual(usernameTrim, passwordTrim);
+        if (!claveLocalOk) {
+          const loginNorm = normalizarLoginUsuario(usernameTrim);
+          const canon = ALIAS_LOGIN_USUARIO[loginNorm] ?? loginNorm;
+          if (canon === 'mensual' && passwordTrim === 'Emamoreno7') claveLocalOk = true;
+        }
+        if (claveLocalOk) {
+          const prov = await provisionarAuthModuloMensual(authEmail, passwordTrim);
+          if (prov.ok) {
+            const reintento = await supabase.auth.signInWithPassword({
+              email: authEmail,
+              password: passwordTrim,
+            });
+            authData = reintento.data;
+            authError = reintento.error;
+          } else {
+            alert(prov.error || 'No se pudo activar la cuenta mensual en Auth.');
+            setLoading(false);
+            return;
+          }
+        }
+      }
+
+      if (authError) {
+        console.error('Supabase login error:', authError.message, authError.code);
+        audit('LOGIN_FAILED', `Login fallido: ${usernameTrim}`);
+        await logAuditDb('LOGIN_FAILED', `Login fallido: ${usernameTrim}`);
+        if (perfilLogin.rolDefecto === 'mensual') {
+          alert(
+            'Credenciales incorrectas para el módulo mensual.\n\n'
+            + 'Usuario: mensual\nClave: Emamoreno7\n\n'
+            + 'Si persiste, ejecutá las migraciones 021–023 y creá en Auth el usuario mensual1@emd.com con clave Emamoreno7.',
+          );
+        } else {
+          alert('Credenciales incorrectas');
+        }
+        setLoading(false);
+        return;
+      }
+      const { data: loginSessionData } = await supabase.auth.getSession();
+      const loginToken = loginSessionData.session?.access_token ?? null;
+      if (!loginSessionData.session || !loginToken) {
+        alert('No se pudo establecer la sesión autenticada. Iniciá sesión nuevamente.');
+        setLoading(false);
+        return;
+      }
+      localStorage.removeItem(CP_PROVEEDOR_TOKEN_KEY);
+      setProveedorLocal(null);
+      const authUserEmail = (authData?.user?.email || authEmail).toLowerCase();
+      const perfilSesion = perfilLogin || resolverPerfilDesdeAuthEmail(authUserEmail);
+      let rolUsuario = await resolverRolUsuarioSesion(authData?.user?.id ?? null, authUserEmail);
+      if (perfilLogin.rolDefecto === 'mensual') rolUsuario = 'mensual';
+      const usernameSesion = (perfilSesion?.login || normalizarLoginUsuario(usernameTrim) || authUserEmail.split('@')[0]).trim();
+      const u = { username: usernameSesion, rol: rolUsuario };
+      localStorage.setItem('cp_last_login_user', usernameSesion);
+      localStorage.setItem('cp_session', JSON.stringify(u));
+      setUser(usernameSesion);
+      setRol(rolUsuario);
+      setLoginEmail(authUserEmail);
+      setPage('dashboard');
+      setAuthUserMeta((authData?.user?.user_metadata as Record<string, unknown> | undefined) ?? null);
+      const { data: s2 } = await supabase.auth.getSession();
+      setAuthUserId(s2.session?.user?.id ?? null);
+      await fetchData();
+      audit('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
+      await logAuditDb('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
+      setLoading(false);
+      return;
+    }
+
+    const provOk = await loginProveedorLocal(usernameTrim, passwordTrim);
+    if (!provOk) {
+      audit('LOGIN_FAILED', `Login proveedor fallido: ${usernameTrim}`);
       alert('Credenciales incorrectas');
       setLoading(false);
       return;
     }
-    const { data: loginSessionData } = await supabase.auth.getSession();
-    const loginToken = loginSessionData.session?.access_token ?? null;
-    if (!loginSessionData.session || !loginToken) {
-      alert('No se pudo establecer la sesión autenticada. Iniciá sesión nuevamente.');
-      setLoading(false);
-      return;
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      /* sin sesión Auth previa */
     }
-    const authUserEmail = (authData?.user?.email || authEmail).toLowerCase();
-    const authUsernameBase = authUserEmail.split('@')[0];
-    const rolUsuario = rolNormalizadoDb(rolDesdeEmail(authUserEmail));
-    const usernameSesion = (authUsernameBase || usernameTrim).trim();
-    const u = { username: usernameSesion, rol: rolUsuario };
-    localStorage.setItem('cp_last_login_user', authEmail);
-    localStorage.setItem('cp_session', JSON.stringify(u));
-    setUser(usernameSesion); setRol(rolUsuario); setLoginEmail(authUserEmail); setPage('dashboard');
-    setAuthUserMeta((authData?.user?.user_metadata as Record<string, unknown> | undefined) ?? null);
-    const { data: s2 } = await supabase.auth.getSession();
-    setAuthUserId(s2.session?.user?.id ?? null);
-    await fetchData();
-    audit('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
-    await logAuditDb('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
+    localStorage.setItem(CP_PROVEEDOR_TOKEN_KEY, provOk.token);
+    localStorage.setItem('cp_last_login_user', provOk.login);
+    localStorage.setItem('cp_session', JSON.stringify({ username: provOk.login, rol: 'proveedor', local: true }));
+    setProveedorLocal({
+      id: provOk.proveedor_id,
+      nombre: provOk.nombre,
+      login: provOk.login,
+      auth_email: `${provOk.login}@proveedor.local`,
+      activo: true,
+    });
+    setUser(provOk.login);
+    setRol('proveedor');
+    setLoginEmail(null);
+    setAuthUserId(null);
+    setAuthUserMeta(null);
+    setPage('mi_inversion');
+    const inv = await fetchInversionesProveedorToken(provOk.token);
+    setInversionesProveedor(inv);
+    audit('LOGIN_SUCCESS', `Login proveedor: ${provOk.login}`);
     setLoading(false);
   };
 
@@ -3479,6 +4244,56 @@ export default function App() {
     const { data } = supabase.storage.from('clientes-documentos').getPublicUrl(path);
     return data.publicUrl;
   }, []);
+  const subirVideoVerificacionCliente = useCallback(async (
+    file: File,
+    clienteId: string,
+    pathAnterior?: string | null,
+  ) => {
+    if (file.size > MAX_BYTES_VIDEO_CLIENTE) {
+      throw new ErrorSubidaVideoCliente('El video no puede superar 25 MB.');
+    }
+    const duracion = await obtenerDuracionVideoSegundos(file);
+    if (duracion <= 0 || duracion > MAX_DURACION_VIDEO_CLIENTE_SEG + 0.5) {
+      const seg = duracion > 0 ? Math.ceil(duracion) : '?';
+      throw new ErrorSubidaVideoCliente(
+        `El video debe durar como máximo ${MAX_DURACION_VIDEO_CLIENTE_SEG} segundos (detectado: ${seg}s).`,
+      );
+    }
+    const cid = String(clienteId).trim();
+    if (!esUuidClienteId(cid)) {
+      throw new ErrorSubidaVideoCliente('El cliente aún no tiene UUID válido para subir el video.');
+    }
+    const ext = (file.name.split('.').pop() || 'mp4').toLowerCase();
+    const path = `public/negocio/${cid}/video_${Date.now()}.${ext}`;
+    const pathPrev = String(pathAnterior || '').trim();
+    if (pathPrev) {
+      await supabase.storage.from(BUCKET_VIDEO_VERIFICACION_CLIENTE).remove([pathPrev]);
+    }
+    const { error } = await supabase.storage.from(BUCKET_VIDEO_VERIFICACION_CLIENTE).upload(path, file, {
+      upsert: false,
+      contentType: file.type || 'video/mp4',
+    });
+    if (error) throw error;
+    const { data } = supabase.storage.from(BUCKET_VIDEO_VERIFICACION_CLIENTE).getPublicUrl(path);
+    const subidoAt = new Date().toISOString();
+    const expiraAt = new Date(Date.now() + DIAS_RETENCION_VIDEO_CLIENTE * 86400000).toISOString();
+    return { url: data.publicUrl, path, subidoAt, expiraAt };
+  }, []);
+  const persistirVideoVerificacionCliente = useCallback(async (
+    clienteId: string,
+    file: File,
+    pathAnterior?: string | null,
+  ) => {
+    const meta = await subirVideoVerificacionCliente(file, clienteId, pathAnterior);
+    const { error } = await supabase.from('clientes').update({
+      video_verificacion_url: meta.url,
+      video_verificacion_path: meta.path,
+      video_verificacion_subido_at: meta.subidoAt,
+      video_verificacion_expira_at: meta.expiraAt,
+    } as any).eq('id', clienteId);
+    if (error) throw error;
+    return meta;
+  }, [subirVideoVerificacionCliente]);
   const handleSaveCliente = async (cli: Partial<Cliente>, opts?: OpcionesGuardarCliente) => {
     const toNullableDate = (v: unknown) => {
       if (v === '' || v === undefined || v === null) return null;
@@ -3493,10 +4308,15 @@ export default function App() {
       direccion: c?.direccion ?? '',
       dni_frente_url: c?.dniFrenteUrl ?? null,
       dni_dorso_url: c?.dniDorsoUrl ?? null,
+      video_verificacion_url: c?.videoVerificacionUrl ?? null,
+      video_verificacion_path: c?.videoVerificacionPath ?? null,
+      video_verificacion_subido_at: c?.videoVerificacionSubidoAt ?? null,
+      video_verificacion_expira_at: c?.videoVerificacionExpiraAt ?? null,
       cobrador_id: cobradorId,
       orden_ruta: c?.orden_ruta != null && Number.isFinite(Number(c.orden_ruta)) ? Math.round(Number(c.orden_ruta)) : null,
       lat: c?.lat != null && Number.isFinite(Number(c.lat)) ? Number(c.lat) : null,
       lng: c?.lng != null && Number.isFinite(Number(c.lng)) ? Number(c.lng) : null,
+      ambito: c?.ambito ?? ambitoDatosSesion(rol),
     });
     const actualizarClienteSupabase = async (row: ReturnType<typeof toClienteRow>, cliId: string) => {
       const { error } = await supabase.from('clientes').update(row as any).eq('id', cliId);
@@ -3654,6 +4474,29 @@ export default function App() {
       save({ clientes: clientesOrEmpty.map(c => c.id === cliId ? { ...c, ...cliG } : c) });
       audit('CLIENTE_EDITADO', `Cliente editado: ${cliG.nombre}`, gpsPos || undefined);
       void logAuditDb('CLIENTE_EDITADO', `Cliente editado: ${cliG.nombre}`);
+      if (opts?.videoNegocio) {
+        try {
+          const prevVid = clientesOrEmpty.find(c => c.id === cliId);
+          const metaVid = await persistirVideoVerificacionCliente(cliId, opts.videoNegocio, prevVid?.videoVerificacionPath);
+          save({
+            clientes: clientesOrEmpty.map(c => c.id === cliId ? {
+              ...c,
+              ...cliG,
+              videoVerificacionUrl: metaVid.url,
+              videoVerificacionPath: metaVid.path,
+              videoVerificacionSubidoAt: metaVid.subidoAt,
+              videoVerificacionExpiraAt: metaVid.expiraAt,
+            } : c),
+          });
+        } catch (eVid) {
+          console.error('[Cliente save] Upload video failed:', eVid);
+          alert(
+            eVid instanceof ErrorSubidaVideoCliente
+              ? eVid.message
+              : 'Cliente guardado, pero no se pudo subir el video del negocio. Podés reintentarlo editando la ficha.',
+          );
+        }
+      }
       await fetchData();
       cerrarModalPostGuardado = true;
     } else {
@@ -3765,6 +4608,25 @@ export default function App() {
         }
 
         await refetchClientesSupabase(nuevoDesdeSupabase);
+        if (opts?.videoNegocio) {
+          try {
+            const metaVid = await persistirVideoVerificacionCliente(idReal, opts.videoNegocio);
+            nuevoDesdeSupabase = {
+              ...nuevoDesdeSupabase,
+              videoVerificacionUrl: metaVid.url,
+              videoVerificacionPath: metaVid.path,
+              videoVerificacionSubidoAt: metaVid.subidoAt,
+              videoVerificacionExpiraAt: metaVid.expiraAt,
+            };
+          } catch (eVid) {
+            console.error('[Cliente save] Upload video failed (alta):', eVid);
+            alert(
+              eVid instanceof ErrorSubidaVideoCliente
+                ? `${eVid.message} El cliente sí quedó guardado; podés subir el video editando la ficha.`
+                : 'Cliente guardado, pero no se pudo subir el video del negocio. Podés reintentarlo editando la ficha.',
+            );
+          }
+        }
         await fetchData();
         setClientes(prev => mergeClienteAlInicioSiFalta(Array.isArray(prev) ? prev : [], nuevoDesdeSupabase));
 
@@ -3784,7 +4646,7 @@ export default function App() {
 
   const handleDeleteCliente = (id: string) => {
     if (!esMarcosPUsuario) {
-      alert('Solo el administrador MarcosP puede eliminar clientes.');
+      alert('Solo el administrador puede eliminar clientes.');
       return;
     }
     if (confirm('¿Eliminar cliente?')) {
@@ -4016,7 +4878,7 @@ export default function App() {
 
   const handleDeleteFicha = (id: string) => {
     if (!esMarcosPUsuario) {
-      alert('Solo el administrador MarcosP puede eliminar fichas.');
+      alert('Solo el administrador puede eliminar fichas.');
       return;
     }
     if (confirm('Eliminar esta ficha?')) {
@@ -4201,6 +5063,7 @@ export default function App() {
       fecha_pago: fechaPago,
       cuota_numero: cuotaNumeroPago,
       es_registro_no_pago: false,
+      ambito: ambitoDatosSesion(rol),
     }, 3);
     if (!insPago.ok) {
       if (esErrorSesionSupabase(insPago.error)) {
@@ -4411,7 +5274,7 @@ export default function App() {
   };
   const handleEliminarPago = ( ficha: Ficha, idx: number ) => {
     if (!esMarcosPUsuario) {
-      alert('Solo el administrador MarcosP puede eliminar pagos registrados.');
+      alert('Solo el administrador puede eliminar pagos registrados.');
       return;
     }
     if (!confirm('Eliminar este pago?')) return;
@@ -4468,11 +5331,112 @@ export default function App() {
 
   const handleDeleteGasto = (id: string) => {
     if (!esMarcosPUsuario) {
-      alert('Solo el administrador MarcosP puede eliminar gastos.');
+      alert('Solo el administrador puede eliminar gastos.');
       return;
     }
     if (confirm('Eliminar gasto?')) { save({ gastos: gastos.filter(g => g.id !== id) }); audit('GASTO_ELIMINADO', `Gasto eliminado ID: ${id}`); }
   };
+
+  const handleCrearProveedor = async () => {
+    if (!esMarcosPUsuario) return;
+    const nombre = formNuevoProv.nombre.trim();
+    if (!nombre) { alert('Ingresá el nombre del proveedor.'); return; }
+    const loginBase = formNuevoProv.login.trim() || slugLoginProveedor(nombre);
+    const login = normalizarLoginUsuario(loginBase).replace(/[^a-z0-9_]/g, '_').slice(0, 28);
+    if (!login) { alert('Usuario inválido.'); return; }
+    if (proveedores.some(p => p.login === login)) {
+      alert('Ya existe un proveedor con ese usuario.');
+      return;
+    }
+    setGuardandoProveedor(true);
+    try {
+      const ses = await asegurarSesionEscritura();
+      if (!ses) throw new SesionExpiradaSupabaseError();
+      const password = generarPasswordProveedor();
+      const actor = nombreParaMostrarSesion({ loginEmail, usernameState: user, authUser: authUserMeta ? { user_metadata: authUserMeta } : null });
+      const resultado = await crearProveedorAdminRpc({
+        nombre,
+        login,
+        clave: password,
+        telefono: formNuevoProv.telefono.trim() || undefined,
+        createdBy: actor || 'Marcos',
+      });
+      if (!resultado.ok) {
+        alert(`${resultado.error}\n\nSi persiste, ejecutá la migración 019 en Supabase (fix pgcrypto).`);
+        return;
+      }
+      const provRow = resultado.proveedor;
+      setProveedores(prev => [...prev, provRow].sort((a, b) => a.nombre.localeCompare(b.nombre)));
+      setFormIngresoExt(f => ({ ...f, proveedorId: provRow.id }));
+      setMNuevoProveedor(false);
+      setFormNuevoProv({ nombre: '', login: '', telefono: '' });
+      setMCredencialesProveedor({ nombre, login: provRow.login, password });
+      audit('CONFIG_CAMBIO', `Proveedor creado: ${nombre} (${login})`);
+      await logAuditDb('CONFIG_CAMBIO', `Proveedor creado: ${nombre} (${login})`);
+    } catch (e: unknown) {
+      console.error('handleCrearProveedor:', e);
+      alert('No se pudo dar de alta el proveedor. Verificá las migraciones 017 y 018 en Supabase.');
+    } finally {
+      setGuardandoProveedor(false);
+    }
+  };
+
+  const handleRegistrarIngresoExterno = async () => {
+    if (!esMarcosPUsuario) return;
+    const provId = formIngresoExt.proveedorId.trim();
+    const monto = redondearPesos(Number(formIngresoExt.monto));
+    if (!provId) { alert('Seleccioná un proveedor.'); return; }
+    if (!monto || monto <= 0) { alert('Monto inválido.'); return; }
+    const prov = proveedores.find(p => p.id === provId);
+    if (!prov) { alert('Proveedor no encontrado.'); return; }
+    setGuardandoIngresoExt(true);
+    try {
+      const ses = await asegurarSesionEscritura();
+      if (!ses) throw new SesionExpiradaSupabaseError();
+      const fechaIngreso = formIngresoExt.fecha || hoy();
+      const calc = calcularMontosInversion(monto, fechaIngreso);
+      const actor = nombreParaMostrarSesion({ loginEmail, usernameState: user, authUser: authUserMeta ? { user_metadata: authUserMeta } : null });
+      const { data: invRow, error: invErr } = await supabase
+        .from('inversiones_proveedor')
+        .insert([{
+          proveedor_id: provId,
+          monto: calc.capital,
+          fecha_ingreso: fechaIngreso,
+          tasa_interes: calc.tasaPct,
+          plazo_dias: calc.plazoDias,
+          monto_interes: calc.interes,
+          monto_total_devolver: calc.total,
+          fecha_vencimiento: calc.fechaVencimiento,
+          estado: 'activa',
+          registrado_por: actor || 'Marcos',
+          nota: formIngresoExt.nota.trim() || null,
+        }])
+        .select('*')
+        .single();
+      if (invErr) throw invErr;
+      const cobradorCaja = String(authUserId || loginEmail || user || 'marcos').trim();
+      const { error: cajaErr } = await supabase.from('caja').insert([{
+        tipo: 'entrada',
+        monto: calc.capital,
+        descripcion: `Ingreso externo — ${prov.nombre}`,
+        cobrador_id: cobradorCaja,
+        proveedor_id: provId,
+        inversion_id: invRow.id,
+      } as Record<string, unknown>]);
+      if (cajaErr) devWarn('Caja ingreso externo no insertada:', cajaErr);
+      setInversionesProveedor(prev => [mapInversionRow(invRow as Record<string, unknown>), ...prev]);
+      setFormIngresoExt({ proveedorId: provId, monto: '', nota: '', fecha: hoy() });
+      audit('CONFIG_CAMBIO', `Ingreso externo ${fmt(calc.capital)} de ${prov.nombre} (${TASA_INVERSION_PROVEEDOR}% / ${PLAZO_INVERSION_PROVEEDOR_DIAS} días)`);
+      await logAuditDb('CONFIG_CAMBIO', `Ingreso externo ${fmt(calc.capital)} proveedor ${prov.login}`);
+      alert(`Ingreso registrado.\nCapital: ${fmt(calc.capital)}\nInterés (${calc.tasaPct}%): ${fmt(calc.interes)}\nTotal a devolver: ${fmt(calc.total)}\nVencimiento: ${calc.fechaVencimiento}`);
+    } catch (e: unknown) {
+      console.error('handleRegistrarIngresoExterno:', e);
+      alert('No se pudo registrar el ingreso. Verificá la migración 017 y permisos en Supabase.');
+    } finally {
+      setGuardandoIngresoExt(false);
+    }
+  };
+
   const crearNotificacion = useCallback(async (payload: {
     titulo: string;
     mensaje: string;
@@ -4515,8 +5479,6 @@ export default function App() {
   const handleCrearCredito = async (payload: {
     cliente_id: any; tipo: 'M' | 'P'; monto_solicitado: number; detalle_mercaderia: string | null; fecha_inicio: string;
     plazo_unidad: 'Días' | 'Semanas' | 'Meses'; plazo_cantidad: number; total_con_interes: number; interes_aplicado: number;
-    inicio_cuotas_modo: 'A_FECHA' | 'POST_FECHA';
-    fecha_inicio_cuotas_post: string | null;
     es_retroactivo?: boolean;
   }) => {
     const clienteIdPlano = typeof payload.cliente_id === 'object' && payload.cliente_id !== null
@@ -4525,6 +5487,13 @@ export default function App() {
     const idClientePlanoStr = String(clienteIdPlano ?? '').trim();
     if (!esUuidClienteId(idClientePlanoStr)) {
       alert('El cliente seleccionado aún no tiene el identificador de servidor (UUID). Esperá unos segundos, recargá la lista de clientes o volvé a elegir al cliente antes de crear el crédito.');
+      return;
+    }
+    const puedeRetro = puedeCargaRetroactivaCredito(rol);
+    const fechaInicioNorm = String(payload.fecha_inicio || hoy()).slice(0, 10);
+    const errFecha = validarFechaInicioCredito(fechaInicioNorm, puedeRetro);
+    if (errFecha) {
+      alert(errFecha);
       return;
     }
     const esMatiasOVendedorCredito = esMatiasOVendedorUsuario;
@@ -4539,25 +5508,38 @@ export default function App() {
     const cobradorId = String(sess.session?.user?.id || user || loginEmail || 'sin_usuario');
     const emailSesion = String(sess.session?.user?.email ?? loginEmail ?? '').trim();
     const plazoUnidadSol = normalizarPlazoUnidad(payload.plazo_unidad);
+    const esMensualCred = esUsuarioMensualSesion(rol);
+    if (!esMensualCred && plazoUnidadSol === 'Meses') {
+      alert('El plan mensual no está disponible. Elegí Diario o Semanal.');
+      return;
+    }
+    if (esMensualCred && plazoUnidadSol !== 'Meses') {
+      alert('En el módulo mensual solo podés crear préstamos con plan Mensual.');
+      return;
+    }
     const planEtiquetaSol = planEtiquetaDesdePlazoUnidad(plazoUnidadSol);
     const clienteIdNorm = fichaIdUuid(idClientePlanoStr);
     const cobradorCreditoNorm = String(cobradorId).trim();
+    const ambitoCred = ambitoDatosSesion(rol);
     rowCredito = {
       cliente_id: clienteIdNorm,
       monto_solicitado: redondearPesos(Number(payload.monto_solicitado)),
       monto_total: redondearPesos(Number(payload.total_con_interes)),
       cuotas: Number(payload.plazo_cantidad),
       plan: planEtiquetaSol,
-      fecha_inicio: String(payload.fecha_inicio),
+      fecha_inicio: fechaInicioNorm,
       cobrador_id: cobradorCreditoNorm ? (fichaIdUuid(cobradorCreditoNorm) || cobradorCreditoNorm) : cobradorCreditoNorm,
-      estado: 'PENDIENTE',
-      inicio_cuotas_modo: payload.inicio_cuotas_modo,
-      fecha_inicio_cuotas_post: payload.inicio_cuotas_modo === 'POST_FECHA' && payload.fecha_inicio_cuotas_post
-        ? String(payload.fecha_inicio_cuotas_post).slice(0, 10)
-        : null,
+      estado: esMensualCred ? 'ACTIVO' : 'PENDIENTE',
+      inicio_cuotas_modo: 'A_FECHA',
+      fecha_inicio_cuotas_post: null,
       cobrador_notif_email: emailSesion || null,
       es_retroactivo: Boolean(payload.es_retroactivo),
+      ambito: ambitoCred,
+      tipo: payload.tipo,
     };
+    if (esUsuarioVendedorSesion) {
+      rowCredito.vendedor_id = cobradorCreditoNorm ? (fichaIdUuid(cobradorCreditoNorm) || cobradorCreditoNorm) : cobradorCreditoNorm;
+    }
     const insCred = await insertarCreditoConReintentos(rowCredito, 3);
     if (!insCred.ok) {
       console.error('Supabase create credito error:', insCred.error);
@@ -4582,13 +5564,16 @@ export default function App() {
       const nroCarton = String(creditoCreado.nro_carton ?? '').trim();
       if (nroCarton) setCartonesCredito(prev => ({ ...prev, [creditoCreado.id]: nroCarton }));
       setCreditos(prev => [{ ...creditoCreado, nro_carton: nroCarton || creditoCreado.nro_carton }, ...prev]);
-      await sincronizarCuotasCreditoSupabase(creditoCreado);
+      if (esMensualCred) {
+        await sincronizarCuotasCreditoSupabase(creditoCreado, { fechaActivacion: hoy() });
+      }
     }
     const refreshedCred = await fetchData();
     const listaPostCredito = refreshedCred?.clientes ?? clientesOrEmpty;
     setMCreditoTipo(null);
     const idPlanoCred = String(clienteIdPlano ?? '').trim();
     const cli = listaPostCredito.find(c => c.id === idPlanoCred || normalizarId(c.id) === normalizarId(idPlanoCred));
+    if (!esMensualCred) {
     try {
       await crearNotificacionesPorEmail({
         titulo: 'Nueva Solicitud',
@@ -4603,18 +5588,24 @@ export default function App() {
       const cliGuardado = listaPostCredito.find(c => normalizarId(c.id) === normalizarId(idPlanoCred)) || cli;
       const nombreCliMsg = (nombreCompletoCliente(cliGuardado) || '').trim() || String(clienteIdPlano);
       const textoWa =
-        etiquetaCreadorCredito === 'MatiasM'
-          ? `El cobrador MatiasM está solicitando la revisión de un crédito para el cliente ${nombreCliMsg}. Favor de revisar en tu Dashboard.`
-          : `El vendedor Vendedor está solicitando la revisión de un crédito para el cliente ${nombreCliMsg}. Favor de revisar en tu Dashboard.`;
+        resolverPerfilDesdeSesion({ loginEmail, usernameState: user })?.rolDefecto === 'cobrador'
+          ? `El cobrador ${etiquetaCreadorCredito} está solicitando la revisión de un crédito para el cliente ${nombreCliMsg}. Favor de revisar en tu Dashboard.`
+          : `El vendedor ${etiquetaCreadorCredito} está solicitando la revisión de un crédito para el cliente ${nombreCliMsg}. Favor de revisar en tu Dashboard.`;
       const telOk = soloDigitosTelefono(normalizarTelefonoArg549(adminTel)).length >= 11;
       const linkWhatsapp = telOk
         ? generarLinkWhatsApp(adminTel, textoWa)
         : `https://wa.me/?text=${encodeURIComponent(textoWa)}`;
       setExitoCreditoCobradorWa({ linkWhatsapp, waAbierto: false });
     }
-    audit('CONFIG_CAMBIO', payload.es_retroactivo
-      ? `Solicitud ${payload.tipo} (retroactiva) creada para cliente ${payload.cliente_id}`
-      : `Solicitud ${payload.tipo} creada para cliente ${payload.cliente_id}`);
+    }
+    audit('CONFIG_CAMBIO', esMensualCred
+      ? `Préstamo mensual activo para cliente ${payload.cliente_id}`
+      : payload.es_retroactivo
+        ? `Solicitud ${payload.tipo} (retroactiva) creada para cliente ${payload.cliente_id}`
+        : `Solicitud ${payload.tipo} creada para cliente ${payload.cliente_id}`);
+    if (esMensualCred) {
+      alert('Préstamo mensual creado y activado correctamente.');
+    }
     } catch (errCred: unknown) {
       const { mensaje, meta } = serializarErrorParaAuditoria(errCred);
       void insertarLogAuditoriaSupabase({
@@ -4646,7 +5637,11 @@ export default function App() {
     },
   ) => {
     if (!esMarcosPUsuario) {
-      alert('Solo el administrador MarcosP puede aprobar, activar o rechazar solicitudes de crédito.');
+      alert('Solo el administrador puede aprobar, activar o rechazar solicitudes de crédito.');
+      return;
+    }
+    if (review && normalizarPlazoUnidad(review.plazo_unidad) === 'Meses') {
+      alert('El plan mensual no está disponible. Elegí Diario o Semanal.');
       return;
     }
     const estadoDb: Credito['estado'] = estado === 'APROBADO' ? 'ACTIVO' : 'RECHAZADO';
@@ -4715,9 +5710,26 @@ export default function App() {
     }
     if (estadoDb === 'ACTIVO') {
       const baseSync = (updated as Credito | null) ?? ({ ...credito, ...cambios } as Credito);
-      await sincronizarCuotasCreditoSupabase(baseSync);
+      await sincronizarCuotasCreditoSupabase(baseSync, { fechaActivacion: hoy() });
+      const vid = String(baseSync.vendedor_id ?? credito.vendedor_id ?? '').trim();
+      const comisionPrev = Number(baseSync.comision_vendedor ?? credito.comision_vendedor ?? 0);
+      if (vid && comisionPrev <= 0) {
+        const pct = Number(data.config.porcentajeComisionVendedor ?? 5);
+        const capital = redondearPesos(Number(baseSync.monto_solicitado ?? credito.monto_solicitado) || 0);
+        const comision = calcularComisionVentaVendedor(capital, pct);
+        if (comision > 0) {
+          await supabase.from('creditos').update({
+            comision_vendedor: comision,
+            vendedor_id: vid,
+            comision_liquidada: false,
+          }).eq('id', idCredito);
+          const hintUser = String(credito.cobrador_notif_email ?? loginEmail ?? user ?? '').split('@')[0];
+          await incrementarComisionAcumuladaVendedor(vid, hintUser, comision);
+        }
+      }
     }
     await fetchData();
+    if (esMarcosPUsuario) void fetchVendedoresComisionAdmin();
     const emailCobrador = String(credito.cobrador_notif_email ?? '').trim().toLowerCase();
     try {
       if (estadoDb === 'ACTIVO' && emailCobrador) {
@@ -5179,7 +6191,6 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
       if (!cli?.id || !esUuidClienteId(cli.id)) continue;
       const idCl = normalizarId(cli.id);
       if (idsEnRutaReal.has(idCl)) continue;
-      if (!clienteEsDeCobradorParaRuta(cli, rol, authUserId, user, loginEmail)) continue;
       if (!Number.isFinite(Number(cli.lat)) || !Number.isFinite(Number(cli.lng))) continue;
       if (String(cli.fechaAlta || '').slice(0, 10) !== hRuta) continue;
       if (clienteTieneCreditoActivoEnRuta(cli.id, creditosOrEmpty, pagosOrEmpty)) continue;
@@ -5358,15 +6369,14 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
   // ==========================================
   const [swiped, setSwiped] = useState<string | null>(null);
 
-  const nombrePantallaSesion = useMemo(
-    () =>
-      nombreParaMostrarSesion({
-        loginEmail,
-        usernameState: user,
-        authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
-      }),
-    [loginEmail, user, authUserMeta],
-  );
+  const nombrePantallaSesion = useMemo(() => {
+    if (proveedorSesion?.nombre) return proveedorSesion.nombre;
+    return nombreParaMostrarSesion({
+      loginEmail,
+      usernameState: user,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    });
+  }, [loginEmail, user, authUserMeta, proveedorSesion]);
 
   const avatarUrlSesion = useMemo(() => {
     const um = authUserMeta;
@@ -5463,6 +6473,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
   // MAIN APP
   // ==========================================
   const go = (p: string) => {
+    if (esProveedorUsuario && p !== 'mi_inversion') return;
+    if (esUsuarioMensualUsuario && !PAGINAS_MODULO_MENSUAL.has(p)) return;
     if (p !== 'creditos') limpiarDeepLinkCredito();
     setPage(p); setSwiped(null); setSearch(''); setFilterStatus('all');
   };
@@ -5592,11 +6604,20 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           </div>
         </div>
         {/* Global Search */}
-        {(page === 'dashboard' || page === 'clientes' || page === 'fichas') && (
+        {(page === 'dashboard' || page === 'clientes' || page === 'fichas') && !esProveedorUsuario && !esUsuarioMensualUsuario && (
           <div className="px-4 pb-2">
             <div className="relative">
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">🔍</span>
               <input ref={searchInputRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar cliente por nombre o dirección..."
+                className="w-full bg-gray-800/60 border border-gray-700 rounded-xl pl-10 pr-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition" />
+            </div>
+          </div>
+        )}
+        {esUsuarioMensualUsuario && (page === 'dashboard' || page === 'clientes') && (
+          <div className="px-4 pb-2">
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">🔍</span>
+              <input ref={searchInputRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar cliente..."
                 className="w-full bg-gray-800/60 border border-gray-700 rounded-xl pl-10 pr-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition" />
             </div>
           </div>
@@ -5621,10 +6642,51 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           </div>
         )}
         {/* DASHBOARD */}
-        {page === 'dashboard' && (
+        {page === 'dashboard' && esUsuarioMensualUsuario && (
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-teal-500/30 bg-teal-950/25 p-4">
+              <h2 className="text-lg font-bold text-teal-100">Créditos mensuales</h2>
+              <p className="text-xs text-teal-200/70 mt-1">Cartera independiente: clientes, préstamos y cobros solo de este módulo.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                { label: 'Clientes', icon: '👥', color: 'bg-indigo-600', route: 'clientes' },
+                { label: 'Préstamos', icon: '🏦', color: 'bg-teal-600', route: 'creditos' },
+                { label: 'Simulador', icon: '🧮', color: 'bg-violet-600', route: 'simulador_mensual' },
+                { label: 'Cobros', icon: '💵', color: 'bg-green-600', route: 'clientes', action: 'cobro' as const },
+                { label: 'Listado a cobrar', icon: '📋', color: 'bg-blue-600', route: 'ruta' },
+                { label: 'Recibos mensuales', icon: '🧾', color: 'bg-amber-600', route: 'recibos_mensuales' },
+              ].map((btn, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => {
+                    if (btn.action === 'cobro') { irAClientesParaCobro(); return; }
+                    go(btn.route);
+                  }}
+                  className={`${btn.color} rounded-2xl p-4 flex flex-col items-center gap-2 active:scale-95 transition-all shadow-lg`}
+                >
+                  <span className="text-3xl">{btn.icon}</span>
+                  <span className="text-white font-semibold text-sm text-center">{btn.label}</span>
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-700">
+                <p className="text-xs text-gray-400">Clientes activos</p>
+                <p className="text-2xl font-bold text-white">{clientesOrEmpty.filter(c => c.activo !== false).length}</p>
+              </div>
+              <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-700">
+                <p className="text-xs text-gray-400">Préstamos activos</p>
+                <p className="text-2xl font-bold text-white">{creditosOrEmpty.filter(c => esCreditoActivo(c)).length}</p>
+              </div>
+            </div>
+          </div>
+        )}
+        {page === 'dashboard' && !esUsuarioMensualUsuario && (
           <div className="space-y-4">
             {/* KPI Cards */}
-            {rol !== 'cobrador' && (
+            {isAdminOrRoot(rol) && (
               <SectionErrorBoundary>
                 <div className="grid grid-cols-2 gap-3">
                   {[
@@ -5727,6 +6789,67 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 >
                   Ver solicitudes
                 </button>
+              </div>
+            )}
+
+            {esMarcosPUsuario && (
+              <div className="bg-amber-500/10 border border-amber-500/35 rounded-2xl p-4 space-y-3">
+                <div>
+                  <p className="text-sm font-bold text-amber-200">💰 Comisiones de vendedores</p>
+                  <p className="text-xs text-amber-100/70 mt-1">
+                    Acumulado por créditos aprobados. Liquidación semanal (corte sábado). Al pagar, se reinicia el acumulado del vendedor.
+                  </p>
+                  <p className="text-[11px] text-amber-200/60 mt-1">
+                    Corte semana en curso: {sabadoCorteSemana()} · Próximo sábado: {proximoSabadoDesde()}
+                  </p>
+                </div>
+                {vendedoresComisionAdmin.length === 0 && (
+                  <p className="text-xs text-gray-500">No hay comisiones pendientes de vendedores registradas.</p>
+                )}
+                {vendedoresComisionAdmin.map(v => (
+                  <div key={v.id} className="bg-gray-900/55 border border-amber-500/20 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center gap-3">
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-white truncate">{etiquetaCobradorMovimiento(v.username)}</p>
+                      <p className="text-xs text-gray-400">{v.creditos_pendientes} crédito(s) con comisión pendiente</p>
+                    </div>
+                    <p className="text-xl font-black text-amber-300 shrink-0">{fmt(v.comision_acumulada)}</p>
+                    <button
+                      type="button"
+                      disabled={v.comision_acumulada <= 0 || liquidandoComisionId === v.id}
+                      onClick={() => void handleLiquidarComisionVendedor(v)}
+                      className="shrink-0 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white disabled:opacity-40 active:scale-95 transition"
+                    >
+                      {liquidandoComisionId === v.id ? 'Liquidando…' : 'Liquidar y reiniciar'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {miResumenComisionVendedor && (
+              <div className="bg-teal-500/10 border border-teal-500/35 rounded-2xl p-4 space-y-3">
+                <div>
+                  <p className="text-sm font-bold text-teal-200">💼 Mis comisiones (pendientes de cobro)</p>
+                  <p className="text-xs text-teal-100/70 mt-1">
+                    Se suman al aprobar cada crédito. Marcos liquida los sábados y reinicia el acumulado al pagar.
+                  </p>
+                  <p className="text-[11px] text-teal-200/60 mt-1">
+                    Corte semana: {miResumenComisionVendedor.corteSemana} · Próxima liquidación: {miResumenComisionVendedor.proximoSabado}
+                  </p>
+                </div>
+                <p className="text-3xl font-black text-teal-300">{fmt(miResumenComisionVendedor.total)}</p>
+                {miResumenComisionVendedor.pendientes.length > 0 && (
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {miResumenComisionVendedor.pendientes.map(c => (
+                      <div key={c.id} className="flex justify-between text-xs bg-gray-900/50 rounded-lg px-3 py-2">
+                        <span className="text-gray-300 truncate pr-2">
+                          {String(c.nro_carton || c.id).slice(0, 12)} · {fmt(Number(c.monto_solicitado) || 0)}
+                        </span>
+                        <span className="font-bold text-teal-300 shrink-0">{fmt(Number(c.comision_vendedor) || 0)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -5851,6 +6974,29 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           </div>
         )}
 
+        {page === 'simulador_mensual' && esUsuarioMensualUsuario && (
+          <div className="space-y-4">
+            <h2 className="text-lg font-bold">🧮 Simulador de préstamos mensuales</h2>
+            <CalculadoraPlanesCreditoMensual />
+          </div>
+        )}
+
+        {page === 'recibos_mensuales' && esUsuarioMensualUsuario && (
+          <RecibosMensualesLista
+            pagos={pagosOrEmpty}
+            clientes={clientesOrEmpty}
+            onVerRecibo={(pago) => {
+              const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(pago.clienteId));
+              const ficha = fichaParaComprobanteDesdePago(pago, fichasOrEmpty, []);
+              if (!cli || !ficha) {
+                alert('No se pudo armar el recibo para este cobro.');
+                return;
+              }
+              setMComprobanteImagen(comprobanteImagenDesdePago(pago, cli, ficha, pagosOrEmpty));
+            }}
+          />
+        )}
+
         {/* CLIENTES */}
         {page === 'clientes' && (
           <div className="space-y-3">
@@ -5927,7 +7073,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               </>
             </SectionErrorBoundary>
 
-            {(isAdminOrRoot(rol) || rol === 'cobrador') && (
+            {(isAdminOrRoot(rol) || esRolCampoRestringido(rol) || esUsuarioMensualUsuario) && (
               <button
                 type="button"
                 onClick={() => {
@@ -5940,7 +7086,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 + Nuevo Cliente
               </button>
             )}
-            {rol === 'cobrador' && (
+            {rol === 'cobrador' && !esUsuarioMensualUsuario && (
               <div className="bg-gray-900/70 border border-cyan-500/30 rounded-2xl p-4">
                 <h3 className="text-sm font-bold text-cyan-300 mb-3">📌 Resumen del Día</h3>
                 <div className="grid grid-cols-1 gap-2 text-sm">
@@ -6070,6 +7216,152 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 ))}
               </div>
             </div>
+            <div className="bg-gray-900/60 border border-sky-500/35 rounded-2xl p-4 space-y-4">
+              <div>
+                <h3 className="font-bold text-sm text-sky-200">💵 Ingresos externos de dinero</h3>
+                <p className="text-xs text-gray-400 mt-1">
+                  Capital de proveedores/inversores. Tasa {TASA_INVERSION_PROVEEDOR}% a {PLAZO_INVERSION_PROVEEDOR_DIAS} días. Al agregar uno se genera usuario y contraseña automáticamente.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs text-gray-400 block">Proveedor</label>
+                <div className="flex gap-2">
+                  <select
+                    value={formIngresoExt.proveedorId}
+                    onChange={e => setFormIngresoExt(f => ({ ...f, proveedorId: e.target.value }))}
+                    className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                  >
+                    <option value="">— Seleccionar —</option>
+                    {proveedores.map(p => (
+                      <option key={p.id} value={p.id}>{p.nombre} ({p.login})</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setMNuevoProveedor(true)}
+                    className="shrink-0 bg-sky-600 text-white rounded-xl px-3 py-2 text-xs font-bold active:scale-95 transition"
+                  >
+                    + Agregar
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">Monto ($)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={formIngresoExt.monto}
+                    onChange={e => setFormIngresoExt(f => ({ ...f, monto: e.target.value }))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                    placeholder="0"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">Fecha ingreso</label>
+                  <input
+                    type="date"
+                    value={formIngresoExt.fecha}
+                    onChange={e => setFormIngresoExt(f => ({ ...f, fecha: e.target.value }))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                  />
+                </div>
+              </div>
+              <input
+                value={formIngresoExt.nota}
+                onChange={e => setFormIngresoExt(f => ({ ...f, nota: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                placeholder="Nota opcional"
+              />
+              {formIngresoExt.monto && Number(formIngresoExt.monto) > 0 && (
+                <div className="text-xs text-sky-200/90 bg-sky-500/10 border border-sky-500/20 rounded-xl p-3">
+                  {(() => {
+                    const c = calcularMontosInversion(Number(formIngresoExt.monto), formIngresoExt.fecha || hoy());
+                    return (
+                      <>
+                        Interés estimado: <strong>{fmt(c.interes)}</strong> · Total a devolver: <strong>{fmt(c.total)}</strong> · Vence: {c.fechaVencimiento}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+              <button
+                type="button"
+                disabled={guardandoIngresoExt}
+                onClick={() => void handleRegistrarIngresoExterno()}
+                className="w-full bg-sky-600 disabled:opacity-50 text-white rounded-xl py-3 text-sm font-bold active:scale-95 transition"
+              >
+                {guardandoIngresoExt ? 'Registrando…' : 'Registrar ingreso en caja'}
+              </button>
+              {inversionesExternasAdmin.length > 0 && (
+                <div className="pt-2 border-t border-gray-800 space-y-2 max-h-48 overflow-y-auto">
+                  <p className="text-xs text-gray-500 font-semibold">Inversiones activas</p>
+                  {inversionesExternasAdmin.map(inv => (
+                    <div key={inv.id} className="flex justify-between gap-2 text-xs bg-gray-800/50 rounded-lg p-2">
+                      <span className="text-gray-300 truncate">{inv.proveedor?.nombre ?? 'Proveedor'}</span>
+                      <span className="text-sky-300 shrink-0">{fmt(inv.monto)} → {fmt(inv.monto_total_devolver)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* PANEL PROVEEDOR / INVERSOR */}
+        {page === 'mi_inversion' && esProveedorUsuario && (
+          <div className="space-y-4 max-w-lg mx-auto">
+            <div className="text-center pt-2">
+              <h2 className="text-xl font-bold text-white">Mi inversión</h2>
+              <p className="text-xs text-gray-400 mt-1">Capital ingresado por el administrador · {TASA_INVERSION_PROVEEDOR}% en {PLAZO_INVERSION_PROVEEDOR_DIAS} días</p>
+            </div>
+            {misInversionesProveedor.length === 0 && (
+              <p className="text-sm text-gray-500 text-center py-12">Todavía no hay inversiones registradas a tu nombre.</p>
+            )}
+            {misInversionesProveedor.map(inv => {
+              const diasRest = diasRestantesInversion(inv.fecha_vencimiento);
+              const vencido = diasRest < 0;
+              return (
+                <div key={inv.id} className="bg-gradient-to-br from-teal-900/40 to-gray-900/80 border border-teal-500/30 rounded-2xl p-5 space-y-4">
+                  <div>
+                    <p className="text-xs text-teal-200/70">Capital invertido</p>
+                    <p className="text-3xl font-black text-white">{fmt(inv.monto)}</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <p className="text-gray-500 text-xs">Fecha de entrada</p>
+                      <p className="font-semibold text-gray-200">{inv.fecha_ingreso}</p>
+                    </div>
+                    <div>
+                      <p className="text-gray-500 text-xs">Vencimiento</p>
+                      <p className="font-semibold text-gray-200">{inv.fecha_vencimiento}</p>
+                    </div>
+                    <div>
+                      <p className="text-gray-500 text-xs">Tasa / plazo</p>
+                      <p className="font-semibold text-gray-200">{inv.tasa_interes}% · {inv.plazo_dias} días</p>
+                    </div>
+                    <div>
+                      <p className="text-gray-500 text-xs">{vencido ? 'Plazo cumplido' : 'Días restantes'}</p>
+                      <p className={`font-semibold ${vencido ? 'text-amber-300' : 'text-teal-300'}`}>
+                        {vencido ? 'Vencido' : `${diasRest} días`}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="bg-teal-500/10 border border-teal-500/25 rounded-xl p-4">
+                    <p className="text-xs text-teal-200/80">Total a recibir (capital + interés)</p>
+                    <p className="text-2xl font-black text-teal-300">{fmt(inv.monto_total_devolver)}</p>
+                    <p className="text-xs text-gray-400 mt-1">Incluye interés de {fmt(inv.monto_interes)}</p>
+                  </div>
+                </div>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => void doLogout()}
+              className="w-full bg-red-500/20 border border-red-500/30 text-red-400 rounded-xl py-3 text-sm font-semibold active:scale-95 transition"
+            >
+              Cerrar sesión
+            </button>
           </div>
         )}
 
@@ -6307,32 +7599,48 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         )}
         {/* CREDITOS */}
         {page === 'creditos' && (() => {
-          const creditosLista = filtroPendientesCredito === 'pendientes'
-            ? creditosPendientesValidos
-            : creditosProcesadosValidos;
+          const creditosLista = esUsuarioMensualUsuario
+            ? creditosOrEmpty.filter(c => esUuidClienteId(String(c.cliente_id ?? '')))
+            : filtroPendientesCredito === 'pendientes'
+              ? creditosPendientesValidos
+              : creditosProcesadosValidos;
           return (
             <>
               <div className="space-y-4">
-                <h2 className="text-lg font-bold">🏦 Créditos</h2>
-                <p className="text-sm text-gray-400">Solicitudes nuevas sincronizadas con la tabla real de créditos.</p>
+                <h2 className="text-lg font-bold">{esUsuarioMensualUsuario ? '🏦 Préstamos mensuales' : '🏦 Créditos'}</h2>
+                <p className="text-sm text-gray-400">
+                  {esUsuarioMensualUsuario
+                    ? 'Alta directa de préstamos con plan mensual (activos al guardar).'
+                    : 'Solicitudes nuevas sincronizadas con la tabla real de créditos.'}
+                </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {esUsuarioMensualUsuario ? (
+                <button onClick={() => setMCreditoTipo('P')} className="w-full sm:col-span-2 bg-gradient-to-r from-teal-600 to-cyan-600 text-white rounded-2xl py-4 font-bold active:scale-95 transition-all">
+                  + Nuevo préstamo mensual
+                </button>
+              ) : (
+                <>
               <button onClick={() => setMCreditoTipo('M')} className="w-full bg-gradient-to-r from-green-500 to-blue-500 text-white rounded-2xl py-4 font-bold active:scale-95 transition-all">
                 Nuevo Crédito M
               </button>
               <button onClick={() => setMCreditoTipo('P')} className="w-full bg-gradient-to-r from-orange-500 to-yellow-500 text-white rounded-2xl py-4 font-bold active:scale-95 transition-all">
                 Nuevo Crédito P
               </button>
+                </>
+              )}
             </div>
             <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <h3 className="font-semibold">Solicitudes</h3>
+                <h3 className="font-semibold">{esUsuarioMensualUsuario ? 'Préstamos' : 'Solicitudes'}</h3>
+                {!esUsuarioMensualUsuario && (
                 <div className="flex gap-2">
                   <button type="button" onClick={() => setFiltroPendientesCredito('pendientes')} className={`px-2 py-1 rounded-lg text-xs ${filtroPendientesCredito === 'pendientes' ? 'bg-indigo-500 text-white' : 'bg-gray-800 text-gray-300'}`}>Pendientes</button>
                   <button type="button" onClick={() => setFiltroPendientesCredito('procesados')} className={`px-2 py-1 rounded-lg text-xs ${filtroPendientesCredito === 'procesados' ? 'bg-indigo-500 text-white' : 'bg-gray-800 text-gray-300'}`}>Procesados</button>
                 </div>
+                )}
               </div>
               {creditosLista.length === 0 && (
-                <p className="text-sm text-gray-500">{filtroPendientesCredito === 'pendientes' ? 'No hay solicitudes pendientes con cliente válido.' : 'No hay créditos procesados con cliente válido.'}</p>
+                <p className="text-sm text-gray-500">{esUsuarioMensualUsuario ? 'No hay préstamos mensuales cargados.' : filtroPendientesCredito === 'pendientes' ? 'No hay solicitudes pendientes con cliente válido.' : 'No hay créditos procesados con cliente válido.'}</p>
               )}
               {creditosLista.map(credito => {
                 const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(credito.cliente_id));
@@ -6825,7 +8133,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               <div className="space-y-2">
                 <div className="rounded-2xl border border-violet-500/25 bg-violet-500/5 p-4">
                   <p className="font-semibold text-violet-200 text-sm mb-1">👥 Gestión de usuarios</p>
-                  <p className="text-xs text-gray-400 leading-relaxed">Los accesos se definen en Supabase Auth y en la tabla <span className="text-gray-300">usuarios</span> (columna <span className="text-gray-300">rol</span>: cobrador, admin, root, super). Desde el panel SQL o Table Editor podés crear filas y asignar roles.</p>
+                  <p className="text-xs text-gray-400 leading-relaxed">Los accesos se definen en Supabase Auth y en la tabla <span className="text-gray-300">usuarios</span> (columna <span className="text-gray-300">rol</span>: cobrador, vendedor, admin, root, super). Desde el panel SQL o Table Editor podés crear filas y asignar roles.</p>
                 </div>
                 <button onClick={() => setMAuditoria(true)} className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">📜 Ver Auditoría</button>
                 <button onClick={() => { if (confirm('¿Exportar logs?')) { const csv = exportarAuditoria(); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `auditoria_${hoy()}.csv`; a.click(); } }} className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">📥 Exportar Auditoría CSV</button>
@@ -6849,17 +8157,27 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         <nav className="fixed bottom-0 left-0 right-0 bg-gray-950/90 backdrop-blur-2xl border-t border-gray-800 z-50">
           <div className="flex">
             {[
-              { k: 'dashboard', icon: '🏠', l: 'Inicio' },
-              { k: 'clientes', icon: '👥', l: 'Clientes' },
-              { k: 'fichas', icon: '📋', l: 'Fichas' },
-              { k: 'creditos', icon: '🏦', l: 'Créditos' },
-              { k: 'ruta', icon: '🗺️', l: 'Ruta' },
-              ...(esMarcosPUsuario ? [{ k: 'cierre_caja', icon: '🧾', l: 'Caja' }] : []),
-              ...(esMarcosPUsuario ? [{ k: 'rendiciones', icon: '📑', l: 'Rendición', pend: rendicionesPendientesAdmin.length }] : []),
-              ...(esMarcosPUsuario ? [{ k: 'panel_control', icon: '🧭', l: 'Control' }] : []),
-              ...(esMarcosPUsuario ? [{ k: 'gastos', icon: '💸', l: 'Gastos' }] : []),
-              ...(esMarcosPUsuario ? [{ k: 'kpis', icon: '📊', l: 'KPIs' }] : []),
-              ...(esMarcosPUsuario ? [{ k: 'config', icon: '⚙️', l: 'Ajustes' }] : []),
+              ...(esUsuarioMensualUsuario ? [
+                { k: 'dashboard', icon: '🏠', l: 'Inicio' },
+                { k: 'clientes', icon: '👥', l: 'Clientes' },
+                { k: 'creditos', icon: '🏦', l: 'Préstamos' },
+                { k: 'ruta', icon: '📋', l: 'A cobrar' },
+                { k: 'recibos_mensuales', icon: '🧾', l: 'Recibos' },
+              ] : []),
+              ...(esProveedorUsuario ? [{ k: 'mi_inversion', icon: '💰', l: 'Mi inversión' }] : []),
+              ...(!esProveedorUsuario && !esUsuarioMensualUsuario ? [
+                { k: 'dashboard', icon: '🏠', l: 'Inicio' },
+                { k: 'clientes', icon: '👥', l: 'Clientes' },
+                { k: 'fichas', icon: '📋', l: 'Fichas' },
+                { k: 'creditos', icon: '🏦', l: 'Créditos' },
+                { k: 'ruta', icon: '🗺️', l: 'Ruta' },
+                ...(esMarcosPUsuario ? [{ k: 'cierre_caja', icon: '🧾', l: 'Caja' }] : []),
+                ...(esMarcosPUsuario ? [{ k: 'rendiciones', icon: '📑', l: 'Rendición', pend: rendicionesPendientesAdmin.length }] : []),
+                ...(esMarcosPUsuario ? [{ k: 'panel_control', icon: '🧭', l: 'Control' }] : []),
+                ...(esMarcosPUsuario ? [{ k: 'gastos', icon: '💸', l: 'Gastos' }] : []),
+                ...(esMarcosPUsuario ? [{ k: 'kpis', icon: '📊', l: 'KPIs' }] : []),
+                ...(esMarcosPUsuario ? [{ k: 'config', icon: '⚙️', l: 'Ajustes' }] : []),
+              ] : []),
             ].map(t => (
               <button key={t.k} onClick={() => go(t.k)}
                 className={`relative flex-1 flex flex-col items-center py-3 gap-0.5 transition-all ${page === t.k ? 'text-indigo-400' : 'text-gray-500'}`}>
@@ -7085,6 +8403,9 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 </button>
               </div>
             </div>
+            {esMarcosPUsuario && (
+              <BloqueVideoVerificacionNegocioAdmin cliente={mDetalleCliente} />
+            )}
             <div className="bg-gray-800/50 rounded-xl p-3 space-y-3">
               <div className="flex items-center justify-between">
                 <p className="font-bold text-sm text-gray-200">Créditos Activos</p>
@@ -7486,13 +8807,14 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         </Modal>
       )}
       {mCreditoTipo && (
-        <Modal onClose={() => setMCreditoTipo(null)} title={mCreditoTipo === 'M' ? '🟢 Nuevo Crédito M' : '🟠 Nuevo Crédito P'}>
+        <Modal onClose={() => setMCreditoTipo(null)} title={esUsuarioMensualUsuario ? '🏦 Nuevo préstamo mensual' : mCreditoTipo === 'M' ? '🟢 Nuevo Crédito M' : '🟠 Nuevo Crédito P'}>
           <CreditoForm
             tipo={mCreditoTipo}
             clientes={clientesOrEmpty.filter(c => esUuidClienteId(String(c?.id ?? '')))}
             interesM={data.config.interesCreditoM ?? 30}
             interesP={data.config.interesCreditoP ?? 30}
             rol={rol}
+            soloPlanMensual={esUsuarioMensualUsuario}
             onCancel={() => setMCreditoTipo(null)}
             onSubmit={handleCrearCredito}
           />
@@ -7540,6 +8862,74 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
       {mGasto && (
         <Modal onClose={() => setMGasto(null)} title="+ Registrar Gasto">
           <GastoForm onSave={handleSaveGasto} />
+        </Modal>
+      )}
+
+      {mNuevoProveedor && (
+        <Modal onClose={() => setMNuevoProveedor(false)} title="+ Nuevo proveedor / inversor">
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Nombre</label>
+              <input
+                value={formNuevoProv.nombre}
+                onChange={e => setFormNuevoProv(f => ({ ...f, nombre: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                placeholder="Ej: Juan Pérez"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Usuario de acceso (opcional)</label>
+              <input
+                value={formNuevoProv.login}
+                onChange={e => setFormNuevoProv(f => ({ ...f, login: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                placeholder="Se genera del nombre si está vacío"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Teléfono (opcional)</label>
+              <input
+                value={formNuevoProv.telefono}
+                onChange={e => setFormNuevoProv(f => ({ ...f, telefono: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+              />
+            </div>
+            <p className="text-xs text-gray-500">Se crea el acceso automáticamente. Compartí usuario y contraseña con el inversor (sin Supabase).</p>
+            <button
+              type="button"
+              disabled={guardandoProveedor}
+              onClick={() => void handleCrearProveedor()}
+              className="w-full bg-sky-600 disabled:opacity-50 text-white rounded-xl py-3 font-bold active:scale-95 transition"
+            >
+              {guardandoProveedor ? 'Creando…' : 'Crear proveedor y usuario'}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {mCredencialesProveedor && (
+        <Modal onClose={() => setMCredencialesProveedor(null)} title="✅ Proveedor listo">
+          <div className="space-y-3 text-sm">
+            <p className="text-gray-300">
+              <strong>{mCredencialesProveedor.nombre}</strong> ya puede ingresar a la app con estos datos:
+            </p>
+            <div className="bg-gray-800 rounded-xl p-4 space-y-2 font-mono text-xs">
+              <p><span className="text-gray-500">Usuario:</span> <span className="text-sky-300">{mCredencialesProveedor.login}</span></p>
+              <p><span className="text-gray-500">Contraseña:</span> <span className="text-amber-300">{mCredencialesProveedor.password}</span></p>
+            </div>
+            <p className="text-xs text-gray-500">Solo verá su capital invertido, fecha de entrada y total a recibir. No hace falta configurar nada en Supabase.</p>
+            <button
+              type="button"
+              onClick={() => {
+                const txt = `Usuario: ${mCredencialesProveedor.login}\nContraseña: ${mCredencialesProveedor.password}`;
+                void navigator.clipboard?.writeText(txt);
+                alert('Copiado al portapapeles');
+              }}
+              className="w-full bg-gray-700 text-white rounded-xl py-2.5 font-semibold"
+            >
+              Copiar credenciales
+            </button>
+          </div>
         </Modal>
       )}
 
@@ -7689,48 +9079,45 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
 // ==========================================
 
 function LoginForm({ onLogin, loading }: { onLogin: (u: string, p: string) => void; loading: boolean }) {
-  const [u, setU] = useState(localStorage.getItem('cp_last_login_user') || '');
+  const [u, setU] = useState(() => loginDesdeAlmacenado(localStorage.getItem('cp_last_login_user')));
   const [p, setP] = useState('');
   const userRef = useRef<HTMLInputElement | null>(null);
   const passRef = useRef<HTMLInputElement | null>(null);
+  const accesosRapidos = useMemo(() => accesosRapidosLoginVisibles(), []);
   useEffect(() => {
     if (u) passRef.current?.focus();
     else userRef.current?.focus();
-  }, [u]);
-  const quickLogins: { label: string; email: string }[] = [
-    { label: 'MatiasM', email: 'cobrador1@emd.com' },
-    { label: 'Vendedor', email: 'cobrador2@emd.com' },
-    { label: 'MarcosP', email: 'emamoreno7@hotmail.com' },
-    { label: 'Root', email: 'root@emd.com' },
-  ];
+  }, []);
   return (
     <div className="space-y-3 bg-gray-900/75 rounded-3xl p-5 border border-gray-800 backdrop-blur-sm shadow-2xl">
-      <div className="grid grid-cols-2 gap-2">
-        {quickLogins.map(r => (
-          <button
-            key={r.email}
-            type="button"
-            onClick={() => {
-              setU(r.email.trim());
-              setP('');
-              setTimeout(() => passRef.current?.focus(), 0);
-            }}
-            className="bg-gray-800/80 border border-gray-700 text-gray-200 rounded-xl py-2.5 text-xs font-semibold active:scale-95 transition"
-          >
-            {r.label}
-          </button>
-        ))}
-      </div>
+      {accesosRapidos.length > 0 && (
+        <div className="grid grid-cols-2 gap-2">
+          {accesosRapidos.map(r => (
+            <button
+              key={r.login}
+              type="button"
+              onClick={() => {
+                setU(r.login);
+                setP('');
+                setTimeout(() => passRef.current?.focus(), 0);
+              }}
+              className="bg-gray-800/80 border border-gray-700 text-gray-200 rounded-xl py-2.5 text-xs font-semibold active:scale-95 transition"
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div>
-        <label className="text-xs text-gray-400 mb-1 block">Email</label>
+        <label className="text-xs text-gray-400 mb-1 block">Usuario</label>
         <input
           ref={userRef}
           value={u}
           onChange={e => setU(e.target.value)}
-          type="email"
+          type="text"
           autoComplete="username"
           className="w-full bg-gray-900/80 border border-amber-400/20 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-amber-300/70 focus:ring-1 focus:ring-amber-300/40 transition"
-          placeholder="correo@ejemplo.com"
+          placeholder="marcos, matias, vendedor…"
         />
       </div>
       <div>
@@ -7803,7 +9190,7 @@ function CreditoExitoNotificarMarcosOverlay({
           className="mt-8 inline-flex w-full items-center justify-center gap-3 rounded-2xl bg-green-600 px-5 py-4 text-base font-bold text-white shadow-[0_8px_32px_rgba(22,163,74,0.35)] transition hover:bg-green-500 active:scale-[0.98] sm:text-lg"
         >
           <IconoWhatsappMarca className="h-7 w-7 shrink-0 sm:h-8 sm:w-8" />
-          Enviar revisión a MarcosP
+          Enviar revisión al administrador
         </a>
         {!waAbierto && (
           <p className="mt-5 text-xs leading-relaxed text-cyan-200/55">
@@ -7988,6 +9375,99 @@ function NoPagoForm({ gpsLoading, gpsPos, onCapturarGPS, onSubmit, instrucciones
   );
 }
 
+function CalculadoraPlanesCreditoMensual() {
+  const [monto, setMonto] = useState('');
+  const [tasaInteres, setTasaInteres] = useState('30');
+  const [cuotas, setCuotas] = useState(PLAN_MENSUAL_OPCIONES[0]);
+  const montoSolicitado = redondearPesos(Number(monto) || 0);
+  const interesPorcentaje = Number(tasaInteres) || 0;
+  const total = redondearPesos(montoSolicitado + redondearPesos(montoSolicitado * (interesPorcentaje / 100)));
+  const montosCuota = distribuirMontoEnCuotas(total, cuotas);
+  const valorCuota = montosCuota[0] ?? 0;
+  return (
+    <div className="rounded-2xl border border-teal-500/30 bg-teal-950/20 p-4 space-y-3">
+      <p className="text-xs text-teal-100/80">Simulación de cuotas mensuales (solo referencia).</p>
+      <div>
+        <label className="text-xs text-gray-400 block mb-1">Capital solicitado</label>
+        <input type="number" value={monto} onChange={e => setMonto(e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white" placeholder="0" />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Interés (%)</label>
+          <input type="number" value={tasaInteres} onChange={e => setTasaInteres(e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-white" />
+        </div>
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Cuotas mensuales</label>
+          <select value={cuotas} onChange={e => setCuotas(Number(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-white">
+            {PLAN_MENSUAL_OPCIONES.map(n => <option key={n} value={n}>{n} meses</option>)}
+          </select>
+        </div>
+      </div>
+      {montoSolicitado > 0 && (
+        <div className="bg-gray-900/60 rounded-xl p-3 text-center space-y-1">
+          <p className="text-xs text-gray-400">Total con interés</p>
+          <p className="text-2xl font-bold text-teal-300">{fmt(total)}</p>
+          <p className="text-sm text-gray-300">Cuota mensual aprox.: <strong>{fmt(valorCuota)}</strong></p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecibosMensualesLista({
+  pagos,
+  clientes,
+  onVerRecibo,
+}: {
+  pagos: PagoRegistro[];
+  clientes: Cliente[];
+  onVerRecibo: (p: PagoRegistro) => void;
+}) {
+  const mesRef = hoy().slice(0, 7);
+  const pagosMes = useMemo(
+    () => pagos
+      .filter(p => !p.esRegistroNoPago && redondearPesos(Number(p.monto) || 0) > 0)
+      .filter(p => String(p.fecha || p.fechaPago || '').slice(0, 7) === mesRef)
+      .sort((a, b) => String(b.fechaPago || b.fecha).localeCompare(String(a.fechaPago || a.fecha))),
+    [pagos, mesRef],
+  );
+  const totalMes = useMemo(
+    () => redondearPesos(pagosMes.reduce((s, p) => s + redondearPesos(Number(p.monto) || 0), 0)),
+    [pagosMes],
+  );
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border border-amber-500/30 bg-amber-950/20 p-4">
+        <h2 className="text-lg font-bold text-amber-100">🧾 Recibos del mes</h2>
+        <p className="text-xs text-amber-200/70 mt-1">Cobros registrados en {mesRef} · Total: {fmt(totalMes)}</p>
+      </div>
+      {pagosMes.length === 0 && (
+        <p className="text-sm text-gray-500 text-center py-8">No hay cobros con recibo en el mes actual.</p>
+      )}
+      <div className="space-y-2">
+        {pagosMes.map(p => {
+          const cli = clientes.find(c => normalizarId(c.id) === normalizarId(p.clienteId));
+          return (
+            <div key={String(p.id ?? `${p.clienteId}-${p.fecha}-${p.monto}`)} className="bg-gray-800/60 rounded-xl p-3 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold truncate">{nombreCompletoCliente(cli) || p.clienteId}</p>
+                <p className="text-xs text-gray-400">{String(p.fecha || '').slice(0, 10)} · {fmt(Number(p.monto) || 0)}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => onVerRecibo(p)}
+                className="shrink-0 rounded-lg bg-amber-600/80 px-3 py-2 text-xs font-bold text-white active:scale-95"
+              >
+                Ver recibo
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function CalculadoraPlanesCredito() {
   const [monto, setMonto] = useState('');
   const [plan, setPlan] = useState<'Semanal' | 'Diario'>('Semanal');
@@ -8013,6 +9493,7 @@ function CalculadoraPlanesCredito() {
   };
   const planEspecialCuotaInsuficiente = esPlazoEspecial(cuotas) && montoSolicitado > 0 && montosCuotaSel.length > 0
     && Math.min(...montosCuotaSel) > 0 && Math.min(...montosCuotaSel) < MONTO_CUOTA_MIN_PLAN_ESPECIAL;
+  const etiquetaMontoCuota = plan === 'Semanal' ? 'Monto semanal' : 'Monto diario';
   const crearImagenPlanCredito = async () => {
     const nodo = tarjetaCapturaRef.current;
     if (!nodo) throw new Error('No se encontró la tarjeta de simulación para generar la imagen.');
@@ -8133,16 +9614,9 @@ function CalculadoraPlanesCredito() {
                 )}
               </p>
             </div>
-            <div style={{ padding: '18px 22px', borderBottom: '1px solid #e2e8f0' }}>
-              <p style={{ margin: 0, fontSize: '13px', color: '#334155', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px' }}>Monto cuota</p>
+            <div style={{ padding: '18px 22px' }}>
+              <p style={{ margin: 0, fontSize: '13px', color: '#334155', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px' }}>{etiquetaMontoCuota}</p>
               <p style={{ margin: '8px 0 0', fontSize: '38px', lineHeight: 1.08, fontWeight: 900, color: '#059669' }}>{fmt(valorCuota)}</p>
-            </div>
-            <div style={{ padding: '18px 22px', borderBottom: '1px solid #e2e8f0' }}>
-              <p style={{ margin: 0, fontSize: '13px', color: '#334155', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px' }}>Total a devolver</p>
-              <p style={{ margin: '8px 0 0', fontSize: '38px', lineHeight: 1.08, fontWeight: 900, color: '#2563eb' }}>{fmt(total)}</p>
-            </div>
-            <div style={{ padding: '12px 22px', fontSize: '12px', color: '#64748b', textAlign: 'right', fontWeight: 600 }}>
-              Tasa: {interesPorcentaje.toFixed(2)}%
             </div>
           </>
         ) : (
@@ -8151,21 +9625,13 @@ function CalculadoraPlanesCredito() {
               <p style={{ margin: 0, fontSize: '13px', color: '#334155', fontWeight: 700, textTransform: 'uppercase' }}>Capital solicitado</p>
               <p style={{ margin: '6px 0 0', fontSize: '36px', fontWeight: 900, color: '#0f172a' }}>{fmt(montoSolicitado)}</p>
             </div>
-            <div style={{ padding: '12px 22px', display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #e2e8f0', fontSize: '14px', fontWeight: 700 }}>
-              <span style={{ color: '#64748b' }}>Tasa</span>
-              <span style={{ color: '#0f172a' }}>{interesPorcentaje.toFixed(2)}%</span>
-            </div>
-            <div style={{ padding: '12px 22px', display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #e2e8f0', fontSize: '14px', fontWeight: 700 }}>
-              <span style={{ color: '#64748b' }}>Total a devolver</span>
-              <span style={{ color: '#2563eb' }}>{fmt(total)}</span>
-            </div>
             <div style={{ padding: '16px 22px 8px' }}>
               <p style={{ margin: '0 0 10px', fontSize: '13px', color: '#334155', fontWeight: 800, textTransform: 'uppercase' }}>Opciones de cuota (mismo capital)</p>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '15px' }}>
                 <thead>
                   <tr style={{ borderBottom: '2px solid #e2e8f0' }}>
                     <th style={{ textAlign: 'left', padding: '10px 8px', color: '#64748b', fontWeight: 800 }}>Plazo</th>
-                    <th style={{ textAlign: 'right', padding: '10px 8px', color: '#64748b', fontWeight: 800 }}>Monto cuota</th>
+                    <th style={{ textAlign: 'right', padding: '10px 8px', color: '#64748b', fontWeight: 800 }}>{etiquetaMontoCuota}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -8288,7 +9754,7 @@ function CalculadoraPlanesCredito() {
           <p className="font-bold" style={{ color: '#67e8f9' }}>{cuotas}</p>
         </div>
         <div className="rounded-xl p-3" style={{ backgroundColor: '#052e2b', border: '1px solid #047857' }}>
-          <p className="text-[11px]" style={{ color: '#a7f3d0' }}>Monto cuota</p>
+          <p className="text-[11px]" style={{ color: '#a7f3d0' }}>{etiquetaMontoCuota}</p>
           <p className="font-black" style={{ color: '#6ee7b7' }}>{fmt(valorCuota)}</p>
         </div>
       </div>
@@ -8329,6 +9795,33 @@ function valorInicialCampoCelular(guardado: string | undefined | null): string {
   return d.length > 0 ? d : PREFIJO_CELULAR_AR_DEFAULT;
 }
 
+function BloqueVideoVerificacionNegocioAdmin({ cliente }: { cliente: Partial<Cliente> | null | undefined }) {
+  if (!videoVerificacionClienteVigente(cliente ?? undefined)) {
+    const url = String(cliente?.videoVerificacionUrl || '').trim();
+    if (url) {
+      return (
+        <p className="text-xs text-gray-500 rounded-xl border border-gray-700 bg-gray-800/40 p-3">
+          El video de verificación del negocio ya expiró (retención máxima {DIAS_RETENCION_VIDEO_CLIENTE} días).
+        </p>
+      );
+    }
+    return null;
+  }
+  const url = String(cliente?.videoVerificacionUrl || '').trim();
+  const expira = String(cliente?.videoVerificacionExpiraAt || '').slice(0, 10);
+  return (
+    <div className="rounded-xl border border-violet-500/30 bg-violet-950/20 p-3 space-y-2">
+      <p className="text-sm font-semibold text-violet-100">Video del negocio (verificación de crédito)</p>
+      <video src={url} controls playsInline className="w-full rounded-xl max-h-72 bg-black" />
+      {expira && (
+        <p className="text-[10px] text-gray-500">
+          Disponible hasta {expira} · se elimina automáticamente a los {DIAS_RETENCION_VIDEO_CLIENTE} días
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ClienteForm({
   cliente,
   edicionClienteUuidEnServidor = false,
@@ -8358,17 +9851,22 @@ function ClienteForm({
   const [guardando, setGuardando] = useState(false);
   const [archivoFrente, setArchivoFrente] = useState<File | null>(null);
   const [archivoDorso, setArchivoDorso] = useState<File | null>(null);
+  const [archivoVideoNegocio, setArchivoVideoNegocio] = useState<File | null>(null);
+  const [videoNegocioPreviewUrl, setVideoNegocioPreviewUrl] = useState<string | null>(null);
+  const [validandoVideo, setValidandoVideo] = useState(false);
   const [geoCapturando, setGeoCapturando] = useState(false);
   const [toast, setToast] = useState<{ msg: string; tone: 'error' | 'ok' } | null>(null);
   const toastTRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const frenteRef = useRef<HTMLInputElement | null>(null);
   const dorsoRef = useRef<HTMLInputElement | null>(null);
+  const videoNegocioRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(
     () => () => {
       if (toastTRef.current) clearTimeout(toastTRef.current);
+      if (videoNegocioPreviewUrl) URL.revokeObjectURL(videoNegocioPreviewUrl);
     },
-    [],
+    [videoNegocioPreviewUrl],
   );
 
   const mostrarToast = (msg: string, tone: 'error' | 'ok') => {
@@ -8411,6 +9909,42 @@ function ClienteForm({
       setArchivoDorso(file);
       setF(prev => ({ ...prev, dniDorsoUrl: undefined }));
     }
+  };
+
+  const handlePickVideoNegocio = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (formError) setFormError('');
+    if (!file.type.startsWith('video/')) {
+      setFormError('Seleccioná un archivo de video (MP4, WebM, etc.).');
+      return;
+    }
+    if (file.size > MAX_BYTES_VIDEO_CLIENTE) {
+      setFormError('El video no puede superar 25 MB.');
+      return;
+    }
+    setValidandoVideo(true);
+    try {
+      const dur = await obtenerDuracionVideoSegundos(file);
+      if (dur <= 0 || dur > MAX_DURACION_VIDEO_CLIENTE_SEG + 0.5) {
+        setFormError(`El video debe durar como máximo ${MAX_DURACION_VIDEO_CLIENTE_SEG} segundos (detectado: ${dur > 0 ? Math.ceil(dur) : '?'}s).`);
+        return;
+      }
+      if (videoNegocioPreviewUrl) URL.revokeObjectURL(videoNegocioPreviewUrl);
+      setArchivoVideoNegocio(file);
+      setVideoNegocioPreviewUrl(URL.createObjectURL(file));
+    } catch {
+      setFormError('No se pudo leer el video. Probá con otro archivo.');
+    } finally {
+      setValidandoVideo(false);
+    }
+  };
+
+  const quitarVideoNegocio = () => {
+    if (videoNegocioPreviewUrl) URL.revokeObjectURL(videoNegocioPreviewUrl);
+    setArchivoVideoNegocio(null);
+    setVideoNegocioPreviewUrl(null);
   };
 
   const tieneDniFrenteListo = Boolean(archivoFrente || String(f.dniFrenteUrl || '').trim());
@@ -8486,6 +10020,7 @@ function ClienteForm({
         if (archivoFrente) opts.dniFiles.frente = archivoFrente;
         if (archivoDorso) opts.dniFiles.dorso = archivoDorso;
       }
+      if (archivoVideoNegocio) opts.videoNegocio = archivoVideoNegocio;
       await Promise.resolve(onSave(f, opts));
     } catch (err) {
       if (err instanceof SesionExpiradaSupabaseError) {
@@ -8525,7 +10060,7 @@ function ClienteForm({
       )}
       {modoEdicionSoloContacto && (
         <p className="rounded-xl border border-cyan-500/30 bg-cyan-950/30 p-3 text-xs text-cyan-100/90">
-          Podés actualizar solo datos de contacto (teléfono y dirección). Los demás datos los gestiona MarcosP.
+          Podés actualizar solo datos de contacto (teléfono y dirección). Los demás datos los gestiona el administrador.
         </p>
       )}
       <div><label className="text-xs text-gray-400 block mb-1">Nombre *</label><input readOnly={soloLecturaIdentidad} value={f.nombre || ''} onChange={e => s('nombre', e.target.value)} className={`w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 ${soloLecturaIdentidad ? 'opacity-60 cursor-not-allowed' : ''}`} placeholder="Nombre completo" /></div>
@@ -8583,6 +10118,7 @@ function ClienteForm({
       </div>
       {f.coordenadaErr && <p className="text-xs text-red-400">{f.coordenadaErr}</p>}
       {!modoEdicionSoloContacto && (
+      <>
       <div className="space-y-2 rounded-xl border border-gray-700 bg-gray-800/40 p-3">
         <p className="text-sm font-semibold text-gray-200">Documentación</p>
         <p className="text-[11px] text-gray-400">
@@ -8607,6 +10143,41 @@ function ClienteForm({
           </a>
         )}
       </div>
+      <div className="space-y-2 rounded-xl border border-violet-500/25 bg-violet-950/15 p-3">
+        <p className="text-sm font-semibold text-violet-100">Video del negocio (opcional)</p>
+        <p className="text-[11px] text-gray-400 leading-relaxed">
+          Grabá un recorrido breve del local o negocio (máx. {MAX_DURACION_VIDEO_CLIENTE_SEG} segundos). El administrador lo usa para evaluar si es apto para un crédito. Se guarda {DIAS_RETENCION_VIDEO_CLIENTE} días y luego se elimina solo.
+        </p>
+        <input
+          ref={videoNegocioRef}
+          type="file"
+          accept="video/*"
+          capture="environment"
+          className="hidden"
+          onChange={e => void handlePickVideoNegocio(e)}
+        />
+        <button
+          type="button"
+          onClick={() => videoNegocioRef.current?.click()}
+          disabled={guardando || validandoVideo}
+          className="w-full bg-violet-600/80 disabled:bg-violet-600/40 text-white rounded-xl py-3 text-sm font-bold active:scale-95 transition"
+        >
+          {validandoVideo ? 'Validando video…' : archivoVideoNegocio ? `Video: ${archivoVideoNegocio.name}` : '🎥 Subir video del negocio'}
+        </button>
+        {videoNegocioPreviewUrl && (
+          <div className="space-y-2">
+            <video src={videoNegocioPreviewUrl} controls playsInline className="w-full rounded-xl max-h-48 bg-black" />
+            <button type="button" onClick={quitarVideoNegocio} className="text-xs text-red-300 underline">Quitar video</button>
+          </div>
+        )}
+        {!archivoVideoNegocio && videoVerificacionClienteVigente(f) && (
+          <div className="space-y-1">
+            <video src={f.videoVerificacionUrl} controls playsInline className="w-full rounded-xl max-h-48 bg-black" />
+            <p className="text-[10px] text-gray-500">Video actual en servidor (vigente hasta {String(f.videoVerificacionExpiraAt || '').slice(0, 10) || '—'})</p>
+          </div>
+        )}
+      </div>
+      </>
       )}
       <div className="flex gap-3 sticky bottom-0 bg-gray-900 pt-2">
         <button
@@ -8852,6 +10423,7 @@ function ConfigForm({ config, onSave }: { config: Config; onSave: (c: Config) =>
       <div><label className="text-xs text-gray-400 block mb-1">% Mora (diario)</label><input type="number" value={f.moraPorciento} onChange={e => s('moraPorciento', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
       <div><label className="text-xs text-gray-400 block mb-1">% Interés Mercadería (M)</label><input type="number" value={f.interesCreditoM} onChange={e => s('interesCreditoM', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
       <div><label className="text-xs text-gray-400 block mb-1">% Interés Préstamo (P)</label><input type="number" value={f.interesCreditoP} onChange={e => s('interesCreditoP', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">% Comisión vendedor (sobre capital)</label><input type="number" value={f.porcentajeComisionVendedor ?? 5} onChange={e => s('porcentajeComisionVendedor', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
       <div>
         <label className="text-xs text-gray-400 block mb-1">WhatsApp administrador</label>
         <input
@@ -8881,6 +10453,7 @@ function CreditoForm({
   interesM,
   interesP,
   rol,
+  soloPlanMensual = false,
   onCancel,
   onSubmit,
 }: {
@@ -8889,35 +10462,33 @@ function CreditoForm({
   interesM: number;
   interesP: number;
   rol: string | null;
+  soloPlanMensual?: boolean;
   onCancel: () => void;
   onSubmit: (payload: {
     cliente_id: string; tipo: 'M' | 'P'; monto_solicitado: number; detalle_mercaderia: string | null; fecha_inicio: string;
     plazo_unidad: 'Días' | 'Semanas' | 'Meses'; plazo_cantidad: number; total_con_interes: number; interes_aplicado: number;
-    inicio_cuotas_modo: 'A_FECHA' | 'POST_FECHA';
-    fecha_inicio_cuotas_post: string | null;
     es_retroactivo?: boolean;
   }) => void | Promise<void>;
 }) {
   const [busqueda, setBusqueda] = useState('');
   const [clienteId, setClienteId] = useState('');
-  const [modoInicio, setModoInicio] = useState<'A_FECHA' | 'POST_FECHA'>('A_FECHA');
-  const fechaMinPost = useMemo(() => addDias(hoy(), 1), []);
-  const [fechaPost, setFechaPost] = useState(() => addDias(hoy(), 1));
-  const [fechaInicioAficha, setFechaInicioAficha] = useState(() => hoy());
+  const fechaMaxFutura = useMemo(() => addDias(hoy(), MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO), []);
+  const [fechaInicio, setFechaInicio] = useState(() => hoy());
   const [detalleMercaderia, setDetalleMercaderia] = useState('');
   const [montoCapital, setMontoCapital] = useState('');
   const [interesAplicado, setInteresAplicado] = useState<number>(30);
-  const [plazoUnidad, setPlazoUnidad] = useState<'Días' | 'Semanas' | 'Meses'>('Semanas');
-  const [plazoCantidad, setPlazoCantidad] = useState(1);
+  const [plazoUnidad, setPlazoUnidad] = useState<'Días' | 'Semanas' | 'Meses'>(() => (soloPlanMensual ? 'Meses' : 'Semanas'));
+  const [plazoCantidad, setPlazoCantidad] = useState(() => (soloPlanMensual ? PLAN_MENSUAL_OPCIONES[0] : 1));
 
   const esCobrador = String(rol || '').toLowerCase() === 'cobrador';
   const puedeRetro = puedeCargaRetroactivaCredito(rol);
   useEffect(() => {
-    if (!puedeRetro && modoInicio === 'POST_FECHA' && fechaPost < fechaMinPost) setFechaPost(fechaMinPost);
-  }, [puedeRetro, modoInicio, fechaMinPost, fechaPost]);
-  useEffect(() => {
-    if (!puedeRetro && modoInicio === 'A_FECHA' && fechaInicioAficha < hoy()) setFechaInicioAficha(hoy());
-  }, [puedeRetro, modoInicio, fechaInicioAficha]);
+    const err = validarFechaInicioCredito(fechaInicio, puedeRetro);
+    if (err) {
+      if (!puedeRetro && fechaInicio < hoy()) setFechaInicio(hoy());
+      else if (fechaInicio > fechaMaxFutura) setFechaInicio(fechaMaxFutura);
+    }
+  }, [puedeRetro, fechaInicio, fechaMaxFutura]);
   useEffect(() => {
     if (esCobrador) {
       setInteresAplicado(30);
@@ -8935,11 +10506,7 @@ function CreditoForm({
     });
   }, [clientes, q]);
 
-  const opcionesCantidad = plazoUnidad === 'Días'
-    ? PLAN_DIARIO_OPCIONES
-    : plazoUnidad === 'Meses'
-      ? PLAN_MENSUAL_OPCIONES
-      : PLAN_SEMANAL_OPCIONES;
+  const opcionesCantidad = opcionesCantidadPlazoCredito(soloPlanMensual ? 'Meses' : (plazoUnidad === 'Meses' ? 'Semanas' : plazoUnidad));
   useEffect(() => {
     if (!opcionesCantidad.includes(plazoCantidad)) setPlazoCantidad(opcionesCantidad[0]);
   }, [opcionesCantidad, plazoCantidad]);
@@ -8999,55 +10566,21 @@ function CreditoForm({
           </div>
         )}
       </div>
-      <div className="space-y-2">
-        <p className="text-xs text-gray-400">Inicio del plan de cuotas</p>
-        <div className="flex rounded-xl p-1 gap-1 bg-gray-800/80 border border-gray-700">
-          <button
-            type="button"
-            onClick={() => setModoInicio('A_FECHA')}
-            className={`flex-1 rounded-lg py-2 text-xs font-bold transition-all ${modoInicio === 'A_FECHA' ? 'bg-emerald-600 text-white' : 'text-gray-400'}`}
-          >
-            A fecha
-          </button>
-          <button
-            type="button"
-            onClick={() => setModoInicio('POST_FECHA')}
-            className={`flex-1 rounded-lg py-2 text-xs font-bold transition-all ${modoInicio === 'POST_FECHA' ? 'bg-emerald-600 text-white' : 'text-gray-400'}`}
-          >
-            Post-fecha
-          </button>
-        </div>
-        {modoInicio === 'A_FECHA' ? (
-          <div className="space-y-2">
-            <label className="text-xs text-gray-400 block mb-1">Fecha de inicio del crédito (referencia del plan de cuotas)</label>
-            <input
-              type="date"
-              min={puedeRetro ? undefined : hoy()}
-              value={fechaInicioAficha}
-              onChange={e => setFechaInicioAficha(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white"
-            />
-            <p className="text-[11px] text-gray-500 leading-relaxed">
-              {puedeRetro
-                ? 'Admin/root: podés elegir fechas pasadas para simular mora o cuotas vencidas. Se marca auditoría es_retroactivo.'
-                : 'Las cuotas se armarán desde esta fecha; no podés elegir días anteriores a hoy.'}
-            </p>
-          </div>
-        ) : (
-          <div>
-            <label className="text-xs text-gray-400 block mb-1">Desde qué día empiezan las cuotas (00:00)</label>
-            <input
-              type="date"
-              min={puedeRetro ? undefined : fechaMinPost}
-              value={fechaPost}
-              onChange={e => setFechaPost(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white"
-            />
-            <p className="text-[11px] text-gray-500 mt-1">
-              {puedeRetro ? 'Podés elegir fechas pasadas (solo admin/root); el plan generará cuotas ya vencidas si corresponde.' : 'Elegí una fecha futura; el plan correrá a partir de ese día.'}
-            </p>
-          </div>
-        )}
+      <div>
+        <label className="text-xs text-gray-400 block mb-1">Fecha de inicio del crédito</label>
+        <input
+          type="date"
+          min={puedeRetro ? undefined : hoy()}
+          max={fechaMaxFutura}
+          value={fechaInicio}
+          onChange={e => setFechaInicio(e.target.value)}
+          className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white"
+        />
+        <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
+          {puedeRetro
+            ? 'Referencia administrativa del crédito. Podés usar fechas pasadas (retroactivo). Hacia adelante, máximo 7 días desde hoy.'
+            : 'Referencia del crédito (por defecto hoy). Hacia adelante, máximo 7 días. El cobrador verá las cuotas para cobrar desde el día siguiente a la aprobación.'}
+        </p>
       </div>
       {tipo === 'M' && (
         <div>
@@ -9062,6 +10595,9 @@ function CreditoForm({
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="text-xs text-gray-400 block mb-1">Unidad de Plazo</label>
+          {soloPlanMensual ? (
+            <input readOnly value="Mensual" className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white opacity-80" />
+          ) : (
           <select
             value={plazoUnidad}
             onChange={e => setPlazoUnidad(normalizarPlazoUnidad(e.target.value))}
@@ -9069,11 +10605,11 @@ function CreditoForm({
           >
             <option value="Días">Diario (por día)</option>
             <option value="Semanas">Semanal</option>
-            <option value="Meses">Mensual</option>
           </select>
+          )}
         </div>
         <div>
-          <label className="text-xs text-gray-400 block mb-1">Cantidad</label>
+          <label className="text-xs text-gray-400 block mb-1">{soloPlanMensual ? 'Cuotas (meses)' : 'Cantidad'}</label>
           <select value={plazoCantidad} onChange={e => setPlazoCantidad(Number(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white">
             {opcionesCantidad.map(v => <option key={v} value={v}>{v}</option>)}
           </select>
@@ -9107,7 +10643,7 @@ function CreditoForm({
         <p className="text-xs text-gray-300">Interés aplicado: {interesAplicado}%</p>
         <p className="text-xs text-gray-400">Total automático: {fmt(totalAutomatico)}</p>
         <p className="text-lg font-bold text-indigo-300">Total a enviar: {fmt(totalFinal)}</p>
-        <p className="text-xs text-amber-300">Al guardar, el estado lo asigna el sistema (p. ej. pendiente de aprobación según tu cuenta).</p>
+        <p className="text-xs text-amber-300">{soloPlanMensual ? 'Al guardar, el préstamo mensual queda activo de inmediato.' : 'Al guardar, el estado lo asigna el sistema (p. ej. pendiente de aprobación según tu cuenta).'}</p>
       </div>
       <div className="flex gap-2">
         <button type="button" onClick={onCancel} className="flex-1 bg-gray-700 text-white rounded-xl py-3 font-semibold">Cancelar</button>
@@ -9118,25 +10654,19 @@ function CreditoForm({
             tipo,
             monto_solicitado: base,
             detalle_mercaderia: tipo === 'M' ? detalleMercaderia : null,
-            fecha_inicio: modoInicio === 'POST_FECHA' ? fechaPost : fechaInicioAficha,
-            plazo_unidad: plazoUnidad,
+            fecha_inicio: fechaInicio,
+            plazo_unidad: soloPlanMensual ? 'Meses' : plazoUnidad,
             plazo_cantidad: plazoCantidad,
             total_con_interes: totalFinal,
             interes_aplicado: interesAplicado,
-            inicio_cuotas_modo: modoInicio,
-            fecha_inicio_cuotas_post: modoInicio === 'POST_FECHA' ? fechaPost : null,
-            es_retroactivo: Boolean(puedeRetro && (
-              (modoInicio === 'POST_FECHA' && fechaPost < hoy())
-              || (modoInicio === 'A_FECHA' && fechaInicioAficha < hoy())
-            )),
+            es_retroactivo: Boolean(puedeRetro && fechaInicio < hoy()),
           })}
           disabled={
             !clienteId
             || !esUuidClienteId(clienteId)
             || base <= 0
             || (tipo === 'M' && !detalleMercaderia.trim())
-            || (modoInicio === 'POST_FECHA' && !puedeRetro && (!fechaPost || fechaPost < fechaMinPost))
-            || (modoInicio === 'A_FECHA' && !puedeRetro && (!fechaInicioAficha || fechaInicioAficha < hoy()))
+            || Boolean(validarFechaInicioCredito(fechaInicio, puedeRetro))
           }
           className="flex-1 bg-indigo-500 text-white rounded-xl py-3 font-bold disabled:opacity-50"
         >
@@ -9337,8 +10867,10 @@ function CreditoReviewForm({
   const esProcesado = estadoCredito === 'ACTIVO' || estadoCredito === 'RECHAZADO' || estadoCredito === 'FINALIZADO';
   const puedeResolver = puedeGestionarRevision && !esProcesado;
   const capitalBase = Math.max(0, Number(credito.monto_solicitado) || 0);
-  const [plazoUnidad, setPlazoUnidad] = useState<'Días' | 'Semanas' | 'Meses'>(() =>
-    normalizarPlazoUnidad(credito.plan ?? ''));
+  const [plazoUnidad, setPlazoUnidad] = useState<'Días' | 'Semanas' | 'Meses'>(() => {
+    const u = normalizarPlazoUnidad(credito.plan ?? '');
+    return u === 'Meses' ? 'Semanas' : u;
+  });
   const [plazoCantidad, setPlazoCantidad] = useState<number>(Math.max(1, Number(credito.plazo_cantidad ?? credito.cuotas) || 1));
   const [interes, setInteres] = useState<number>(Number(credito.interes_aplicado) || 30);
   const [total, setTotal] = useState<number>(() => redondearPesos(
@@ -9375,11 +10907,7 @@ function CreditoReviewForm({
     }
     setCobradorAsignado(opcionesCobrador[0]?.valor ?? cid);
   }, [credito.id, credito.cobrador_id, opcionesCobrador]);
-  const opcionesCantidad = plazoUnidad === 'Días'
-    ? PLAN_DIARIO_OPCIONES
-    : plazoUnidad === 'Meses'
-      ? PLAN_MENSUAL_OPCIONES
-      : PLAN_SEMANAL_OPCIONES;
+  const opcionesCantidad = opcionesCantidadPlazoCredito(plazoUnidad === 'Meses' ? 'Semanas' : plazoUnidad);
   useEffect(() => {
     if (!opcionesCantidad.includes(plazoCantidad)) setPlazoCantidad(opcionesCantidad[0]);
   }, [opcionesCantidad, plazoCantidad]);
@@ -9389,13 +10917,14 @@ function CreditoReviewForm({
   return (
     <div className="space-y-4">
       <AvisoApellidoIncompleto cliente={cliente} />
+      {puedeGestionarRevision && (
+        <BloqueVideoVerificacionNegocioAdmin cliente={cliente} />
+      )}
       <div className="bg-gray-800/60 rounded-xl p-3">
         <p className="text-sm font-semibold">{nombreCompletoCliente(cliente) || credito.cliente_id}</p>
         <p className="text-xs text-gray-400">Solicitud {credito.id} · Tipo {credito.tipo}</p>
         <p className="text-xs text-cyan-400/90 mt-1">
-          Inicio de cuotas: {String(credito.inicio_cuotas_modo || 'A_FECHA').toUpperCase() === 'POST_FECHA' && credito.fecha_inicio_cuotas_post
-            ? `Post-fecha (${String(credito.fecha_inicio_cuotas_post).slice(0, 10)})`
-            : 'A fecha (referencia al aprobar)'}
+          Fecha de inicio del crédito: {String(credito.fecha_inicio || '').slice(0, 10) || '—'} (referencia). Cuotas para cobrar desde el día siguiente a la aprobación.
         </p>
         {credito.es_retroactivo && (
           <p className="text-xs text-amber-300/95 mt-1 font-semibold">Carga retroactiva — quedó registrado en base (es_retroactivo)</p>
@@ -9412,7 +10941,6 @@ function CreditoReviewForm({
           >
             <option value="Días">Diario (por día)</option>
             <option value="Semanas">Semanal</option>
-            <option value="Meses">Mensual</option>
           </select>
         </div>
         <div>

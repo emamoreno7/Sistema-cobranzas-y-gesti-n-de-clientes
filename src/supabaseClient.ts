@@ -3,6 +3,8 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 const SUPABASE_URL = 'https://hdgnsonvsqipxcxwashp.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_aJa1D1IcGOyZ0eXz8QmfJQ_0tPyv_7i';
 
+export { SUPABASE_URL, SUPABASE_ANON_KEY };
+
 const nativeFetch = globalThis.fetch.bind(globalThis);
 
 /** Lanzada cuando la sesión no es válida (401 / refresh token inválido); el formulario muestra el mensaje al usuario. */

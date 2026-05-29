@@ -2,7 +2,7 @@ create table if not exists public.usuarios (
   id uuid primary key default gen_random_uuid(),
   username text unique not null,
   password text not null,
-  rol text not null check (rol in ('super', 'admin', 'cobrador', 'root')),
+  rol text not null check (rol in ('super', 'admin', 'cobrador', 'vendedor', 'proveedor', 'root')),
   activo boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -131,6 +131,7 @@ create table if not exists public.configuracion (
   porcentaje_interes numeric,
   interes_credito_m numeric,
   interes_credito_p numeric,
+  porcentaje_comision_vendedor numeric default 5,
   nombre_empresa text,
   telefono_empresa text,
   direccion_empresa text,
