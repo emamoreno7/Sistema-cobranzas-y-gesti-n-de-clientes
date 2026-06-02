@@ -878,7 +878,94 @@ const MARCA_COMPLETA = `${MARCA_PRIMARIA} ${MARCA_DESCRIPTOR}`;
 const M: Config = { moneda: 'ARS', simboloMoneda: '$', moraPorciento: 2, nombreEmpresa: MARCA_COMPLETA, telefonoEmpresa: '+54 11 0000 0000', direccionEmpresa: 'Calle Principal 123', ruc: '00-00000000-0', numeroWhatsappAdmin: '', interesCreditoM: 30, interesCreditoP: 30, porcentajeComisionVendedor: 5, modoExterior: false };
 const PLAN_SEMANAL_OPCIONES = [4, 6, 8, 10, 12, 17, 44];
 const PLAN_DIARIO_OPCIONES = [26, 39, 52, 65, 78, 117, 286];
-const PLAN_MENSUAL_OPCIONES = [3, 6, 9, 12, 18, 24];
+/** Cuotas mensuales ofrecidas en el módulo mensual (sin 7 ni 9 meses). */
+const PLAN_MENSUAL_OPCIONES = [1, 2, 3, 4, 5, 6, 8, 10, 12];
+const LS_AJUSTE_TASA_MENSUAL_PCT = 'cp_ajuste_tasa_mensual_pct';
+const LS_TASAS_MENSUAL_PERSONALIZADAS = 'cp_tasas_mensual_por_mes';
+/** Tasa por defecto (%) según cantidad de meses (mes correlativo). */
+const TASA_INTERES_MENSUAL_DEFECTO_POR_MES: Record<number, number> = {
+  1: 30,
+  2: 45,
+  3: 70,
+  4: 90,
+  5: 110,
+  6: 135,
+  7: 175,
+  8: 175,
+  10: 195,
+  12: 210,
+};
+
+type ConfigTasasMensual = {
+  ajusteGlobalPct: number;
+  tasasPersonalizadas: Record<number, number>;
+};
+
+const CONFIG_TASAS_MENSUAL_VACIO: ConfigTasasMensual = { ajusteGlobalPct: 0, tasasPersonalizadas: {} };
+
+function leerAjusteTasaMensualPct(): number {
+  try {
+    const v = localStorage.getItem(LS_AJUSTE_TASA_MENSUAL_PCT);
+    const n = parseFloat(v ?? '0');
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function leerTasasPersonalizadasMensual(): Record<number, number> {
+  try {
+    const raw = localStorage.getItem(LS_TASAS_MENSUAL_PERSONALIZADAS);
+    if (!raw) return {};
+    const obj = JSON.parse(raw) as Record<string, number>;
+    const out: Record<number, number> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      const meses = Number(k);
+      const pct = Number(v);
+      if (Number.isFinite(meses) && meses > 0 && Number.isFinite(pct) && pct >= 0) out[meses] = Math.round(pct);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function leerConfigTasasMensual(): ConfigTasasMensual {
+  return {
+    ajusteGlobalPct: leerAjusteTasaMensualPct(),
+    tasasPersonalizadas: leerTasasPersonalizadasMensual(),
+  };
+}
+
+function guardarConfigTasasMensual(config: ConfigTasasMensual): void {
+  localStorage.setItem(LS_AJUSTE_TASA_MENSUAL_PCT, String(config.ajusteGlobalPct));
+  localStorage.setItem(LS_TASAS_MENSUAL_PERSONALIZADAS, JSON.stringify(config.tasasPersonalizadas));
+}
+
+function tasaDefectoMensualPorMeses(meses: number): number {
+  return TASA_INTERES_MENSUAL_DEFECTO_POR_MES[meses] ?? TASA_INTERES_MENSUAL_DEFECTO_POR_MES[1] ?? 30;
+}
+
+function tasaBaseMensualPorMeses(meses: number, tasasPersonalizadas: Record<number, number>): number {
+  if (tasasPersonalizadas[meses] != null) return tasasPersonalizadas[meses];
+  return tasaDefectoMensualPorMeses(meses);
+}
+
+function tasaInteresMensualPorMeses(meses: number, config: ConfigTasasMensual = CONFIG_TASAS_MENSUAL_VACIO): number {
+  const base = tasaBaseMensualPorMeses(meses, config.tasasPersonalizadas);
+  return Math.max(0, Math.round(base + config.ajusteGlobalPct));
+}
+
+function listadoPlanMensualPlazoTasa(config: ConfigTasasMensual = CONFIG_TASAS_MENSUAL_VACIO): Array<{ meses: number; tasaPct: number }> {
+  return PLAN_MENSUAL_OPCIONES.map(meses => ({
+    meses,
+    tasaPct: tasaInteresMensualPorMeses(meses, config),
+  }));
+}
+
+function cantidadTasasMensualPersonalizadas(config: ConfigTasasMensual): number {
+  return Object.keys(config.tasasPersonalizadas).length;
+}
 const AMBITO_DATOS_PRINCIPAL = 'principal';
 const AMBITO_DATOS_MENSUAL = 'mensual';
 const PAGINAS_MODULO_MENSUAL = new Set([
@@ -2655,6 +2742,8 @@ export default function App() {
   const [mNotificaciones, setMNotificaciones] = useState(false);
   const [mQrScan, setMQrScan] = useState(false);
   const [mCreditoTipo, setMCreditoTipo] = useState<'M' | 'P' | null>(null);
+  const [configTasasMensual, setConfigTasasMensual] = useState<ConfigTasasMensual>(() => leerConfigTasasMensual());
+  const [mAjusteTasaMensual, setMAjusteTasaMensual] = useState(false);
   /** Tras crear crédito como MatiasM/Vendedor: splash bloqueante hasta abrir WhatsApp al admin. */
   const [exitoCreditoCobradorWa, setExitoCreditoCobradorWa] = useState<{
     linkWhatsapp: string;
@@ -6681,6 +6770,24 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 <p className="text-2xl font-bold text-white">{creditosOrEmpty.filter(c => esCreditoActivo(c)).length}</p>
               </div>
             </div>
+            <button
+              type="button"
+              onClick={() => setMAjusteTasaMensual(true)}
+              className="w-full rounded-2xl border border-violet-500/40 bg-violet-950/30 px-4 py-3 flex items-center justify-between gap-3 active:scale-[0.98] transition"
+            >
+              <span className="text-left">
+                <span className="block text-sm font-bold text-violet-100">📊 Tasas de interés mensual</span>
+                <span className="block text-xs text-violet-200/70 mt-0.5">
+                  {configTasasMensual.ajusteGlobalPct !== 0 && (
+                    <>Ajuste general {configTasasMensual.ajusteGlobalPct > 0 ? '+' : ''}{configTasasMensual.ajusteGlobalPct} p.p. · </>
+                  )}
+                  {cantidadTasasMensualPersonalizadas(configTasasMensual) > 0
+                    ? `${cantidadTasasMensualPersonalizadas(configTasasMensual)} plan(es) personalizado(s)`
+                    : 'Tasas por defecto'}
+                </span>
+              </span>
+              <span className="text-violet-300 text-lg shrink-0">⚙️</span>
+            </button>
           </div>
         )}
         {page === 'dashboard' && !esUsuarioMensualUsuario && (
@@ -6977,7 +7084,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         {page === 'simulador_mensual' && esUsuarioMensualUsuario && (
           <div className="space-y-4">
             <h2 className="text-lg font-bold">🧮 Simulador de préstamos mensuales</h2>
-            <CalculadoraPlanesCreditoMensual />
+            <CalculadoraPlanesCreditoMensual configTasasMensual={configTasasMensual} />
           </div>
         )}
 
@@ -8815,8 +8922,22 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             interesP={data.config.interesCreditoP ?? 30}
             rol={rol}
             soloPlanMensual={esUsuarioMensualUsuario}
+            configTasasMensual={configTasasMensual}
             onCancel={() => setMCreditoTipo(null)}
             onSubmit={handleCrearCredito}
+          />
+        </Modal>
+      )}
+      {mAjusteTasaMensual && esUsuarioMensualUsuario && (
+        <Modal onClose={() => setMAjusteTasaMensual(false)} title="📊 Tasas de interés mensual">
+          <AjusteTasasMensualPanel
+            config={configTasasMensual}
+            onGuardar={(nuevo) => {
+              setConfigTasasMensual(nuevo);
+              guardarConfigTasasMensual(nuevo);
+              setMAjusteTasaMensual(false);
+            }}
+            onCerrar={() => setMAjusteTasaMensual(false)}
           />
         </Modal>
       )}
@@ -9375,10 +9496,127 @@ function NoPagoForm({ gpsLoading, gpsPos, onCapturarGPS, onSubmit, instrucciones
   );
 }
 
-function CalculadoraPlanesCreditoMensual() {
+function AjusteTasasMensualPanel({
+  config,
+  onGuardar,
+  onCerrar,
+}: {
+  config: ConfigTasasMensual;
+  onGuardar: (nuevo: ConfigTasasMensual) => void;
+  onCerrar: () => void;
+}) {
+  const [draft, setDraft] = useState<ConfigTasasMensual>(config);
+  useEffect(() => { setDraft(config); }, [config]);
+  const planPreview = useMemo(() => listadoPlanMensualPlazoTasa(draft), [draft]);
+  const pasoAjusteGlobal = (delta: number) => setDraft(prev => ({ ...prev, ajusteGlobalPct: prev.ajusteGlobalPct + delta }));
+  const setTasaEfectivaPlazo = (meses: number, tasaEfectiva: number) => {
+    const base = Math.max(0, Math.round(tasaEfectiva - draft.ajusteGlobalPct));
+    setDraft(prev => {
+      const tasasPersonalizadas = { ...prev.tasasPersonalizadas };
+      const defecto = tasaDefectoMensualPorMeses(meses);
+      if (base === defecto) delete tasasPersonalizadas[meses];
+      else tasasPersonalizadas[meses] = base;
+      return { ...prev, tasasPersonalizadas };
+    });
+  };
+  const restablecerPlazo = (meses: number) => {
+    setDraft(prev => {
+      const tasasPersonalizadas = { ...prev.tasasPersonalizadas };
+      delete tasasPersonalizadas[meses];
+      return { ...prev, tasasPersonalizadas };
+    });
+  };
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-gray-400 leading-relaxed">
+        Podés subir o bajar <strong className="text-gray-200">todas</strong> las tasas con el ajuste general, o editar <strong className="text-gray-200">cada plazo</strong> por separado. El simulador y los nuevos préstamos usan estos valores.
+      </p>
+      <div className="rounded-xl border border-violet-500/30 bg-violet-950/20 p-4 space-y-3">
+        <label className="text-xs text-violet-200 block">Ajuste general (suma a todos los planes, p.p.)</label>
+        <div className="flex flex-wrap gap-2">
+          {[-10, -5, -1, 1, 5, 10].map(delta => (
+            <button
+              key={delta}
+              type="button"
+              onClick={() => pasoAjusteGlobal(delta)}
+              className="rounded-lg bg-gray-800 border border-gray-600 px-3 py-2 text-sm font-semibold text-white active:scale-95"
+            >
+              {delta > 0 ? `+${delta}` : delta}
+            </button>
+          ))}
+        </div>
+        <input
+          type="number"
+          value={draft.ajusteGlobalPct}
+          onChange={e => setDraft(prev => ({ ...prev, ajusteGlobalPct: Number(e.target.value) || 0 }))}
+          className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white text-center text-lg font-bold"
+        />
+      </div>
+      <div className="rounded-xl border border-gray-700 overflow-hidden">
+        <p className="text-xs font-semibold text-gray-300 px-3 py-2 bg-gray-800/80">Tasa por plazo (% efectivo en simulador)</p>
+        <div className="max-h-64 overflow-y-auto divide-y divide-gray-800">
+          {planPreview.map(p => {
+            const personalizada = draft.tasasPersonalizadas[p.meses] != null;
+            const defecto = tasaDefectoMensualPorMeses(p.meses);
+            return (
+              <div key={p.meses} className="px-3 py-2.5 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm text-gray-300 shrink-0">{p.meses} {p.meses === 1 ? 'mes' : 'meses'}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={p.tasaPct}
+                    onChange={e => setTasaEfectivaPlazo(p.meses, Number(e.target.value) || 0)}
+                    className="w-24 bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-sm text-white text-right font-bold"
+                  />
+                </div>
+                <p className="text-[10px] text-gray-500">
+                  Defecto: {defecto}%
+                  {personalizada && <span className="text-violet-300"> · base personalizada: {draft.tasasPersonalizadas[p.meses]}%</span>}
+                  {draft.ajusteGlobalPct !== 0 && <span> · ajuste global {draft.ajusteGlobalPct > 0 ? '+' : ''}{draft.ajusteGlobalPct} p.p.</span>}
+                </p>
+                {personalizada && (
+                  <button
+                    type="button"
+                    onClick={() => restablecerPlazo(p.meses)}
+                    className="text-[10px] text-violet-300 underline underline-offset-2"
+                  >
+                    Volver al valor por defecto ({defecto}%)
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="flex flex-col sm:flex-row gap-2">
+        <button
+          type="button"
+          onClick={() => setDraft(CONFIG_TASAS_MENSUAL_VACIO)}
+          className="flex-1 bg-gray-700 text-white rounded-xl py-3 font-semibold active:scale-95"
+        >
+          Restablecer todo
+        </button>
+        <button type="button" onClick={onCerrar} className="flex-1 bg-gray-800 border border-gray-600 text-white rounded-xl py-3 font-semibold">
+          Cancelar
+        </button>
+        <button
+          type="button"
+          onClick={() => onGuardar(draft)}
+          className="flex-1 bg-violet-600 text-white rounded-xl py-3 font-bold active:scale-95"
+        >
+          Guardar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CalculadoraPlanesCreditoMensual({ configTasasMensual = CONFIG_TASAS_MENSUAL_VACIO }: { configTasasMensual?: ConfigTasasMensual }) {
   const [monto, setMonto] = useState('');
-  const [tasaInteres, setTasaInteres] = useState('30');
-  const [cuotas, setCuotas] = useState(PLAN_MENSUAL_OPCIONES[0]);
+  const [cuotas, setCuotas] = useState<number>(PLAN_MENSUAL_OPCIONES[0]);
+  const planOpciones = useMemo(() => listadoPlanMensualPlazoTasa(configTasasMensual), [configTasasMensual]);
+  const tasaInteres = String(tasaInteresMensualPorMeses(cuotas, configTasasMensual));
   const montoSolicitado = redondearPesos(Number(monto) || 0);
   const interesPorcentaje = Number(tasaInteres) || 0;
   const total = redondearPesos(montoSolicitado + redondearPesos(montoSolicitado * (interesPorcentaje / 100)));
@@ -9386,7 +9624,19 @@ function CalculadoraPlanesCreditoMensual() {
   const valorCuota = montosCuota[0] ?? 0;
   return (
     <div className="rounded-2xl border border-teal-500/30 bg-teal-950/20 p-4 space-y-3">
-      <p className="text-xs text-teal-100/80">Simulación de cuotas mensuales (solo referencia).</p>
+      <p className="text-xs text-teal-100/80">
+        Simulación de cuotas mensuales (solo referencia).
+        {(configTasasMensual.ajusteGlobalPct !== 0 || cantidadTasasMensualPersonalizadas(configTasasMensual) > 0) && (
+          <span className="block mt-1 text-violet-200/90">
+            {configTasasMensual.ajusteGlobalPct !== 0 && (
+              <>Ajuste general: {configTasasMensual.ajusteGlobalPct > 0 ? '+' : ''}{configTasasMensual.ajusteGlobalPct} p.p. </>
+            )}
+            {cantidadTasasMensualPersonalizadas(configTasasMensual) > 0 && (
+              <>{cantidadTasasMensualPersonalizadas(configTasasMensual)} plan(es) con tasa personalizada</>
+            )}
+          </span>
+        )}
+      </p>
       <div>
         <label className="text-xs text-gray-400 block mb-1">Capital solicitado</label>
         <input type="number" value={monto} onChange={e => setMonto(e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white" placeholder="0" />
@@ -9394,12 +9644,14 @@ function CalculadoraPlanesCreditoMensual() {
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="text-xs text-gray-400 block mb-1">Interés (%)</label>
-          <input type="number" value={tasaInteres} onChange={e => setTasaInteres(e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-white" />
+          <input type="number" value={tasaInteres} readOnly className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-white opacity-80" />
         </div>
         <div>
           <label className="text-xs text-gray-400 block mb-1">Cuotas mensuales</label>
           <select value={cuotas} onChange={e => setCuotas(Number(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-white">
-            {PLAN_MENSUAL_OPCIONES.map(n => <option key={n} value={n}>{n} meses</option>)}
+            {planOpciones.map(p => (
+              <option key={p.meses} value={p.meses}>{p.meses} {p.meses === 1 ? 'mes' : 'meses'} · {p.tasaPct}%</option>
+            ))}
           </select>
         </div>
       </div>
@@ -10454,6 +10706,7 @@ function CreditoForm({
   interesP,
   rol,
   soloPlanMensual = false,
+  configTasasMensual = CONFIG_TASAS_MENSUAL_VACIO,
   onCancel,
   onSubmit,
 }: {
@@ -10463,6 +10716,7 @@ function CreditoForm({
   interesP: number;
   rol: string | null;
   soloPlanMensual?: boolean;
+  configTasasMensual?: ConfigTasasMensual;
   onCancel: () => void;
   onSubmit: (payload: {
     cliente_id: string; tipo: 'M' | 'P'; monto_solicitado: number; detalle_mercaderia: string | null; fecha_inicio: string;
@@ -10478,7 +10732,7 @@ function CreditoForm({
   const [montoCapital, setMontoCapital] = useState('');
   const [interesAplicado, setInteresAplicado] = useState<number>(30);
   const [plazoUnidad, setPlazoUnidad] = useState<'Días' | 'Semanas' | 'Meses'>(() => (soloPlanMensual ? 'Meses' : 'Semanas'));
-  const [plazoCantidad, setPlazoCantidad] = useState(() => (soloPlanMensual ? PLAN_MENSUAL_OPCIONES[0] : 1));
+  const [plazoCantidad, setPlazoCantidad] = useState<number>(() => (soloPlanMensual ? PLAN_MENSUAL_OPCIONES[0] : 1));
 
   const esCobrador = String(rol || '').toLowerCase() === 'cobrador';
   const puedeRetro = puedeCargaRetroactivaCredito(rol);
@@ -10490,13 +10744,21 @@ function CreditoForm({
     }
   }, [puedeRetro, fechaInicio, fechaMaxFutura]);
   useEffect(() => {
+    if (soloPlanMensual) {
+      setInteresAplicado(tasaInteresMensualPorMeses(plazoCantidad, configTasasMensual));
+      return;
+    }
     if (esCobrador) {
       setInteresAplicado(30);
       return;
     }
     const baseInteres = tipo === 'M' ? Number(interesM) : Number(interesP);
     setInteresAplicado(Number.isFinite(baseInteres) && baseInteres > 0 ? baseInteres : 30);
-  }, [esCobrador, tipo, interesM, interesP]);
+  }, [soloPlanMensual, plazoCantidad, configTasasMensual, esCobrador, tipo, interesM, interesP]);
+  const planMensualOpciones = useMemo(
+    () => listadoPlanMensualPlazoTasa(configTasasMensual),
+    [configTasasMensual],
+  );
   const q = busqueda.trim().toLowerCase();
   const clientesFiltrados = useMemo(() => {
     if (!q) return clientes;
@@ -10611,7 +10873,11 @@ function CreditoForm({
         <div>
           <label className="text-xs text-gray-400 block mb-1">{soloPlanMensual ? 'Cuotas (meses)' : 'Cantidad'}</label>
           <select value={plazoCantidad} onChange={e => setPlazoCantidad(Number(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white">
-            {opcionesCantidad.map(v => <option key={v} value={v}>{v}</option>)}
+            {soloPlanMensual
+              ? planMensualOpciones.map(p => (
+                <option key={p.meses} value={p.meses}>{p.meses} {p.meses === 1 ? 'mes' : 'meses'} · {p.tasaPct}%</option>
+              ))
+              : opcionesCantidad.map(v => <option key={v} value={v}>{v}</option>)}
           </select>
         </div>
       </div>
@@ -10621,12 +10887,16 @@ function CreditoForm({
           type="number"
           value={interesAplicado}
           onChange={e => setInteresAplicado(Number(e.target.value) || 0)}
-          readOnly={esCobrador}
-          disabled={esCobrador}
+          readOnly={esCobrador || soloPlanMensual}
+          disabled={esCobrador || soloPlanMensual}
           className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white disabled:opacity-70"
         />
         <p className="text-[11px] text-gray-500 mt-1">
-          {esCobrador ? 'Para cobrador el interés queda fijo en 30%.' : 'Podés ajustar el interés antes de guardar la solicitud.'}
+          {soloPlanMensual
+            ? 'La tasa se asigna automáticamente según la cantidad de cuotas mensuales.'
+            : esCobrador
+              ? 'Para cobrador el interés queda fijo en 30%.'
+              : 'Podés ajustar el interés antes de guardar la solicitud.'}
         </p>
       </div>
       <div>
