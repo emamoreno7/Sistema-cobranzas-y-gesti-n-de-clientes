@@ -601,15 +601,33 @@ async function registrarCobranzaDirectaConReintentos(
   return { ok: false, error: lastErr };
 }
 
+function errorColumnaCreditoFaltante(err: unknown): string | null {
+  const msg = String((err as { message?: string })?.message ?? '');
+  const m = msg.match(/Could not find the '([^']+)' column of 'creditos'/i);
+  return m?.[1] ?? null;
+}
+
+function filaCreditoSinColumna(row: Record<string, unknown>, col: string): Record<string, unknown> {
+  const { [col]: _omit, ...rest } = row;
+  return rest;
+}
+
 async function insertarCreditoConReintentos(
   row: Record<string, unknown>,
   maxIntentos = 3,
 ): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: unknown }> {
   let lastErr: unknown;
+  let fila = { ...row };
   for (let i = 0; i < maxIntentos; i++) {
-    const { data, error } = await supabase.from('creditos').insert([row as any]).select('*').single();
+    const { data, error } = await supabase.from('creditos').insert([fila as any]).select('*').single();
     const id = String((data as Record<string, unknown> | null)?.id ?? '').trim();
     if (!error && esUuidClienteId(id)) return { ok: true, data: data as Record<string, unknown> };
+    const colFalta = errorColumnaCreditoFaltante(error);
+    if (colFalta && fila[colFalta] !== undefined) {
+      fila = filaCreditoSinColumna(fila, colFalta);
+      lastErr = error;
+      continue;
+    }
     lastErr = error ?? new Error('Respuesta sin id de crédito');
     if (esErrorSesionSupabase(error)) return { ok: false, error };
     if (i < maxIntentos - 1) await new Promise(r => setTimeout(r, 450 * (i + 1)));
@@ -1176,8 +1194,8 @@ function mapClienteFilaSupabase(c: Record<string, unknown> | null | undefined): 
     videoVerificacionPath: row.video_verificacion_path != null ? String(row.video_verificacion_path) : '',
     videoVerificacionSubidoAt: row.video_verificacion_subido_at != null ? String(row.video_verificacion_subido_at) : undefined,
     videoVerificacionExpiraAt: row.video_verificacion_expira_at != null ? String(row.video_verificacion_expira_at) : undefined,
-    lat: row.lat != null ? Number(row.lat) : undefined,
-    lng: row.lng != null ? Number(row.lng) : undefined,
+    lat: row.lat != null ? Number(row.lat) : row.gps_lat != null ? Number(row.gps_lat) : undefined,
+    lng: row.lng != null ? Number(row.lng) : row.gps_lng != null ? Number(row.gps_lng) : undefined,
     saldo: Number(row.saldo ?? 0),
     quota: Number(row.quota ?? 0),
     frecuencia: (row.frecuencia ?? 'semanal') as Cliente['frecuencia'],
@@ -4877,31 +4895,68 @@ export default function App() {
       if (v === '' || v === undefined || v === null) return null;
       return String(v);
     };
-    const toClienteRow = (c: Partial<Cliente> | null | undefined, cobradorId: string) => ({
-      nombre: c?.nombre ?? '',
-      apellido: c?.apellido ?? '',
-      dni: c?.dni ?? '',
-      telefono: normalizarTelefonoArg549(String(c?.telefono ?? '')),
-      fecha_nacimiento: toNullableDate(c?.fechaNacimiento),
-      direccion: c?.direccion ?? '',
-      dni_frente_url: c?.dniFrenteUrl ?? null,
-      dni_dorso_url: c?.dniDorsoUrl ?? null,
-      video_verificacion_url: c?.videoVerificacionUrl ?? null,
-      video_verificacion_path: c?.videoVerificacionPath ?? null,
-      video_verificacion_subido_at: c?.videoVerificacionSubidoAt ?? null,
-      video_verificacion_expira_at: c?.videoVerificacionExpiraAt ?? null,
-      cobrador_id: cobradorId,
-      orden_ruta: c?.orden_ruta != null && Number.isFinite(Number(c.orden_ruta)) ? Math.round(Number(c.orden_ruta)) : null,
-      lat: c?.lat != null && Number.isFinite(Number(c.lat)) ? Number(c.lat) : null,
-      lng: c?.lng != null && Number.isFinite(Number(c.lng)) ? Number(c.lng) : null,
-      ambito: c?.ambito ?? ambitoDatosSesion(rol),
-    });
-    const actualizarClienteSupabase = async (row: ReturnType<typeof toClienteRow>, cliId: string) => {
-      const { error } = await supabase.from('clientes').update(row as any).eq('id', cliId);
+    const toClienteRow = (c: Partial<Cliente> | null | undefined, cobradorId: string, incluirGps = true) => {
+      const base: Record<string, unknown> = {
+        nombre: c?.nombre ?? '',
+        apellido: c?.apellido ?? '',
+        dni: c?.dni ?? '',
+        telefono: normalizarTelefonoArg549(String(c?.telefono ?? '')),
+        fecha_nacimiento: toNullableDate(c?.fechaNacimiento),
+        direccion: c?.direccion ?? '',
+        dni_frente_url: c?.dniFrenteUrl ?? null,
+        dni_dorso_url: c?.dniDorsoUrl ?? null,
+        video_verificacion_url: c?.videoVerificacionUrl ?? null,
+        video_verificacion_path: c?.videoVerificacionPath ?? null,
+        video_verificacion_subido_at: c?.videoVerificacionSubidoAt ?? null,
+        video_verificacion_expira_at: c?.videoVerificacionExpiraAt ?? null,
+        cobrador_id: cobradorId,
+        orden_ruta: c?.orden_ruta != null && Number.isFinite(Number(c.orden_ruta)) ? Math.round(Number(c.orden_ruta)) : null,
+        ambito: c?.ambito ?? ambitoDatosSesion(rol),
+      };
+      if (incluirGps) {
+        base.lat = c?.lat != null && Number.isFinite(Number(c.lat)) ? Number(c.lat) : null;
+        base.lng = c?.lng != null && Number.isFinite(Number(c.lng)) ? Number(c.lng) : null;
+        if (c?.coordenadaErr) base.coordenada_err = String(c.coordenadaErr);
+      }
+      return base;
+    };
+    const errorFaltaColumnaGpsCliente = (err: { message?: string } | null | undefined) => {
+      const msg = String(err?.message ?? '').toLowerCase();
+      return msg.includes("'lat'") || msg.includes("'lng'") || msg.includes('schema cache');
+    };
+    const actualizarClienteSupabase = async (row: Record<string, unknown>, cliId: string) => {
+      let { error } = await supabase.from('clientes').update(row as any).eq('id', cliId);
+      if (error && errorFaltaColumnaGpsCliente(error)) {
+        const sinGps = toClienteRow(
+          {
+            nombre: String(row.nombre ?? ''),
+            apellido: String(row.apellido ?? ''),
+            dni: String(row.dni ?? ''),
+            telefono: String(row.telefono ?? ''),
+            fechaNacimiento: row.fecha_nacimiento as string | undefined,
+            direccion: String(row.direccion ?? ''),
+            dniFrenteUrl: row.dni_frente_url as string | undefined,
+            dniDorsoUrl: row.dni_dorso_url as string | undefined,
+            videoVerificacionUrl: row.video_verificacion_url as string | undefined,
+            videoVerificacionPath: row.video_verificacion_path as string | undefined,
+            videoVerificacionSubidoAt: row.video_verificacion_subido_at as string | undefined,
+            videoVerificacionExpiraAt: row.video_verificacion_expira_at as string | undefined,
+            orden_ruta: row.orden_ruta as number | null | undefined,
+            ambito: row.ambito as string | undefined,
+          },
+          String(row.cobrador_id ?? cobradorId),
+          false,
+        );
+        ({ error } = await supabase.from('clientes').update(sinGps as any).eq('id', cliId));
+      }
       return { error };
     };
-    const insertarClienteSupabase = async (row: ReturnType<typeof toClienteRow>) => {
-      const { data, error } = await supabase.from('clientes').insert([row as any]).select('*').single();
+    const insertarClienteSupabase = async (row: Record<string, unknown>, cliOriginal?: Partial<Cliente>) => {
+      let { data, error } = await supabase.from('clientes').insert([row as any]).select('*').single();
+      if (error && errorFaltaColumnaGpsCliente(error) && cliOriginal) {
+        const sinGps = toClienteRow(cliOriginal, String(row.cobrador_id ?? cobradorId), false);
+        ({ data, error } = await supabase.from('clientes').insert([sinGps as any]).select('*').single());
+      }
       return { data, error };
     };
 
@@ -5141,7 +5196,7 @@ export default function App() {
 
         // B + C: INSERT y respuesta con UUID (.select().single() en insertarClienteSupabase)
         const rowCompleto = toClienteRow(nuevo, cobradorId);
-        const { data: insertData, error } = await insertarClienteSupabase(rowCompleto);
+        const { data: insertData, error } = await insertarClienteSupabase(rowCompleto, nuevo);
         if (error) {
           console.error('Error detallado de Supabase:', error);
           if (esErrorSesionSupabase(error)) {
@@ -6099,12 +6154,20 @@ export default function App() {
     const clienteIdNorm = fichaIdUuid(idClientePlanoStr);
     const cobradorCreditoNorm = String(cobradorId).trim();
     const ambitoCred = ambitoDatosSesion(rol);
+    const totalCred = redondearPesos(Number(payload.total_con_interes));
+    const cuotasCred = Math.max(1, Number(payload.plazo_cantidad));
     rowCredito = {
       cliente_id: clienteIdNorm,
+      tipo: payload.tipo,
       monto_solicitado: redondearPesos(Number(payload.monto_solicitado)),
-      monto_total: redondearPesos(Number(payload.total_con_interes)),
-      cuotas: Number(payload.plazo_cantidad),
+      monto_total: totalCred,
+      total_con_interes: totalCred,
+      cuotas: cuotasCred,
+      plazo_cantidad: cuotasCred,
+      plazo_unidad: plazoUnidadSol,
       plan: planEtiquetaSol,
+      interes_aplicado: Number(payload.interes_aplicado) || 30,
+      detalle_mercaderia: payload.detalle_mercaderia,
       fecha_inicio: fechaInicioNorm,
       cobrador_id: cobradorCreditoNorm ? (fichaIdUuid(cobradorCreditoNorm) || cobradorCreditoNorm) : cobradorCreditoNorm,
       estado: esMensualCred ? 'ACTIVO' : 'PENDIENTE',
@@ -6113,7 +6176,6 @@ export default function App() {
       cobrador_notif_email: emailSesion || null,
       es_retroactivo: Boolean(payload.es_retroactivo),
       ambito: ambitoCred,
-      tipo: payload.tipo,
     };
     if (esUsuarioVendedorSesion) {
       rowCredito.vendedor_id = cobradorCreditoNorm ? (fichaIdUuid(cobradorCreditoNorm) || cobradorCreditoNorm) : cobradorCreditoNorm;
@@ -6133,7 +6195,11 @@ export default function App() {
         actor: etiquetaCreadorCredito,
         meta,
       });
-      alert('No se pudo crear la solicitud de crédito tras varios intentos. El equipo fue notificado para revisión.');
+      const colFalta = errorColumnaCreditoFaltante(insCred.error);
+      const hintMigracion = colFalta
+        ? `\n\nFalta la columna «${colFalta}» en la tabla creditos. Ejecutá en Supabase la migración 035_creditos_columnas_app.sql (y recargá el esquema si hace falta).`
+        : '\n\nRevisá en Supabase que la tabla creditos tenga las columnas de la migración 035.';
+      alert('No se pudo crear la solicitud de crédito tras varios intentos.' + hintMigracion);
       return;
     }
     const created = insCred.data;
@@ -7739,8 +7805,18 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                       onEdit={() => { setMCliente(cli); setTab(0); }}
                       onDelete={esMarcosPUsuario ? (() => handleDeleteCliente(cli.id)) : undefined}
                       onDetail={() => setMDetalleCliente(cli)}>
-                      <button onClick={() => setMDetalleCliente(cli)}
-                        className="w-full bg-gray-900/70 border border-gray-800 rounded-2xl p-4 text-left active:scale-[0.98] transition-all">
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setMDetalleCliente(cli)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setMDetalleCliente(cli);
+                          }
+                        }}
+                        className="w-full bg-gray-900/70 border border-gray-800 rounded-2xl p-4 text-left active:scale-[0.98] transition-all cursor-pointer"
+                      >
                         <div className="flex items-start gap-3">
                           <div className="w-12 h-12 bg-gray-800 rounded-xl flex items-center justify-center text-xl flex-shrink-0">
                             {sem === '🔴' ? '🚩' : sem === '🟢' ? '✅' : sem === '🟡' ? '⏳' : '💚'}
@@ -7760,6 +7836,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                           </div>
                           <div className="flex flex-col gap-2 flex-shrink-0">
                             <button
+                              type="button"
                               onClick={e => { e.stopPropagation(); setMCliente(cli); setTab(0); }}
                               className="w-9 h-9 bg-indigo-500/20 rounded-lg flex items-center justify-center text-indigo-300 active:scale-90 transition"
                               title="Editar cliente"
@@ -7767,11 +7844,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                             >
                               ✏️
                             </button>
-                            <button onClick={e => { e.stopPropagation(); waCliente(cli); }} className="w-9 h-9 bg-green-500/20 rounded-lg flex items-center justify-center text-green-400 active:scale-90 transition">💬</button>
-                            <button onClick={e => { e.stopPropagation(); geoCliente(cli); }} className="w-9 h-9 bg-blue-500/20 rounded-lg flex items-center justify-center text-blue-400 active:scale-90 transition">📍</button>
+                            <button type="button" onClick={e => { e.stopPropagation(); waCliente(cli); }} className="w-9 h-9 bg-green-500/20 rounded-lg flex items-center justify-center text-green-400 active:scale-90 transition" aria-label="WhatsApp">💬</button>
+                            <button type="button" onClick={e => { e.stopPropagation(); geoCliente(cli); }} className="w-9 h-9 bg-blue-500/20 rounded-lg flex items-center justify-center text-blue-400 active:scale-90 transition" aria-label="Ubicación">📍</button>
                           </div>
                         </div>
-                      </button>
+                      </div>
                     </SwipeRow>
                   );
                 })}
@@ -7835,8 +7912,18 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 <SwipeRow key={fic.id} id={fic.id}
                   onEdit={() => { setMFicha({ cliente: cli, ficha: fic }); setTab(0); }}
                   onDelete={esMarcosPUsuario ? (() => handleDeleteFicha(fic.id)) : undefined}>
-                  <button onClick={() => setMFicha({ cliente: cli, ficha: fic })}
-                    className={`w-full bg-gradient-to-br ${semaforo.cardClass} rounded-2xl p-4 text-left active:scale-[0.98] transition-all`}>
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setMFicha({ cliente: cli, ficha: fic })}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setMFicha({ cliente: cli, ficha: fic });
+                      }
+                    }}
+                    className={`w-full bg-gradient-to-br ${semaforo.cardClass} rounded-2xl p-4 text-left active:scale-[0.98] transition-all cursor-pointer`}
+                  >
                     <div className="flex items-center justify-between">
                       <div>
                         <p className="font-bold">{nombreCompletoCliente(cli) ?? '—'}</p>
@@ -7852,7 +7939,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     <div className="mt-3 bg-gray-800 rounded-full h-2">
                       <div className="bg-gradient-to-r from-green-400 to-emerald-500 h-2 rounded-full transition-all" style={{ width: `${(fic.cuotasPagas / fic.cuotas) * 100}%` }} />
                     </div>
-                  </button>
+                  </div>
                 </SwipeRow>
               );
             })}
