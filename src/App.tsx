@@ -24,6 +24,7 @@ import { TrialBloqueoOverlay } from './components/TrialBloqueoOverlay';
 import { TrialCountdownBadge } from './components/TrialCountdownBadge';
 import { VistaRapidaSistemaModal } from './components/VistaRapidaSistemaModal';
 import { PanelRootTecnico } from './components/PanelRootTecnico';
+import { VistaCheques } from './components/VistaCheques';
 import { registrarEventoSesion } from './utils/registrarEventoSesion';
 import { CONFIG_DEFECTO, configDesdeCacheLocal, configDesdeSupabase } from './utils/configEntrega';
 import {
@@ -1030,7 +1031,7 @@ function cantidadTasasMensualPersonalizadas(config: ConfigTasasMensual): number 
 const AMBITO_DATOS_PRINCIPAL = 'principal';
 const AMBITO_DATOS_MENSUAL = 'mensual';
 const PAGINAS_MODULO_MENSUAL = new Set([
-  'dashboard', 'clientes', 'creditos', 'ruta', 'simulador_mensual', 'recibos_mensuales',
+  'dashboard', 'clientes', 'creditos', 'ruta', 'simulador_mensual', 'recibos_mensuales', 'cheques',
 ]);
 
 function opcionesCantidadPlazoCredito(plazoUnidad: 'Días' | 'Semanas' | 'Meses'): number[] {
@@ -1855,6 +1856,12 @@ function esUsuarioPruebaSesion(usernameState: string | null | undefined, loginEm
 function esUsuarioRootOperador(usernameState: string | null | undefined, loginEmail: string | null | undefined): boolean {
   const u = normalizarLoginUsuario(usernameState);
   return u === 'root' || normalizarEmail(loginEmail) === 'root@emd.com';
+}
+
+/** Solo Marcos puede aprobar/rechazar cheques (no Prueba ni otros admin). */
+function esUsuarioMarcosOperador(usernameState: string | null | undefined, loginEmail: string | null | undefined): boolean {
+  const u = normalizarLoginUsuario(usernameState);
+  return u === 'marcos' || normalizarEmail(loginEmail) === 'emamoreno7@hotmail.com';
 }
 
 /** Validación en servidor (tabla usuarios): no depende de IP/MAC/caché del navegador. */
@@ -3017,6 +3024,18 @@ export default function App() {
   const esUsuarioRootOperadorSesion = useMemo(
     () => esUsuarioRootOperador(user, loginEmail),
     [user, loginEmail],
+  );
+  const esMarcosOperadorSesion = useMemo(
+    () => esUsuarioMarcosOperador(user, loginEmail),
+    [user, loginEmail],
+  );
+  const actorChequesSesion = useMemo(
+    () => nombreParaMostrarSesion({
+      loginEmail,
+      usernameState: user,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    }),
+    [loginEmail, user, authUserMeta],
   );
   const esMarcosPUsuario = useMemo(
     () => esUsuarioMarcosP({
@@ -8143,6 +8162,14 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         )}
 
         {/* GASTOS */}
+        {page === 'cheques' && !esProveedorUsuario && !esUsuarioRootOperadorSesion && (
+          <VistaCheques
+            esMarcosOperador={esMarcosOperadorSesion}
+            esAdminCheques={esMarcosPUsuario}
+            actorLabel={actorChequesSesion}
+          />
+        )}
+
         {page === 'gastos' && esMarcosPUsuario && (
           <div className="space-y-3">
             {/* Resumen */}
@@ -8834,6 +8861,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 { k: 'dashboard', icon: '🏠', l: 'Inicio' },
                 { k: 'clientes', icon: '👥', l: 'Clientes' },
                 { k: 'creditos', icon: '🏦', l: 'Préstamos' },
+                { k: 'cheques', icon: '📝', l: 'Cheques' },
                 { k: 'ruta', icon: '📋', l: 'A cobrar' },
                 { k: 'recibos_mensuales', icon: '🧾', l: 'Recibos' },
               ] : []),
@@ -8843,6 +8871,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 { k: 'clientes', icon: '👥', l: 'Clientes' },
                 { k: 'fichas', icon: '📋', l: 'Fichas' },
                 { k: 'creditos', icon: '🏦', l: 'Créditos' },
+                { k: 'cheques', icon: '📝', l: 'Cheques' },
                 { k: 'ruta', icon: '🗺️', l: 'Ruta' },
                 ...(esMarcosPUsuario ? [{ k: 'cierre_caja', icon: '🧾', l: 'Caja' }] : []),
                 ...(esMarcosPUsuario ? [{ k: 'rendiciones', icon: '📑', l: 'Rendición', pend: rendicionesPendientesAdmin.length }] : []),
