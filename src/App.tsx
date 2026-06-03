@@ -20,6 +20,18 @@ import {
   SesionExpiradaSupabaseError,
 } from './supabaseClient';
 import { BrandingFooter } from './components/BrandingFooter';
+import { TrialBloqueoOverlay } from './components/TrialBloqueoOverlay';
+import { TrialCountdownBadge } from './components/TrialCountdownBadge';
+import { VistaRapidaSistemaModal } from './components/VistaRapidaSistemaModal';
+import { PanelRootTecnico } from './components/PanelRootTecnico';
+import { registrarEventoSesion } from './utils/registrarEventoSesion';
+import { CONFIG_DEFECTO, configDesdeCacheLocal, configDesdeSupabase } from './utils/configEntrega';
+import {
+  MSG_TRIAL_EXPIRADO,
+  mensajeBloqueoDemoPrueba,
+  parseResultadoAccesoDemo,
+  trialExpirado,
+} from './utils/trialLicencia';
 import { DashboardLogsSistema } from './components/Dashboard';
 import { devWarn } from './utils/devConsole';
 import {
@@ -629,6 +641,47 @@ async function actualizarCreditoEstadoConReintentos(
 type OpcionesGuardarCliente = { dniFiles?: { frente?: File; dorso?: File }; videoNegocio?: File };
 
 const BUCKET_VIDEO_VERIFICACION_CLIENTE = 'clientes-videos-verificacion';
+const BUCKETS_ENTREGA_STORAGE = ['clientes-documentos', BUCKET_VIDEO_VERIFICACION_CLIENTE] as const;
+
+/** Vacía buckets de documentos/videos (Storage API; no se puede borrar por SQL en Supabase). */
+async function vaciarBucketStorageRecursivo(bucket: string, prefijo = ''): Promise<number> {
+  let eliminados = 0;
+  const { data, error } = await supabase.storage.from(bucket).list(prefijo, { limit: 1000 });
+  if (error) throw error;
+  if (!data?.length) return 0;
+  const rutasArchivo: string[] = [];
+  for (const item of data) {
+    const ruta = prefijo ? `${prefijo}/${item.name}` : item.name;
+    if (item.metadata != null) {
+      rutasArchivo.push(ruta);
+    } else {
+      eliminados += await vaciarBucketStorageRecursivo(bucket, ruta);
+    }
+  }
+  if (rutasArchivo.length > 0) {
+    const { error: errRm } = await supabase.storage.from(bucket).remove(rutasArchivo);
+    if (errRm) throw errRm;
+    eliminados += rutasArchivo.length;
+  }
+  return eliminados;
+}
+
+async function limpiarStorageEntregaDotCom(): Promise<{ total: number; detalle: Record<string, number> }> {
+  const detalle: Record<string, number> = {};
+  let total = 0;
+  for (const bucket of BUCKETS_ENTREGA_STORAGE) {
+    try {
+      const n = await vaciarBucketStorageRecursivo(bucket);
+      detalle[bucket] = n;
+      total += n;
+    } catch (e) {
+      devWarn(`limpiarStorage bucket ${bucket}:`, e);
+      detalle[bucket] = 0;
+    }
+  }
+  return { total, detalle };
+}
+
 const DIAS_RETENCION_VIDEO_CLIENTE = 30;
 const MAX_DURACION_VIDEO_CLIENTE_SEG = 30;
 const MAX_BYTES_VIDEO_CLIENTE = 25 * 1024 * 1024;
@@ -720,6 +773,7 @@ interface Config {
   moneda: string; simboloMoneda: string; moraPorciento: number; nombreEmpresa: string; telefonoEmpresa: string; direccionEmpresa: string; ruc: string; numeroWhatsappAdmin: string; interesCreditoM: number; interesCreditoP: number;
   porcentajeComisionVendedor: number;
   modoExterior: boolean;
+  trialFin?: string | null;
 }
 interface VisitaFallida { clienteId: string; fecha: string; hora: string; motivo: 'no_domicilio' | 'sin_dinero' | 'promesa_pago' | 'local_cerrado'; lat: number; lng: number; observaciones?: string; promesaFecha?: string; }
 interface Credito {
@@ -755,12 +809,19 @@ interface Credito {
   /** Comisión generada al aprobar el crédito. */
   comision_vendedor?: number;
   comision_liquidada?: boolean;
+  /** Admin autorizó la comisión para que el vendedor la vea en «a cobrar». */
+  comision_aprobada_admin?: boolean;
+  porcentaje_comision_credito?: number;
 }
 interface VendedorComisionResumen {
   id: string;
   username: string;
   comision_acumulada: number;
   creditos_pendientes: number;
+  porcentaje_comision: number;
+  total_pendiente_aprobacion: number;
+  ventas_pendientes_aprobacion: Credito[];
+  ventas_aprobadas_pendientes: Credito[];
 }
 interface PagoRegistro {
   id: string;
@@ -875,7 +936,7 @@ const genId = () => `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 const MARCA_PRIMARIA = 'DotCom';
 const MARCA_DESCRIPTOR = 'Sistema de Gestión';
 const MARCA_COMPLETA = `${MARCA_PRIMARIA} ${MARCA_DESCRIPTOR}`;
-const M: Config = { moneda: 'ARS', simboloMoneda: '$', moraPorciento: 2, nombreEmpresa: MARCA_COMPLETA, telefonoEmpresa: '+54 11 0000 0000', direccionEmpresa: 'Calle Principal 123', ruc: '00-00000000-0', numeroWhatsappAdmin: '', interesCreditoM: 30, interesCreditoP: 30, porcentajeComisionVendedor: 5, modoExterior: false };
+const M: Config = { ...CONFIG_DEFECTO, nombreEmpresa: MARCA_COMPLETA };
 const PLAN_SEMANAL_OPCIONES = [4, 6, 8, 10, 12, 17, 44];
 const PLAN_DIARIO_OPCIONES = [26, 39, 52, 65, 78, 117, 286];
 /** Cuotas mensuales ofrecidas en el módulo mensual (sin 7 ni 9 meses). */
@@ -1486,6 +1547,21 @@ function calcularComisionVentaVendedor(montoSolicitado: number, porcentaje: numb
   if (capital <= 0 || pct <= 0) return 0;
   return redondearPesos(capital * (pct / 100));
 }
+function porcentajeComisionEfectivoVendedor(pctPersonal: number | null | undefined, pctGlobal: number): number {
+  const p = pctPersonal != null && Number.isFinite(Number(pctPersonal)) ? Number(pctPersonal) : Number(pctGlobal);
+  return Number.isFinite(p) && p >= 0 ? p : 5;
+}
+function creditoComisionPendienteAprobacionAdmin(c: Credito): boolean {
+  return esCreditoActivo(c)
+    && Number(c.comision_vendedor) > 0
+    && !Boolean(c.comision_aprobada_admin);
+}
+function creditoComisionAprobadaPendienteCobro(c: Credito): boolean {
+  return esCreditoActivo(c)
+    && Number(c.comision_vendedor) > 0
+    && Boolean(c.comision_aprobada_admin)
+    && !Boolean(c.comision_liquidada);
+}
 function creditoPerteneceAVendedor(c: Credito, vendedorIds: string[]): boolean {
   const vid = String(c.vendedor_id ?? c.cobrador_id ?? c.creado_por ?? '').trim();
   if (!vid) return false;
@@ -1500,13 +1576,13 @@ function creditoPerteneceAVendedor(c: Credito, vendedorIds: string[]): boolean {
 async function buscarUsuarioVendedorEnBd(vendedorAuthId: string, usernameHint: string) {
   const local = String(usernameHint || '').trim().toLowerCase();
   const id = String(vendedorAuthId || '').trim();
-  let q = supabase.from('usuarios').select('id, username, comision_acumulada').eq('rol', 'vendedor').eq('activo', true);
+  let q = supabase.from('usuarios').select('id, username, comision_acumulada, porcentaje_comision').eq('rol', 'vendedor').eq('activo', true);
   if (id && local) q = q.or(`id.eq.${id},username.eq.${local}`);
   else if (id) q = q.eq('id', id);
   else if (local) q = q.eq('username', local);
   else return null;
   const { data } = await q.limit(1).maybeSingle();
-  return data as { id: string; username: string; comision_acumulada: number } | null;
+  return data as { id: string; username: string; comision_acumulada: number; porcentaje_comision: number | null } | null;
 }
 async function incrementarComisionAcumuladaVendedor(vendedorAuthId: string, usernameHint: string, monto: number) {
   const usr = await buscarUsuarioVendedorEnBd(vendedorAuthId, usernameHint);
@@ -1541,6 +1617,7 @@ const USUARIOS_SISTEMA: PerfilUsuarioSistema[] = [
   { login: 'vendedor', authEmail: 'cobrador2@emd.com', nombre: 'Vendedor', rolDefecto: 'vendedor', accesoRapido: true, usernameBd: 'cobrador2' },
   { login: 'root', authEmail: 'root@emd.com', nombre: 'Root', rolDefecto: 'root', esAdmin: true, accesoRapido: true, usernameBd: 'root' },
   { login: 'mensual', authEmail: 'mensual1@emd.com', nombre: 'Mensual', rolDefecto: 'mensual', accesoRapido: true, usernameBd: 'mensual' },
+  { login: 'prueba', authEmail: 'prueba@emd.com', nombre: 'Prueba Demo', rolDefecto: 'root', esAdmin: true, accesoRapido: true, usernameBd: 'prueba' },
 ];
 
 /** Alias legacy (correos viejos, MatiasM/MarcosP, cobrador1…) → login canónico. */
@@ -1573,6 +1650,111 @@ const ETIQUETA_USUARIO_LEGACY: Record<string, string> = {
   cobrador2: 'Vendedor',
   emamoreno7: 'Marcos',
 };
+
+/** id de `usuarios` / Supabase Auth → nombre y rol para listados (Control, caja, etc.). */
+const MAPA_USUARIO_POR_ID: Record<string, { nombre: string; rol: string }> = {};
+
+const CP_COBRADOR_LABELS_KEY = 'cp_cobrador_uuid_labels_v1';
+
+function registrarEtiquetaCobradorReferencia(
+  clave: string | null | undefined,
+  nombre: string | null | undefined,
+  rol?: string | null,
+) {
+  const k = String(clave ?? '').trim().toLowerCase();
+  const nombreRaw = String(nombre ?? '').trim();
+  if (!k || !nombreRaw || nombreRaw === k) return;
+  const nombreLegible = etiquetaCobradorMovimientoDesdeClave(nombreRaw);
+  const rolEt = etiquetaRolUsuarioLegible(rol) || 'Cobrador';
+  if (esUuidReferenciaUsuario(k)) {
+    MAPA_USUARIO_POR_ID[k] = { nombre: nombreLegible, rol: rolEt };
+    try {
+      const prev = JSON.parse(localStorage.getItem(CP_COBRADOR_LABELS_KEY) || '{}') as Record<string, { nombre: string; rol: string }>;
+      prev[k] = { nombre: nombreLegible, rol: rolEt };
+      localStorage.setItem(CP_COBRADOR_LABELS_KEY, JSON.stringify(prev));
+    } catch {
+      /* quota / modo privado */
+    }
+  }
+}
+
+function registrarEtiquetasCobradorDesdePersistencia() {
+  try {
+    const prev = JSON.parse(localStorage.getItem(CP_COBRADOR_LABELS_KEY) || '{}') as Record<string, { nombre?: string; rol?: string }>;
+    for (const [id, row] of Object.entries(prev)) {
+      if (row?.nombre) registrarEtiquetaCobradorReferencia(id, row.nombre, row.rol);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function registrarEtiquetasDesdeRendicionRows(rows: Array<{ cobrador_id?: unknown; cobrador_nombre?: unknown }> | null | undefined) {
+  for (const row of rows ?? []) {
+    registrarEtiquetaCobradorReferencia(
+      String(row.cobrador_id ?? ''),
+      String(row.cobrador_nombre ?? ''),
+    );
+  }
+}
+
+function registrarEtiquetasDesdeCierres(cierres: Cierre[] | null | undefined) {
+  for (const c of cierres ?? []) {
+    registrarEtiquetaCobradorReferencia(c.userId, c.username);
+  }
+}
+
+function etiquetaRolUsuarioLegible(rol: string | null | undefined): string {
+  const r = rolNormalizadoDb(String(rol ?? ''));
+  if (r === 'vendedor') return 'Vendedor';
+  if (r === 'cobrador') return 'Cobrador';
+  if (r === 'mensual') return 'Mensual';
+  if (r === 'proveedor') return 'Proveedor';
+  if (r === 'admin' || r === 'root' || r === 'super') return 'Administración';
+  return '';
+}
+
+function registrarMapaUsuariosEtiquetas(rows: Array<{ id?: string; username?: string; rol?: string }>) {
+  for (const row of rows) {
+    const username = String(row.username ?? '').trim();
+    const rolEt = etiquetaRolUsuarioLegible(row.rol);
+    const nombre = etiquetaCobradorMovimientoDesdeClave(username || String(row.id ?? ''));
+    const idNorm = normalizarUuidPostgrest(row.id);
+    if (idNorm) registrarEtiquetaCobradorReferencia(idNorm, nombre, rolEt);
+    if (username) registrarEtiquetaCobradorReferencia(username, nombre, rolEt);
+  }
+}
+
+function esUuidReferenciaUsuario(v: unknown): boolean {
+  return esUuidClienteId(v);
+}
+
+function etiquetaCobradorMovimientoDesdeClave(raw: string): string {
+  const s = String(raw ?? '').trim();
+  if (!s) return '—';
+  const lower = s.toLowerCase();
+  if (lower.includes('@')) {
+    const n = normalizarEmail(s);
+    return ETIQUETA_USUARIO_POR_EMAIL[n] || (s.includes('@') ? s.split('@')[0] : s);
+  }
+  if (ETIQUETA_USUARIO_POR_LOCAL[lower]) return ETIQUETA_USUARIO_POR_LOCAL[lower];
+  if (ETIQUETA_USUARIO_LEGACY[lower]) return ETIQUETA_USUARIO_LEGACY[lower];
+  const perfil = resolverPerfilDesdeEntradaLogin(s);
+  if (perfil?.nombre) return perfil.nombre;
+  return s;
+}
+
+function etiquetaRolUsuario(raw: string | null | undefined): string {
+  const s = String(raw ?? '').trim();
+  if (!s) return '—';
+  const lower = s.toLowerCase();
+  if (esUuidReferenciaUsuario(lower)) {
+    return MAPA_USUARIO_POR_ID[lower]?.rol || 'Cobrador';
+  }
+  const perfil = resolverPerfilDesdeEntradaLogin(s);
+  if (perfil) return etiquetaRolUsuarioLegible(perfil.rolDefecto);
+  return 'Cobrador';
+}
 
 function resolverPerfilDesdeLoginCanonico(login: string): PerfilUsuarioSistema | null {
   const k = normalizarLoginUsuario(login);
@@ -1632,7 +1814,7 @@ const PERFILES_VENDEDOR_SISTEMA: { email: string; username: string }[] = USUARIO
 /** Accesos rápidos en login: admin ve todos; cobrador/vendedor solo el suyo. */
 function accesosRapidosLoginVisibles(): { label: string; login: string }[] {
   const todos = USUARIOS_SISTEMA
-    .filter(u => u.accesoRapido)
+    .filter(u => u.accesoRapido && u.login !== 'root')
     .map(u => ({ label: u.nombre, login: u.login }));
   if (typeof localStorage === 'undefined') return [];
   const lastRaw = localStorage.getItem('cp_last_login_user');
@@ -1664,12 +1846,36 @@ function nombreParaMostrarSesion(params: {
   return u || 'Usuario';
 }
 
-/** Admin principal (Marcos): aprobación de créditos, borrados y configuración avanzada. */
+function esUsuarioPruebaSesion(usernameState: string | null | undefined, loginEmail: string | null | undefined): boolean {
+  const u = normalizarLoginUsuario(usernameState);
+  return u === 'prueba' || normalizarEmail(loginEmail) === 'prueba@emd.com';
+}
+
+/** Operador técnico (solo login root): consola de monitoreo, sin cobranzas. */
+function esUsuarioRootOperador(usernameState: string | null | undefined, loginEmail: string | null | undefined): boolean {
+  const u = normalizarLoginUsuario(usernameState);
+  return u === 'root' || normalizarEmail(loginEmail) === 'root@emd.com';
+}
+
+/** Validación en servidor (tabla usuarios): no depende de IP/MAC/caché del navegador. */
+async function verificarAccesoDemoPruebaEnServidor(username: string) {
+  const { data, error } = await supabase.rpc('verificar_acceso_demo_prueba', {
+    p_username: String(username ?? '').trim(),
+  });
+  if (error) {
+    devWarn('verificar_acceso_demo_prueba:', error);
+    return parseResultadoAccesoDemo({ ok: true, es_demo: false });
+  }
+  return parseResultadoAccesoDemo(data);
+}
+
+/** Admin (Marcos, Prueba demo): aprobación de créditos, borrados y configuración avanzada. Root usa consola aparte. */
 function esUsuarioMarcosP(params: {
   loginEmail: string | null | undefined;
   usernameState: string | null | undefined;
   authUser?: AuthMetaInput;
 }): boolean {
+  if (esUsuarioRootOperador(params.usernameState, params.loginEmail)) return false;
   const perfil = resolverPerfilDesdeSesion(params);
   return perfil?.esAdmin === true;
 }
@@ -1685,18 +1891,15 @@ function esUsuarioCobradorMatiasOVendedor(params: {
   return perfil.rolDefecto === 'cobrador' || perfil.rolDefecto === 'vendedor';
 }
 
-/** Cobrador en movimientos, PDF, cartones, tablas (email, local o texto guardado). */
+/** Cobrador en movimientos, PDF, cartones, tablas (email, local, UUID Auth o username). */
 function etiquetaCobradorMovimiento(raw: string | null | undefined): string {
   const s = String(raw ?? '').trim();
   if (!s || s === '—' || s === 'Sin informar' || s === 'sin_usuario') return s || '—';
   const lower = s.toLowerCase();
-  if (lower.includes('@')) {
-    const n = normalizarEmail(s);
-    return ETIQUETA_USUARIO_POR_EMAIL[n] || (s.includes('@') ? s.split('@')[0] : s);
+  if (esUuidReferenciaUsuario(lower)) {
+    return MAPA_USUARIO_POR_ID[lower]?.nombre || 'Usuario';
   }
-  if (ETIQUETA_USUARIO_POR_LOCAL[lower]) return ETIQUETA_USUARIO_POR_LOCAL[lower];
-  if (ETIQUETA_USUARIO_LEGACY[lower]) return ETIQUETA_USUARIO_LEGACY[lower];
-  return s;
+  return etiquetaCobradorMovimientoDesdeClave(s);
 }
 
 function normalizarId(raw: unknown) {
@@ -2608,9 +2811,9 @@ function getInitData(): AppMeta {
   const interesM = interesMStored != null && interesMStored !== '' && !Number.isNaN(parseFloat(interesMStored)) ? parseFloat(interesMStored) : undefined;
   const interesP = interesPStored != null && interesPStored !== '' && !Number.isNaN(parseFloat(interesPStored)) ? parseFloat(interesPStored) : undefined;
   if (d) {
-    const cfg = { ...M, ...((d.config as Config) || {}) };
-    if ((typeof cfg.interesCreditoM !== 'number' || !Number.isFinite(cfg.interesCreditoM)) && interesM != null) cfg.interesCreditoM = interesM;
-    if ((typeof cfg.interesCreditoP !== 'number' || !Number.isFinite(cfg.interesCreditoP)) && interesP != null) cfg.interesCreditoP = interesP;
+    let cfg = configDesdeCacheLocal((d.config as Partial<Config>) || undefined);
+    if (interesM != null) cfg = { ...cfg, interesCreditoM: interesM };
+    if (interesP != null) cfg = { ...cfg, interesCreditoP: interesP };
     return {
       cierres: (d.cierres as AppMeta['cierres']) || [],
       logs: (d.logs as AppMeta['logs']) || [],
@@ -2694,6 +2897,9 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [menuPerfilAbierto, setMenuPerfilAbierto] = useState(false);
   const menuPerfilRef = useRef<HTMLDivElement | null>(null);
+  const [mVistaRapidaSistema, setMVistaRapidaSistema] = useState(false);
+  /** Trial solo usuario demo `prueba` (columna usuarios.trial_fin, validado en servidor). */
+  const [trialFinPrueba, setTrialFinPrueba] = useState<string | null>(null);
 
   // Modals
   const [mCliente, setMCliente] = useState<Partial<Cliente> | null>(null);
@@ -2754,6 +2960,9 @@ export default function App() {
   const [cobradoresRevision, setCobradoresRevision] = useState<Array<{ valor: string; label: string }>>([]);
   const [vendedoresComisionAdmin, setVendedoresComisionAdmin] = useState<VendedorComisionResumen[]>([]);
   const [liquidandoComisionId, setLiquidandoComisionId] = useState<string | null>(null);
+  const [marcosConfigTab, setMarcosConfigTab] = useState<'ajustes' | 'comisiones'>('ajustes');
+  const [guardandoPctComisionId, setGuardandoPctComisionId] = useState<string | null>(null);
+  const [aprobandoComisionCreditoId, setAprobandoComisionCreditoId] = useState<string | null>(null);
   const [mPlanilla, setMPlanilla] = useState<{ tipo: 'ficha'; ficha: Ficha; cliente: Cliente } | { tipo: 'credito'; credito: Credito; cliente: Cliente | null } | null>(null);
   const [cartonSharePayload, setCartonSharePayload] = useState<CartonSharePayload | null>(null);
   const cartonShareRef = useRef<HTMLDivElement | null>(null);
@@ -2805,6 +3014,10 @@ export default function App() {
   const fichasOrEmpty = Array.isArray(fichas) ? fichas : [];
   const notificacionesOrEmpty = Array.isArray(notificaciones) ? notificaciones : [];
 
+  const esUsuarioRootOperadorSesion = useMemo(
+    () => esUsuarioRootOperador(user, loginEmail),
+    [user, loginEmail],
+  );
   const esMarcosPUsuario = useMemo(
     () => esUsuarioMarcosP({
       loginEmail,
@@ -2813,6 +3026,15 @@ export default function App() {
     }),
     [loginEmail, user, authUserMeta],
   );
+  const esSesionUsuarioPrueba = useMemo(
+    () => esUsuarioPruebaSesion(user, loginEmail),
+    [user, loginEmail],
+  );
+  const sistemaBloqueadoTrial = useMemo(
+    () => esSesionUsuarioPrueba && trialExpirado(trialFinPrueba),
+    [esSesionUsuarioPrueba, trialFinPrueba],
+  );
+  const puedeOperarSistema = !sistemaBloqueadoTrial;
   const esMatiasOVendedorUsuario = useMemo(
     () => esUsuarioCobradorMatiasOVendedor({
       loginEmail,
@@ -2866,6 +3088,13 @@ export default function App() {
   type SavePatch = Partial<AppMeta> & Partial<{ clientes: Cliente[]; fichas: Ficha[]; gastos: Gasto[] }>;
 
   const save = useCallback((upd: SavePatch) => {
+    if (
+      sistemaBloqueadoTrial
+      && (upd.clientes !== undefined || upd.fichas !== undefined || upd.gastos !== undefined || upd.config !== undefined)
+    ) {
+      alert(MSG_TRIAL_EXPIRADO);
+      return;
+    }
     if (upd.clientes !== undefined) setClientes(Array.isArray(upd.clientes) ? upd.clientes : []);
     if (upd.fichas !== undefined) setFichas(Array.isArray(upd.fichas) ? upd.fichas : []);
     if (upd.gastos !== undefined) setGastos(Array.isArray(upd.gastos) ? upd.gastos : []);
@@ -2884,7 +3113,7 @@ export default function App() {
       localStorage.setItem('cp_data_v2', JSON.stringify(next));
       return next;
     });
-  }, []);
+  }, [sistemaBloqueadoTrial]);
 
   // Audit
   const audit = useCallback(( accion: AuditAction, detalle: string, gps?: { lat: number; lng: number } ) => {
@@ -3026,6 +3255,8 @@ export default function App() {
           vendedor_id: c?.vendedor_id != null ? String(c.vendedor_id) : null,
           comision_vendedor: redondearPesos(Number(c?.comision_vendedor ?? 0)),
           comision_liquidada: Boolean(c?.comision_liquidada),
+          comision_aprobada_admin: Boolean(c?.comision_aprobada_admin),
+          porcentaje_comision_credito: Number(c?.porcentaje_comision_credito ?? 0) || undefined,
         };
       }) : [];
       const pagosRaw = Array.isArray(pagosDb) ? (pagosDb as any[]) : [];
@@ -3111,6 +3342,10 @@ export default function App() {
         devWarn('Supabase fetch rendiciones:', rendErr.message || rendErr);
       } else if (Array.isArray(rendicionesDb)) {
         const rendicionesMapped = rendicionesDb.map(r => mapRowRendicionDb(r as Record<string, unknown>));
+        registrarEtiquetasDesdeRendicionRows(
+          rendicionesDb as Array<{ cobrador_id?: string; cobrador_nombre?: string }>,
+        );
+        registrarEtiquetasDesdeCierres(rendicionesMapped);
         setData(prev => {
           const next = { ...prev, cierresJornada: rendicionesMapped };
           localStorage.setItem('cp_data_v2', JSON.stringify(next));
@@ -3118,17 +3353,8 @@ export default function App() {
         });
       }
       if (configDb) {
-        const cfg = configDb as any;
-        const interesM = Number(cfg?.interes_credito_m ?? cfg?.interesCreditoM ?? cfg?.porcentaje_interes);
-        const interesP = Number(cfg?.interes_credito_p ?? cfg?.interesCreditoP ?? cfg?.porcentaje_interes);
-        const pctComision = Number(cfg?.porcentaje_comision_vendedor ?? cfg?.porcentajeComisionVendedor);
+        const merged = configDesdeSupabase(configDb as Record<string, unknown>);
         setData(prev => {
-          const merged = {
-            ...prev.config,
-            ...(Number.isFinite(interesM) ? { interesCreditoM: interesM } : {}),
-            ...(Number.isFinite(interesP) ? { interesCreditoP: interesP } : {}),
-            ...(Number.isFinite(pctComision) ? { porcentajeComisionVendedor: pctComision } : {}),
-          };
           localStorage.setItem('cp_interes_credito_m', String(merged.interesCreditoM));
           localStorage.setItem('cp_interes_credito_p', String(merged.interesCreditoP));
           const next = { ...prev, config: merged };
@@ -3259,6 +3485,10 @@ export default function App() {
   }, [user, creditosOrEmpty, pagosOrEmpty, fetchData, supabase]);
 
   const handleSaveConfig = useCallback(async (c: Config) => {
+    if (sistemaBloqueadoTrial) {
+      alert(MSG_TRIAL_EXPIRADO);
+      return;
+    }
     const telefonoEmpresaNorm = normalizarTelefonoArg549(c.telefonoEmpresa);
     const numeroWhatsappAdminNorm = normalizarTelefonoArg549(c.numeroWhatsappAdmin);
     const cNorm: Config = { ...c, telefonoEmpresa: telefonoEmpresaNorm, numeroWhatsappAdmin: numeroWhatsappAdminNorm };
@@ -3288,7 +3518,7 @@ export default function App() {
       return;
     }
     await fetchData();
-  }, [save, audit, fetchData]);
+  }, [save, audit, fetchData, sistemaBloqueadoTrial]);
 
   useEffect(() => {
     const run = async () => {
@@ -3349,12 +3579,34 @@ export default function App() {
       const rolUsuario = await resolverRolUsuarioSesion(sess.session?.user?.id ?? null, email);
       const perfil = resolverPerfilDesdeAuthEmail(email);
       const usernameSesion = (perfil?.login || local.username || email.split('@')[0] || '').trim();
+      if (esUsuarioPruebaSesion(usernameSesion, email)) {
+        const accDemo = await verificarAccesoDemoPruebaEnServidor(usernameSesion);
+        if (!accDemo.ok) {
+          await supabase.auth.signOut();
+          setTrialFinPrueba(null);
+          alert(mensajeBloqueoDemoPrueba(accDemo.motivo));
+          setSessionReady(true);
+          return;
+        }
+        setTrialFinPrueba(accDemo.trialFin);
+      } else {
+        setTrialFinPrueba(null);
+      }
       localStorage.setItem('cp_session', JSON.stringify({ username: usernameSesion, rol: rolUsuario }));
       if (perfil?.login) localStorage.setItem('cp_last_login_user', perfil.login);
       setUser(usernameSesion);
       setRol(rolUsuario);
       setLoginEmail(email);
-      setPage('dashboard');
+      registrarEtiquetaCobradorReferencia(
+        sess.session?.user?.id ?? null,
+        nombreParaMostrarSesion({
+          loginEmail: email,
+          usernameState: usernameSesion,
+          authUser: sess.session?.user ? { user_metadata: sess.session.user.user_metadata as Record<string, unknown> } : null,
+        }),
+        rolUsuario,
+      );
+      setPage(esUsuarioRootOperador(usernameSesion, email) ? 'root_console' : 'dashboard');
       setSessionReady(true);
     };
     void run();
@@ -3362,8 +3614,14 @@ export default function App() {
 
   useEffect(() => {
     if (!user) return;
+    if (esUsuarioRootOperadorSesion) return;
     void fetchData();
-  }, [user, fetchData]);
+  }, [user, fetchData, esUsuarioRootOperadorSesion]);
+
+  useEffect(() => {
+    if (!user || !esUsuarioRootOperadorSesion) return;
+    if (page !== 'root_console') setPage('root_console');
+  }, [user, esUsuarioRootOperadorSesion, page]);
 
   useEffect(() => {
     if (!mAuditoria || !esMarcosPUsuario) return;
@@ -3427,22 +3685,34 @@ export default function App() {
       setVendedoresComisionAdmin([]);
       return;
     }
+    const pctGlobal = Number(data.config.porcentajeComisionVendedor ?? 5);
     const { data: vends, error } = await supabase
       .from('usuarios')
-      .select('id, username, comision_acumulada')
+      .select('id, username, comision_acumulada, porcentaje_comision')
       .eq('rol', 'vendedor')
       .eq('activo', true)
       .order('username');
     if (error) devWarn('fetch vendedores comisiones (usuarios):', error);
 
-    const porClave = new Map<string, { id: string; username: string; comision_acumulada: number }>();
-    for (const v of (vends ?? []) as Array<{ id: string; username: string; comision_acumulada: number }>) {
+    const porClave = new Map<string, {
+      id: string;
+      username: string;
+      comision_acumulada: number;
+      porcentaje_comision: number | null;
+    }>();
+    for (const v of (vends ?? []) as Array<{
+      id: string;
+      username: string;
+      comision_acumulada: number;
+      porcentaje_comision: number | null;
+    }>) {
       const username = String(v.username || '').trim();
       if (!username) continue;
       porClave.set(username.toLowerCase(), {
         id: String(v.id),
         username,
         comision_acumulada: Number(v.comision_acumulada) || 0,
+        porcentaje_comision: v.porcentaje_comision != null ? Number(v.porcentaje_comision) : null,
       });
     }
     for (const perfil of PERFILES_VENDEDOR_SISTEMA) {
@@ -3452,6 +3722,7 @@ export default function App() {
           id: username,
           username,
           comision_acumulada: 0,
+          porcentaje_comision: null,
         });
       }
     }
@@ -3461,49 +3732,150 @@ export default function App() {
       const usernameGuess = vid.includes('@') ? vid.split('@')[0] : vid;
       const clave = usernameGuess.toLowerCase();
       if (!porClave.has(clave)) {
-        porClave.set(clave, { id: vid, username: usernameGuess, comision_acumulada: 0 });
+        porClave.set(clave, { id: vid, username: usernameGuess, comision_acumulada: 0, porcentaje_comision: null });
       }
     }
 
     const resumen: VendedorComisionResumen[] = [...porClave.values()].map(v => {
       const ids = idsReferenciaVendedor({ id: v.id, username: v.username, email: `${v.username}@emd.com` });
-      const creditosPend = creditosOrEmpty.filter(c =>
-        !c.comision_liquidada
-        && Number(c.comision_vendedor) > 0
-        && creditoPerteneceAVendedor(c, ids),
+      const ventasPendientesAprob = creditosOrEmpty.filter(c =>
+        creditoComisionPendienteAprobacionAdmin(c) && creditoPerteneceAVendedor(c, ids),
       );
-      const sumCreditos = creditosPend.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0);
-      const acum = redondearPesos(Math.max(Number(v.comision_acumulada) || 0, sumCreditos));
+      const ventasAprobadasPend = creditosOrEmpty.filter(c =>
+        creditoComisionAprobadaPendienteCobro(c) && creditoPerteneceAVendedor(c, ids),
+      );
+      const sumAprobadas = ventasAprobadasPend.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0);
+      const acum = redondearPesos(Math.max(Number(v.comision_acumulada) || 0, sumAprobadas));
+      const totalPendAprob = redondearPesos(ventasPendientesAprob.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0));
       return {
         id: String(v.id),
         username: String(v.username),
         comision_acumulada: acum,
-        creditos_pendientes: creditosPend.length,
+        creditos_pendientes: ventasAprobadasPend.length,
+        porcentaje_comision: porcentajeComisionEfectivoVendedor(v.porcentaje_comision, pctGlobal),
+        total_pendiente_aprobacion: totalPendAprob,
+        ventas_pendientes_aprobacion: ventasPendientesAprob,
+        ventas_aprobadas_pendientes: ventasAprobadasPend,
       };
     }).sort((a, b) => b.comision_acumulada - a.comision_acumulada);
 
     setVendedoresComisionAdmin(resumen);
-  }, [esMarcosPUsuario, creditosOrEmpty]);
+  }, [esMarcosPUsuario, creditosOrEmpty, data.config.porcentajeComisionVendedor]);
 
   useEffect(() => {
     if (!user || !esMarcosPUsuario) return;
     void fetchVendedoresComisionAdmin();
   }, [user, esMarcosPUsuario, fetchVendedoresComisionAdmin, creditosOrEmpty.length]);
 
+  useEffect(() => {
+    if (!sessionReady || !user) return;
+    registrarEtiquetasCobradorDesdePersistencia();
+    registrarEtiquetasDesdeCierres(cierresJornada);
+    void (async () => {
+      const { data, error } = await supabase
+        .from('usuarios')
+        .select('id, username, rol')
+        .eq('activo', true);
+      if (!error && Array.isArray(data) && data.length > 0) {
+        registrarMapaUsuariosEtiquetas(data as Array<{ id: string; username: string; rol: string }>);
+      }
+      const { data: rendRows, error: rendErr } = await supabase
+        .from('rendiciones')
+        .select('cobrador_id, cobrador_nombre');
+      if (!rendErr && Array.isArray(rendRows) && rendRows.length > 0) {
+        registrarEtiquetasDesdeRendicionRows(rendRows as Array<{ cobrador_id: string; cobrador_nombre: string }>);
+      }
+      const filasSesion: Array<{ id?: string; username?: string; rol?: string }> = [];
+      if (authUserId) {
+        filasSesion.push({
+          id: authUserId,
+          username: user || loginEmail?.split('@')[0] || '',
+          rol: rol ?? undefined,
+        });
+        registrarEtiquetaCobradorReferencia(
+          authUserId,
+          nombreParaMostrarSesion({
+            loginEmail,
+            usernameState: user,
+            authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+          }),
+          rol ?? undefined,
+        );
+      }
+      for (const p of USUARIOS_SISTEMA) {
+        if (p.usernameBd) filasSesion.push({ username: p.usernameBd, rol: p.rolDefecto });
+        if (p.login) filasSesion.push({ username: p.login, rol: p.rolDefecto });
+      }
+      if (filasSesion.length > 0) registrarMapaUsuariosEtiquetas(filasSesion);
+    })();
+  }, [sessionReady, user, authUserId, loginEmail, rol, authUserMeta, cierresJornada]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || (!esMarcosPUsuario && !esUsuarioRootOperadorSesion)) return;
+    const w = window as Window & { dotcomLimpiarStorageEntrega?: () => Promise<unknown> };
+    w.dotcomLimpiarStorageEntrega = async () => {
+      if (!window.confirm('¿Vaciar TODOS los documentos y videos de clientes en Storage?')) {
+        return { cancelado: true };
+      }
+      const r = await limpiarStorageEntregaDotCom();
+      console.log('[DotCom] Storage limpiado:', r);
+      alert(`Storage: ${r.total} archivo(s) eliminados.`);
+      return r;
+    };
+    return () => {
+      delete w.dotcomLimpiarStorageEntrega;
+    };
+  }, [esMarcosPUsuario, esUsuarioRootOperadorSesion]);
+
+  useEffect(() => {
+    if (!sessionReady || !user || !esSesionUsuarioPrueba) return;
+    void (async () => {
+      const acc = await verificarAccesoDemoPruebaEnServidor(user);
+      if (!acc.ok) {
+        alert(mensajeBloqueoDemoPrueba(acc.motivo));
+        setTrialFinPrueba(null);
+        try {
+          await supabase.auth.signOut();
+        } catch {
+          /* ignore */
+        }
+        localStorage.removeItem('cp_session');
+        setUser(null);
+        setAuthUserId(null);
+        setLoginEmail(null);
+        setRol(null);
+        setPage('login');
+        return;
+      }
+      setTrialFinPrueba(acc.trialFin);
+    })();
+  }, [sessionReady, user, loginEmail, esSesionUsuarioPrueba]);
+
+  useEffect(() => {
+    if (page !== 'dashboard' || !user || !esSesionUsuarioPrueba) return;
+    if (localStorage.getItem('cp_vista_rapida_prueba_ok')) return;
+    setMVistaRapidaSistema(true);
+    localStorage.setItem('cp_vista_rapida_prueba_ok', '1');
+  }, [page, user, esSesionUsuarioPrueba]);
+
   const miResumenComisionVendedor = useMemo(() => {
     if (!esUsuarioVendedorSesion) return null;
     const ids = cobradorIdsParaFiltroSesion(
       loginEmail ? { user: { id: authUserId ?? undefined, email: loginEmail } } : null,
     );
-    const pendientes = creditosOrEmpty.filter(c =>
-      !c.comision_liquidada
-      && Number(c.comision_vendedor) > 0
-      && creditoPerteneceAVendedor(c, ids),
+    const enRevisionAdmin = creditosOrEmpty.filter(c =>
+      creditoComisionPendienteAprobacionAdmin(c) && creditoPerteneceAVendedor(c, ids),
     );
-    const total = redondearPesos(pendientes.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0));
+    const aprobadasPendientes = creditosOrEmpty.filter(c =>
+      creditoComisionAprobadaPendienteCobro(c) && creditoPerteneceAVendedor(c, ids),
+    );
+    const totalRevision = redondearPesos(enRevisionAdmin.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0));
+    const total = redondearPesos(aprobadasPendientes.reduce((s, c) => s + Number(c.comision_vendedor || 0), 0));
     return {
       total,
-      pendientes,
+      totalRevision,
+      pendientes: aprobadasPendientes,
+      enRevisionAdmin,
       corteSemana: sabadoCorteSemana(),
       proximoSabado: proximoSabadoDesde(),
     };
@@ -3524,7 +3896,7 @@ export default function App() {
     try {
       const ids = idsReferenciaVendedor({ id: v.id, username: v.username, email: `${v.username}@emd.com` });
       const creditosPend = creditosOrEmpty.filter(c =>
-        !c.comision_liquidada && Number(c.comision_vendedor) > 0 && creditoPerteneceAVendedor(c, ids),
+        creditoComisionAprobadaPendienteCobro(c) && creditoPerteneceAVendedor(c, ids),
       );
       const montoTotal = redondearPesos(
         creditosPend.length > 0
@@ -3580,6 +3952,85 @@ export default function App() {
   }, [
     esMarcosPUsuario, creditosOrEmpty, loginEmail, user, authUserMeta,
     fetchData, fetchVendedoresComisionAdmin, audit,
+  ]);
+
+  const handleGuardarPorcentajeComisionVendedor = useCallback(async (
+    v: VendedorComisionResumen,
+    nuevoPct: number,
+  ) => {
+    if (!esMarcosPUsuario) return;
+    const pct = Math.max(0, Number(nuevoPct) || 0);
+    setGuardandoPctComisionId(v.id);
+    try {
+      const { error } = await supabase
+        .from('usuarios')
+        .update({ porcentaje_comision: pct })
+        .or(`id.eq.${v.id},username.eq.${v.username}`);
+      if (error) throw error;
+      for (const c of v.ventas_pendientes_aprobacion) {
+        const capital = redondearPesos(Number(c.monto_solicitado) || 0);
+        const comision = calcularComisionVentaVendedor(capital, pct);
+        const cid = fichaIdUuid(c.id);
+        if (!cid) continue;
+        await supabase.from('creditos').update({
+          comision_vendedor: comision,
+          porcentaje_comision_credito: pct,
+        }).eq('id', cid);
+        setCreditos(prev => prev.map(cr => fichaIdUuid(cr.id) === cid
+          ? { ...cr, comision_vendedor: comision, porcentaje_comision_credito: pct }
+          : cr));
+      }
+      audit('CONFIG_CAMBIO', `Comisión vendedor ${v.username}: ${pct}%`);
+      await fetchVendedoresComisionAdmin();
+      alert(`Porcentaje de ${etiquetaCobradorMovimiento(v.username)} actualizado a ${pct}%.`);
+    } catch (e) {
+      console.error('handleGuardarPorcentajeComisionVendedor:', e);
+      alert('No se pudo guardar el porcentaje. Ejecutá la migración 024 en Supabase si falta la columna porcentaje_comision.');
+    } finally {
+      setGuardandoPctComisionId(null);
+    }
+  }, [esMarcosPUsuario, fetchVendedoresComisionAdmin, audit, setCreditos]);
+
+  const handleAprobarComisionCredito = useCallback(async (credito: Credito, vendedor: VendedorComisionResumen) => {
+    if (!esMarcosPUsuario) return;
+    const cid = fichaIdUuid(credito.id);
+    if (!cid) return;
+    const monto = redondearPesos(Number(credito.comision_vendedor) || 0);
+    if (monto <= 0) {
+      alert('La comisión de esta venta es cero.');
+      return;
+    }
+    setAprobandoComisionCreditoId(credito.id);
+    try {
+      const { error } = await supabase.from('creditos').update({ comision_aprobada_admin: true }).eq('id', cid);
+      if (error) throw error;
+      const hintUser = vendedor.username;
+      await incrementarComisionAcumuladaVendedor(vendedor.id, hintUser, monto);
+      setCreditos(prev => prev.map(c => fichaIdUuid(c.id) === cid
+        ? { ...c, comision_aprobada_admin: true }
+        : c));
+      const emailVendedor = resolverPerfilDesdeEntradaLogin(vendedor.username)?.authEmail
+        ?? `${String(vendedor.username).trim().toLowerCase()}@emd.com`;
+      try {
+        await supabase.from('notificaciones').insert([{
+          titulo: 'Comisión aprobada',
+          mensaje: `Marcos aprobó tu comisión de ${fmt(monto)} por la venta ${String(credito.nro_carton || '').trim() || cid.slice(0, 8)}. Ya figura en tu panel para cobrar tras la liquidación semanal.`,
+          destinatario_rol: 'vendedor',
+          destinatario_usuario: normalizarEmail(emailVendedor),
+          leido: false,
+        }]);
+      } catch { /* opcional */ }
+      audit('CONFIG_CAMBIO', `Comisión aprobada crédito ${cid} — ${fmt(monto)} — ${vendedor.username}`);
+      await fetchData();
+      await fetchVendedoresComisionAdmin();
+    } catch (e) {
+      console.error('handleAprobarComisionCredito:', e);
+      alert('No se pudo aprobar la comisión. Revisá Supabase (migración 024).');
+    } finally {
+      setAprobandoComisionCreditoId(null);
+    }
+  }, [
+    esMarcosPUsuario, fetchData, fetchVendedoresComisionAdmin, audit,
   ]);
 
   /** Una vez al día: inserta en Supabase registros $0 de no pago para cuotas vencidas sin cobro efectivo (idempotente con índice único). */
@@ -4027,30 +4478,6 @@ export default function App() {
     };
   }, [pagosOrEmpty, clientesOrEmpty]);
 
-  const rankingCobradores = useMemo(() => {
-    const map: { [k: string]: { username: string; total: number; cierres: number } } = {};
-    cierresJornada.forEach(c => {
-      if (!map[c.userId]) map[c.userId] = { username: c.username, total: 0, cierres: 0 };
-      map[c.userId].total += c.montoFisico;
-      map[c.userId].cierres += 1;
-    });
-    return Object.values(map).sort((a, b) => b.total - a.total);
-  }, [cierresJornada]);
-
-  // Proyeccion 7 dias
-  const proyeccion7d = useMemo(() => {
-    const dias = [];
-    for (let i = 0; i < 7; i++) {
-      const fecha = addDias(hoy(), i);
-      const total = fichasOrEmpty.reduce((s, f) => {
-        if (f.estado !== 'activa') return s;
-        return s + f.cuotaMonto;
-      }, 0);
-      dias.push({ fecha, total });
-    }
-    return dias;
-  }, [fichasOrEmpty]);
-
   // ==========================================
   // GPS
   // ==========================================
@@ -4203,6 +4630,12 @@ export default function App() {
         console.error('Supabase login error:', authError.message, authError.code);
         audit('LOGIN_FAILED', `Login fallido: ${usernameTrim}`);
         await logAuditDb('LOGIN_FAILED', `Login fallido: ${usernameTrim}`);
+        void registrarEventoSesion({
+          username: usernameTrim,
+          email: authEmail,
+          accion: 'LOGIN_FAILED',
+          detalle: authError.message,
+        });
         if (perfilLogin.rolDefecto === 'mensual') {
           alert(
             'Credenciales incorrectas para el módulo mensual.\n\n'
@@ -4229,19 +4662,50 @@ export default function App() {
       let rolUsuario = await resolverRolUsuarioSesion(authData?.user?.id ?? null, authUserEmail);
       if (perfilLogin.rolDefecto === 'mensual') rolUsuario = 'mensual';
       const usernameSesion = (perfilSesion?.login || normalizarLoginUsuario(usernameTrim) || authUserEmail.split('@')[0]).trim();
+      if (esUsuarioPruebaSesion(usernameSesion, authUserEmail)) {
+        const accDemo = await verificarAccesoDemoPruebaEnServidor(usernameSesion);
+        if (!accDemo.ok) {
+          await supabase.auth.signOut();
+          setTrialFinPrueba(null);
+          alert(mensajeBloqueoDemoPrueba(accDemo.motivo));
+          setLoading(false);
+          return;
+        }
+        setTrialFinPrueba(accDemo.trialFin);
+      } else {
+        setTrialFinPrueba(null);
+      }
       const u = { username: usernameSesion, rol: rolUsuario };
       localStorage.setItem('cp_last_login_user', usernameSesion);
       localStorage.setItem('cp_session', JSON.stringify(u));
       setUser(usernameSesion);
       setRol(rolUsuario);
       setLoginEmail(authUserEmail);
-      setPage('dashboard');
+      setPage(esUsuarioRootOperador(usernameSesion, authUserEmail) ? 'root_console' : 'dashboard');
       setAuthUserMeta((authData?.user?.user_metadata as Record<string, unknown> | undefined) ?? null);
       const { data: s2 } = await supabase.auth.getSession();
-      setAuthUserId(s2.session?.user?.id ?? null);
-      await fetchData();
+      const authIdLogin = s2.session?.user?.id ?? null;
+      setAuthUserId(authIdLogin);
+      registrarEtiquetaCobradorReferencia(
+        authIdLogin,
+        nombreParaMostrarSesion({
+          loginEmail: authUserEmail,
+          usernameState: usernameSesion,
+          authUser: authData?.user ? { user_metadata: authData.user.user_metadata as Record<string, unknown> } : null,
+        }),
+        rolUsuario,
+      );
+      if (!esUsuarioRootOperador(usernameSesion, authUserEmail)) {
+        await fetchData();
+      }
       audit('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
       await logAuditDb('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
+      void registrarEventoSesion({
+        username: usernameSesion,
+        email: authUserEmail,
+        accion: 'LOGIN_SUCCESS',
+        detalle: `Login exitoso: ${usernameTrim}`,
+      });
       setLoading(false);
       return;
     }
@@ -4285,6 +4749,12 @@ export default function App() {
       loginEmail,
       usernameState: user,
       authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    });
+    void registrarEventoSesion({
+      username: user,
+      email: loginEmail,
+      accion: 'LOGOUT',
+      detalle: `Logout: ${actor}`,
     });
     try {
       registrarAuditoria('LOGOUT', `Logout: ${actor}`);
@@ -5803,7 +6273,12 @@ export default function App() {
       const vid = String(baseSync.vendedor_id ?? credito.vendedor_id ?? '').trim();
       const comisionPrev = Number(baseSync.comision_vendedor ?? credito.comision_vendedor ?? 0);
       if (vid && comisionPrev <= 0) {
-        const pct = Number(data.config.porcentajeComisionVendedor ?? 5);
+        const hintUser = String(credito.cobrador_notif_email ?? loginEmail ?? user ?? '').split('@')[0];
+        const usrV = await buscarUsuarioVendedorEnBd(vid, hintUser);
+        const pct = porcentajeComisionEfectivoVendedor(
+          usrV?.porcentaje_comision,
+          Number(data.config.porcentajeComisionVendedor ?? 5),
+        );
         const capital = redondearPesos(Number(baseSync.monto_solicitado ?? credito.monto_solicitado) || 0);
         const comision = calcularComisionVentaVendedor(capital, pct);
         if (comision > 0) {
@@ -5811,9 +6286,19 @@ export default function App() {
             comision_vendedor: comision,
             vendedor_id: vid,
             comision_liquidada: false,
+            comision_aprobada_admin: false,
+            porcentaje_comision_credito: pct,
           }).eq('id', idCredito);
-          const hintUser = String(credito.cobrador_notif_email ?? loginEmail ?? user ?? '').split('@')[0];
-          await incrementarComisionAcumuladaVendedor(vid, hintUser, comision);
+          setCreditos(prev => prev.map(c => fichaIdUuid(c.id) === idCredito
+            ? {
+              ...c,
+              comision_vendedor: comision,
+              vendedor_id: vid,
+              comision_liquidada: false,
+              comision_aprobada_admin: false,
+              porcentaje_comision_credito: pct,
+            }
+            : c));
         }
       }
     }
@@ -6551,8 +7036,67 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         </header>
         <div className="flex-1 flex flex-col justify-center items-center px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] min-h-0 overflow-y-auto">
           <div className="w-full max-w-sm py-4">
-            <LoginForm onLogin={doLogin} loading={loading} />
+            <LoginForm
+              onLogin={doLogin}
+              loading={loading}
+              onAbrirGuia={() => setMVistaRapidaSistema(true)}
+            />
           </div>
+        </div>
+        <VistaRapidaSistemaModal
+          open={mVistaRapidaSistema}
+          onClose={() => setMVistaRapidaSistema(false)}
+        />
+      </div>
+    );
+  }
+
+  // ==========================================
+  // CONSOLA ROOT (operador técnico, sin cobranzas)
+  // ==========================================
+  if (esUsuarioRootOperadorSesion) {
+    return (
+      <div
+        className="min-h-screen flex flex-col font-sans text-white pt-8 pt-[env(safe-area-inset-top)] overflow-x-hidden"
+        style={{ backgroundColor: 'var(--dotcom-fondo-app, #020617)' }}
+      >
+        <header
+          className="sticky top-0 z-50 border-b border-emerald-900/40 px-4 py-3 flex items-center justify-between gap-3 shrink-0"
+          style={{ backgroundColor: 'color-mix(in srgb, var(--dotcom-fondo-app, #020617) 92%, transparent)' }}
+        >
+          <div className="min-w-0 flex items-center gap-2">
+            <Shield className="w-5 h-5 shrink-0 text-emerald-400" aria-hidden />
+            <div className="min-w-0">
+              <p className="font-black text-base tracking-tight truncate">{MARCA_PRIMARIA}</p>
+              <p className="text-[10px] text-emerald-400/90 uppercase tracking-[0.18em]">Consola técnica Root</p>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void doLogout()}
+              className="flex items-center gap-1.5 rounded-xl border border-red-500/35 bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-200 active:scale-95 transition hover:bg-red-500/20"
+              title="Cerrar sesión e ingresar con otro usuario"
+            >
+              <LogOut className="w-4 h-4 shrink-0" aria-hidden />
+              <span className="hidden min-[360px]:inline">Salir</span>
+            </button>
+          </div>
+        </header>
+        <main className="flex-1 px-4 pt-3 min-w-0">
+          <PanelRootTecnico onLogout={() => void doLogout()} />
+        </main>
+        <div
+          className="shrink-0 w-full max-w-full box-border px-4 pt-2 pb-[max(1rem,env(safe-area-inset-bottom))]"
+          style={{ paddingLeft: 'max(1rem, env(safe-area-inset-left))', paddingRight: 'max(1rem, env(safe-area-inset-right))' }}
+        >
+          <BrandingFooter
+            align="center"
+            variant="dark"
+            className="branding-footer--screen w-full"
+            marcaPrimaria={MARCA_PRIMARIA}
+            descriptor={MARCA_DESCRIPTOR}
+          />
         </div>
       </div>
     );
@@ -6562,6 +7106,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
   // MAIN APP
   // ==========================================
   const go = (p: string) => {
+    if (sistemaBloqueadoTrial && p !== 'dashboard') return;
     if (esProveedorUsuario && p !== 'mi_inversion') return;
     if (esUsuarioMensualUsuario && !PAGINAS_MODULO_MENSUAL.has(p)) return;
     if (p !== 'creditos') limpiarDeepLinkCredito();
@@ -6643,19 +7188,49 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     role="menu"
                     className="absolute left-0 top-full mt-1 z-[60] min-w-[200px] rounded-xl border border-gray-700 bg-gray-900 shadow-xl shadow-black/40 py-1"
                   >
-                    {esMarcosPUsuario && (
+                    {!esProveedorUsuario && (
                       <button
                         type="button"
                         role="menuitem"
-                        className="w-full flex items-center gap-2 px-3 py-2.5 text-left text-sm text-cyan-200 hover:bg-cyan-500/10 active:bg-cyan-500/15 transition"
+                        className="w-full flex items-center gap-2 px-3 py-2.5 text-left text-sm text-cyan-100 hover:bg-cyan-500/10 active:bg-cyan-500/15 transition"
                         onClick={() => {
                           setMenuPerfilAbierto(false);
-                          go('config');
+                          setMVistaRapidaSistema(true);
                         }}
                       >
-                        <span className="text-base shrink-0" aria-hidden>⚙️</span>
-                        Perfil / Ajustes
+                        <span className="text-base shrink-0" aria-hidden>📖</span>
+                        Guía del sistema
                       </button>
+                    )}
+                    {esMarcosPUsuario && (
+                      <>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="w-full flex items-center gap-2 px-3 py-2.5 text-left text-sm text-cyan-200 hover:bg-cyan-500/10 active:bg-cyan-500/15 transition"
+                          onClick={() => {
+                            setMenuPerfilAbierto(false);
+                            setMarcosConfigTab('ajustes');
+                            go('config');
+                          }}
+                        >
+                          <span className="text-base shrink-0" aria-hidden>⚙️</span>
+                          Perfil / Ajustes
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="w-full flex items-center gap-2 px-3 py-2.5 text-left text-sm text-amber-200 hover:bg-amber-500/10 active:bg-amber-500/15 transition"
+                          onClick={() => {
+                            setMenuPerfilAbierto(false);
+                            setMarcosConfigTab('comisiones');
+                            go('config');
+                          }}
+                        >
+                          <span className="text-base shrink-0" aria-hidden>💰</span>
+                          Comisiones
+                        </button>
+                      </>
                     )}
                     <button
                       type="button"
@@ -6800,7 +7375,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     { label: 'En Mora', valor: kpis.moraClientes, icon: '🚩', color: 'from-red-500/20 to-red-600/10 border-red-500/30', textColor: 'text-red-400', onClick: () => { setFilterStatus('mora'); go('clientes'); } },
                     { label: 'Cobrado Hoy', valor: fmt(kpis.totalCobradoHoy), icon: '💵', color: 'from-green-500/20 to-green-600/10 border-green-500/30', textColor: 'text-green-400', onClick: () => {} },
                     { label: 'Gastos Hoy', valor: fmt(kpis.totalGastosHoy), icon: '📤', color: 'from-orange-500/20 to-orange-600/10 border-orange-500/30', textColor: 'text-orange-400', onClick: () => go('gastos') },
-                    { label: 'Efectividad', valor: `${kpis.efectividad.toFixed(0)}%`, icon: '📊', color: 'from-blue-500/20 to-blue-600/10 border-blue-500/30', textColor: 'text-blue-400', onClick: () => go('kpis') },
+                    { label: 'Efectividad', valor: `${kpis.efectividad.toFixed(0)}%`, icon: '📊', color: 'from-blue-500/20 to-blue-600/10 border-blue-500/30', textColor: 'text-blue-400', onClick: () => {} },
                   ].map((k, i) => (
                     <button key={i} onClick={k.onClick} className={`bg-gradient-to-br ${k.color} border rounded-2xl p-4 text-left active:scale-95 transition-all`}>
                       <div className="flex items-start justify-between">
@@ -6900,53 +7475,57 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             )}
 
             {esMarcosPUsuario && (
-              <div className="bg-amber-500/10 border border-amber-500/35 rounded-2xl p-4 space-y-3">
-                <div>
-                  <p className="text-sm font-bold text-amber-200">💰 Comisiones de vendedores</p>
-                  <p className="text-xs text-amber-100/70 mt-1">
-                    Acumulado por créditos aprobados. Liquidación semanal (corte sábado). Al pagar, se reinicia el acumulado del vendedor.
-                  </p>
-                  <p className="text-[11px] text-amber-200/60 mt-1">
-                    Corte semana en curso: {sabadoCorteSemana()} · Próximo sábado: {proximoSabadoDesde()}
-                  </p>
-                </div>
-                {vendedoresComisionAdmin.length === 0 && (
-                  <p className="text-xs text-gray-500">No hay comisiones pendientes de vendedores registradas.</p>
-                )}
-                {vendedoresComisionAdmin.map(v => (
-                  <div key={v.id} className="bg-gray-900/55 border border-amber-500/20 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center gap-3">
-                    <div className="flex-1 min-w-0">
-                      <p className="font-semibold text-white truncate">{etiquetaCobradorMovimiento(v.username)}</p>
-                      <p className="text-xs text-gray-400">{v.creditos_pendientes} crédito(s) con comisión pendiente</p>
-                    </div>
-                    <p className="text-xl font-black text-amber-300 shrink-0">{fmt(v.comision_acumulada)}</p>
-                    <button
-                      type="button"
-                      disabled={v.comision_acumulada <= 0 || liquidandoComisionId === v.id}
-                      onClick={() => void handleLiquidarComisionVendedor(v)}
-                      className="shrink-0 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white disabled:opacity-40 active:scale-95 transition"
-                    >
-                      {liquidandoComisionId === v.id ? 'Liquidando…' : 'Liquidar y reiniciar'}
-                    </button>
-                  </div>
-                ))}
-              </div>
+              <button
+                type="button"
+                onClick={() => { setMarcosConfigTab('comisiones'); go('config'); }}
+                className="w-full rounded-2xl border border-amber-500/35 bg-amber-500/10 p-4 text-left active:scale-[0.98] transition"
+              >
+                <p className="text-sm font-bold text-amber-200">💰 Comisiones de vendedores</p>
+                <p className="text-xs text-amber-100/70 mt-1">
+                  {vendedoresComisionAdmin.filter(v => v.total_pendiente_aprobacion > 0).length > 0
+                    ? `${vendedoresComisionAdmin.filter(v => v.total_pendiente_aprobacion > 0).length} vendedor(es) con comisiones por aprobar`
+                    : 'Gestionar % por vendedor, aprobar ventas y liquidar'}
+                </p>
+              </button>
             )}
 
             {miResumenComisionVendedor && (
               <div className="bg-teal-500/10 border border-teal-500/35 rounded-2xl p-4 space-y-3">
                 <div>
-                  <p className="text-sm font-bold text-teal-200">💼 Mis comisiones (pendientes de cobro)</p>
+                  <p className="text-sm font-bold text-teal-200">💼 Mis comisiones</p>
                   <p className="text-xs text-teal-100/70 mt-1">
-                    Se suman al aprobar cada crédito. Marcos liquida los sábados y reinicia el acumulado al pagar.
+                    Marcos debe aprobar cada comisión; después figura acá como monto a cobrar en la liquidación semanal.
                   </p>
                   <p className="text-[11px] text-teal-200/60 mt-1">
                     Corte semana: {miResumenComisionVendedor.corteSemana} · Próxima liquidación: {miResumenComisionVendedor.proximoSabado}
                   </p>
                 </div>
-                <p className="text-3xl font-black text-teal-300">{fmt(miResumenComisionVendedor.total)}</p>
+                {miResumenComisionVendedor.totalRevision > 0 && (
+                  <div className="rounded-xl bg-violet-500/10 border border-violet-500/25 px-3 py-2">
+                    <p className="text-[11px] text-violet-200">En revisión (admin)</p>
+                    <p className="text-lg font-bold text-violet-300">{fmt(miResumenComisionVendedor.totalRevision)}</p>
+                  </div>
+                )}
+                <div>
+                  <p className="text-[11px] text-teal-200/80">A cobrar (aprobadas)</p>
+                  <p className="text-3xl font-black text-teal-300">{fmt(miResumenComisionVendedor.total)}</p>
+                </div>
+                {miResumenComisionVendedor.enRevisionAdmin.length > 0 && (
+                  <div className="space-y-2 max-h-32 overflow-y-auto">
+                    <p className="text-[10px] text-violet-300/90 uppercase tracking-wide">Pendientes de aprobación</p>
+                    {miResumenComisionVendedor.enRevisionAdmin.map(c => (
+                      <div key={c.id} className="flex justify-between text-xs bg-violet-950/40 rounded-lg px-3 py-2">
+                        <span className="text-gray-300 truncate pr-2">
+                          {String(c.nro_carton || c.id).slice(0, 12)} · {fmt(Number(c.monto_solicitado) || 0)}
+                        </span>
+                        <span className="font-bold text-violet-300 shrink-0">{fmt(Number(c.comision_vendedor) || 0)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {miResumenComisionVendedor.pendientes.length > 0 && (
                   <div className="space-y-2 max-h-40 overflow-y-auto">
+                    <p className="text-[10px] text-teal-300/90 uppercase tracking-wide">Aprobadas — pendiente de pago</p>
                     {miResumenComisionVendedor.pendientes.map(c => (
                       <div key={c.id} className="flex justify-between text-xs bg-gray-900/50 rounded-lg px-3 py-2">
                         <span className="text-gray-300 truncate pr-2">
@@ -7604,59 +8183,6 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           </div>
         )}
 
-        {/* KPIs */}
-        {page === 'kpis' && esMarcosPUsuario && (
-          <div className="space-y-4">
-            <h2 className="text-lg font-bold">📊 Analítica de Negocio</h2>
-
-            {/* Efectividad */}
-            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-              <p className="text-sm text-gray-400 mb-2">Efectividad de Cobro</p>
-              <div className="flex items-end gap-3">
-                <span className="text-3xl font-bold text-indigo-400">{kpis.efectividad.toFixed(1)}%</span>
-                <div className="flex-1 bg-gray-800 rounded-full h-3 mb-1">
-                  <div className="bg-gradient-to-r from-green-400 to-emerald-500 h-3 rounded-full" style={{ width: `${Math.min(100, kpis.efectividad)}%` }} />
-                </div>
-              </div>
-            </div>
-
-            {/* Ranking */}
-            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-              <p className="text-sm text-gray-400 mb-3">Ranking de Cobradores</p>
-              {rankingCobradores.length === 0 && <p className="text-gray-500 text-sm">Sin datos</p>}
-              {rankingCobradores.map((r, i) => (
-                <div key={i} className="flex items-center gap-3 py-2 border-b border-gray-800/50 last:border-0">
-                  <span className="text-lg">{i === 0 ? '🥇' : i === 1 ? '🥈' : '🥉'}</span>
-                  <div className="flex-1">
-                    <p className="font-semibold text-sm">{etiquetaCobradorMovimiento(r.username)}</p>
-                    <p className="text-xs text-gray-400">{r.cierres} cierres</p>
-                  </div>
-                  <span className="font-bold text-green-400">{fmt(r.total)}</span>
-                </div>
-              ))}
-            </div>
-
-            {/* Proyeccion 7 dias */}
-            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-              <p className="text-sm text-gray-400 mb-3">Proyección Flujo (7 días)</p>
-              <div className="flex items-end gap-1 h-32">
-                {proyeccion7d.map((d, i) => {
-                  const max = Math.max(...proyeccion7d.map(x => x.total), 1);
-                  const h = (d.total / max) * 100;
-                  return (
-                    <div key={i} className="flex-1 flex flex-col items-center gap-1">
-                      <div className="w-full bg-indigo-500/30 rounded-t-md relative" style={{ height: `${h}%`, minHeight: '4px' }}>
-                        <div className="absolute inset-0 bg-indigo-500 rounded-t-md" style={{ height: `${h}%` }} />
-                      </div>
-                      <span className="text-xs text-gray-500">{i === 0 ? 'Hoy' : `+${i}`}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        )}
-
         {page === 'panel_control' && esMarcosPUsuario && (
           <div className="space-y-4">
             <h2 className="text-lg font-bold">🧭 Panel de Control</h2>
@@ -7681,7 +8207,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 <div key={item.cobrador} className="bg-gray-800/60 rounded-xl p-3 grid grid-cols-2 sm:grid-cols-5 gap-2 items-center">
                   <div className="col-span-2 sm:col-span-1">
                     <p className="text-sm font-semibold truncate">{etiquetaCobradorMovimiento(item.cobrador)}</p>
-                    <p className="text-[11px] text-gray-500">Cobrador</p>
+                    <p className="text-[11px] text-gray-500">{etiquetaRolUsuario(item.cobrador)}</p>
                   </div>
                   <div>
                     <p className="text-xs text-gray-400">Total Cobrado</p>
@@ -8223,31 +8749,71 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         {/* CONFIG */}
         {page === 'config' && esMarcosPUsuario && (
           <div className="space-y-4">
-            <h2 className="text-lg font-bold">⚙️ Configuración</h2>
-            <ConfigForm config={data.config} onSave={(c: any) => { void handleSaveConfig(c as Config); }} />
-            <div className="rounded-3xl border border-indigo-500/20 bg-gradient-to-br from-gray-900/80 to-gray-800/70 p-5 shadow-xl shadow-indigo-900/20">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-indigo-300 text-lg">ℹ️</span>
-                <p className="font-bold text-indigo-200">Información del Sistema</p>
-              </div>
-              <div className="space-y-2 text-sm text-gray-300">
-                <p><span className="text-gray-400">Software:</span> {MARCA_COMPLETA} v1.0</p>
-                <p><span className="text-gray-400">Programación y Arquitectura:</span> Emanuel Moreno Di Cesare.</p>
-                <p><span className="text-gray-400">Contacto de Soporte:</span> emamoreno@icloud.com Wsp: 549-263-4340284</p>
-              </div>
+            <h2 className="text-lg font-bold">⚙️ Perfil administrador</h2>
+            <div className="flex rounded-xl p-1 gap-1 bg-gray-900/80 border border-gray-700">
+              <button
+                type="button"
+                onClick={() => setMarcosConfigTab('ajustes')}
+                className={`flex-1 rounded-lg py-2.5 text-sm font-semibold transition ${marcosConfigTab === 'ajustes' ? 'bg-indigo-600 text-white' : 'text-gray-400'}`}
+              >
+                Ajustes
+              </button>
+              <button
+                type="button"
+                onClick={() => { setMarcosConfigTab('comisiones'); void fetchVendedoresComisionAdmin(); }}
+                className={`flex-1 rounded-lg py-2.5 text-sm font-semibold transition ${marcosConfigTab === 'comisiones' ? 'bg-amber-600 text-white' : 'text-gray-400'}`}
+              >
+                Comisiones
+                {vendedoresComisionAdmin.some(v => v.total_pendiente_aprobacion > 0) && (
+                  <span className="ml-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white px-1">
+                    {vendedoresComisionAdmin.reduce((s, v) => s + v.ventas_pendientes_aprobacion.length, 0)}
+                  </span>
+                )}
+              </button>
             </div>
-            {esMarcosPUsuario && isRootLike(rol) && (
-              <div className="space-y-2">
-                <div className="rounded-2xl border border-violet-500/25 bg-violet-500/5 p-4">
-                  <p className="font-semibold text-violet-200 text-sm mb-1">👥 Gestión de usuarios</p>
-                  <p className="text-xs text-gray-400 leading-relaxed">Los accesos se definen en Supabase Auth y en la tabla <span className="text-gray-300">usuarios</span> (columna <span className="text-gray-300">rol</span>: cobrador, vendedor, admin, root, super). Desde el panel SQL o Table Editor podés crear filas y asignar roles.</p>
+            {marcosConfigTab === 'comisiones' ? (
+              <ComisionesAdminPanel
+                vendedores={vendedoresComisionAdmin}
+                pctGlobal={Number(data.config.porcentajeComisionVendedor ?? 5)}
+                clientes={clientesOrEmpty}
+                guardandoPctId={guardandoPctComisionId}
+                liquidandoId={liquidandoComisionId}
+                aprobandoCreditoId={aprobandoComisionCreditoId}
+                onGuardarPct={(v, pct) => void handleGuardarPorcentajeComisionVendedor(v, pct)}
+                onAprobarComision={(c, v) => void handleAprobarComisionCredito(c, v)}
+                onLiquidar={v => void handleLiquidarComisionVendedor(v)}
+              />
+            ) : (
+              <>
+                <ConfigForm
+                  config={data.config}
+                  soloLectura={!puedeOperarSistema}
+                  onSave={(c: any) => { void handleSaveConfig(c as Config); }}
+                />
+                <div className="rounded-3xl border border-indigo-500/20 bg-gradient-to-br from-gray-900/80 to-gray-800/70 p-5 shadow-xl shadow-indigo-900/20">
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="text-indigo-300 text-lg">ℹ️</span>
+                    <p className="font-bold text-indigo-200">Información del Sistema</p>
+                  </div>
+                  <div className="space-y-2 text-sm text-gray-300">
+                    <p><span className="text-gray-400">Software:</span> {MARCA_COMPLETA} v1.0</p>
+                    <p><span className="text-gray-400">Programación y Arquitectura:</span> Emanuel Moreno Di Cesare.</p>
+                    <p><span className="text-gray-400">Contacto de Soporte:</span> emamoreno@icloud.com Wsp: 549-263-4340284</p>
+                  </div>
                 </div>
-                <button onClick={() => setMAuditoria(true)} className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">📜 Ver Auditoría</button>
-                <button onClick={() => { if (confirm('¿Exportar logs?')) { const csv = exportarAuditoria(); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `auditoria_${hoy()}.csv`; a.click(); } }} className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">📥 Exportar Auditoría CSV</button>
+                {isRootLike(rol) && (
+                  <div className="space-y-2">
+                    <div className="rounded-2xl border border-violet-500/25 bg-violet-500/5 p-4">
+                      <p className="font-semibold text-violet-200 text-sm mb-1">👥 Gestión de usuarios</p>
+                      <p className="text-xs text-gray-400 leading-relaxed">Los accesos se definen en Supabase Auth y en la tabla <span className="text-gray-300">usuarios</span> (columna <span className="text-gray-300">rol</span>: cobrador, vendedor, admin, root, super). Desde el panel SQL o Table Editor podés crear filas y asignar roles.</p>
+                    </div>
+                    <button onClick={() => setMAuditoria(true)} className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">📜 Ver Auditoría</button>
+                    <button onClick={() => { if (confirm('¿Exportar logs?')) { const csv = exportarAuditoria(); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `auditoria_${hoy()}.csv`; a.click(); } }} className="w-full bg-gray-800 border border-gray-700 text-gray-300 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">📥 Exportar Auditoría CSV</button>
+                  </div>
+                )}
                 <button onClick={() => doLogout()} className="w-full bg-red-500/20 border border-red-500/30 text-red-400 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">🚪 Cerrar Sesión</button>
-              </div>
+              </>
             )}
-            {esMarcosPUsuario && !isRootLike(rol) && <button onClick={() => doLogout()} className="w-full bg-red-500/20 border border-red-500/30 text-red-400 rounded-xl py-3 text-sm font-semibold active:scale-95 transition">🚪 Cerrar Sesión</button>}
           </div>
         )}
         {user && (
@@ -8282,7 +8848,6 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 ...(esMarcosPUsuario ? [{ k: 'rendiciones', icon: '📑', l: 'Rendición', pend: rendicionesPendientesAdmin.length }] : []),
                 ...(esMarcosPUsuario ? [{ k: 'panel_control', icon: '🧭', l: 'Control' }] : []),
                 ...(esMarcosPUsuario ? [{ k: 'gastos', icon: '💸', l: 'Gastos' }] : []),
-                ...(esMarcosPUsuario ? [{ k: 'kpis', icon: '📊', l: 'KPIs' }] : []),
                 ...(esMarcosPUsuario ? [{ k: 'config', icon: '⚙️', l: 'Ajustes' }] : []),
               ] : []),
             ].map(t => (
@@ -9191,6 +9756,16 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           </div>
         </Modal>
       )}
+
+      <VistaRapidaSistemaModal
+        open={mVistaRapidaSistema}
+        onClose={() => setMVistaRapidaSistema(false)}
+      />
+
+      {esSesionUsuarioPrueba && trialFinPrueba && (
+        <TrialCountdownBadge trialFin={trialFinPrueba} />
+      )}
+      <TrialBloqueoOverlay activo={sistemaBloqueadoTrial} onCerrarSesion={() => void doLogout()} />
     </div>
   );
 }
@@ -9199,7 +9774,15 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
 // SUB-COMPONENTS
 // ==========================================
 
-function LoginForm({ onLogin, loading }: { onLogin: (u: string, p: string) => void; loading: boolean }) {
+function LoginForm({
+  onLogin,
+  loading,
+  onAbrirGuia,
+}: {
+  onLogin: (u: string, p: string) => void;
+  loading: boolean;
+  onAbrirGuia?: () => void;
+}) {
   const [u, setU] = useState(() => loginDesdeAlmacenado(localStorage.getItem('cp_last_login_user')));
   const [p, setP] = useState('');
   const userRef = useRef<HTMLInputElement | null>(null);
@@ -9238,7 +9821,7 @@ function LoginForm({ onLogin, loading }: { onLogin: (u: string, p: string) => vo
           type="text"
           autoComplete="username"
           className="w-full bg-gray-900/80 border border-amber-400/20 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-amber-300/70 focus:ring-1 focus:ring-amber-300/40 transition"
-          placeholder="marcos, matias, vendedor…"
+          placeholder="marcos, matias, prueba…"
         />
       </div>
       <div>
@@ -9256,6 +9839,26 @@ function LoginForm({ onLogin, loading }: { onLogin: (u: string, p: string) => vo
       <button onClick={() => u.trim() && p && onLogin(u.trim(), p)} disabled={loading}
         className="w-full bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 disabled:from-amber-500/50 disabled:to-yellow-500/50 text-gray-950 font-bold py-3 rounded-xl transition-all active:scale-[0.98] shadow-lg shadow-amber-500/20">
         {loading ? '⏳...' : 'Ingresar'}
+      </button>
+      {onAbrirGuia && (
+        <button
+          type="button"
+          onClick={onAbrirGuia}
+          className="w-full bg-cyan-500/15 border border-cyan-400/35 text-cyan-200 font-semibold py-2.5 rounded-xl text-sm active:scale-[0.98] transition hover:bg-cyan-500/25"
+        >
+          📖 Ver guía del sistema
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => {
+          setU('prueba');
+          setP('prueba');
+          setTimeout(() => passRef.current?.focus(), 0);
+        }}
+        className="w-full text-[11px] text-gray-500 hover:text-amber-300/90 py-1 transition"
+      >
+        Demo: usuario <span className="text-gray-400">prueba</span> / clave <span className="text-gray-400">prueba</span>
       </button>
     </div>
   );
@@ -10641,7 +11244,151 @@ function SplashScreen({ elapsedMs }: { elapsedMs: number }) {
   );
 }
 
-function ConfigForm({ config, onSave }: { config: Config; onSave: (c: Config) => void }) {
+function ComisionesAdminPanel({
+  vendedores,
+  pctGlobal,
+  clientes,
+  guardandoPctId,
+  liquidandoId,
+  aprobandoCreditoId,
+  onGuardarPct,
+  onAprobarComision,
+  onLiquidar,
+}: {
+  vendedores: VendedorComisionResumen[];
+  pctGlobal: number;
+  clientes: Cliente[];
+  guardandoPctId: string | null;
+  liquidandoId: string | null;
+  aprobandoCreditoId: string | null;
+  onGuardarPct: (v: VendedorComisionResumen, pct: number) => void;
+  onAprobarComision: (credito: Credito, v: VendedorComisionResumen) => void;
+  onLiquidar: (v: VendedorComisionResumen) => void;
+}) {
+  const [pctDraft, setPctDraft] = useState<Record<string, string>>({});
+  const nombreClienteCredito = (c: Credito) => {
+    const cli = clientes.find(cl => normalizarId(cl.id) === normalizarId(String(c.cliente_id ?? '')));
+    return nombreCompletoCliente(cli) || String(c.cliente_id ?? '').slice(0, 8);
+  };
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-gray-400 leading-relaxed">
+        Definí el <strong className="text-gray-200">% de comisión</strong> por vendedor, revisá cada venta y <strong className="text-gray-200">aprobá</strong> la comisión.
+        El vendedor solo ve el monto a cobrar después de tu aprobación. Por defecto global: {pctGlobal}%.
+      </p>
+      <p className="text-[11px] text-amber-200/80">
+        Corte semanal: {sabadoCorteSemana()} · Próximo sábado: {proximoSabadoDesde()}
+      </p>
+      {vendedores.length === 0 && (
+        <p className="text-sm text-gray-500 text-center py-6">No hay vendedores registrados en el sistema.</p>
+      )}
+      {vendedores.map(v => {
+        const draftKey = v.id;
+        const pctVal = pctDraft[draftKey] ?? String(v.porcentaje_comision);
+        return (
+          <div key={v.id} className="rounded-2xl border border-amber-500/30 bg-amber-950/15 overflow-hidden">
+            <div className="p-4 border-b border-amber-500/20 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-bold text-white text-lg">{etiquetaCobradorMovimiento(v.username)}</p>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    A cobrar (aprobadas): <span className="text-amber-300 font-semibold">{fmt(v.comision_acumulada)}</span>
+                    {v.total_pendiente_aprobacion > 0 && (
+                      <span className="text-violet-300"> · En revisión: {fmt(v.total_pendiente_aprobacion)}</span>
+                    )}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={v.comision_acumulada <= 0 || liquidandoId === v.id}
+                  onClick={() => onLiquidar(v)}
+                  className="shrink-0 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white disabled:opacity-40 active:scale-95"
+                >
+                  {liquidandoId === v.id ? 'Liquidando…' : 'Liquidar y reiniciar'}
+                </button>
+              </div>
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="flex-1 min-w-[120px]">
+                  <label className="text-[10px] text-gray-500 block mb-1">% Comisión (sobre capital)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={pctVal}
+                    onChange={e => setPctDraft(prev => ({ ...prev, [draftKey]: e.target.value }))}
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-white font-semibold"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={guardandoPctId === v.id}
+                  onClick={() => onGuardarPct(v, Number(pctVal) || 0)}
+                  className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50"
+                >
+                  {guardandoPctId === v.id ? 'Guardando…' : 'Guardar %'}
+                </button>
+              </div>
+            </div>
+            {v.ventas_pendientes_aprobacion.length > 0 && (
+              <div className="p-3 border-b border-gray-800/80">
+                <p className="text-xs font-semibold text-violet-200 mb-2">Ventas pendientes de aprobación ({v.ventas_pendientes_aprobacion.length})</p>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {v.ventas_pendientes_aprobacion.map(c => (
+                    <div key={c.id} className="flex flex-col sm:flex-row sm:items-center gap-2 bg-gray-900/60 rounded-lg px-3 py-2">
+                      <div className="flex-1 min-w-0 text-xs">
+                        <p className="text-white font-medium truncate">{nombreClienteCredito(c)}</p>
+                        <p className="text-gray-500">
+                          Cartón {String(c.nro_carton || '—')} · Capital {fmt(Number(c.monto_solicitado) || 0)}
+                          {c.porcentaje_comision_credito != null && ` · ${c.porcentaje_comision_credito}%`}
+                        </p>
+                      </div>
+                      <p className="font-bold text-violet-300 shrink-0">{fmt(Number(c.comision_vendedor) || 0)}</p>
+                      <button
+                        type="button"
+                        disabled={aprobandoCreditoId === c.id}
+                        onClick={() => onAprobarComision(c, v)}
+                        className="shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-bold text-white disabled:opacity-50"
+                      >
+                        {aprobandoCreditoId === c.id ? '…' : 'Aprobar comisión'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {v.ventas_aprobadas_pendientes.length > 0 && (
+              <div className="p-3">
+                <p className="text-xs font-semibold text-teal-200/90 mb-2">Ventas con comisión aprobada ({v.ventas_aprobadas_pendientes.length})</p>
+                <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                  {v.ventas_aprobadas_pendientes.map(c => (
+                    <div key={c.id} className="flex justify-between text-xs bg-gray-900/40 rounded-lg px-3 py-2">
+                      <span className="text-gray-300 truncate pr-2">
+                        {nombreClienteCredito(c)} · {String(c.nro_carton || '').slice(0, 10)}
+                      </span>
+                      <span className="font-bold text-teal-300 shrink-0">{fmt(Number(c.comision_vendedor) || 0)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {v.ventas_pendientes_aprobacion.length === 0 && v.ventas_aprobadas_pendientes.length === 0 && (
+              <p className="p-4 text-xs text-gray-500 text-center">Sin ventas con comisión en este período.</p>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ConfigForm({
+  config,
+  onSave,
+  soloLectura = false,
+}: {
+  config: Config;
+  onSave: (c: Config) => void;
+  soloLectura?: boolean;
+}) {
   const [f, setF] = useState<Config>(() => ({
     ...config,
     telefonoEmpresa: valorInicialCampoCelular(config.telefonoEmpresa),
@@ -10657,7 +11404,12 @@ function ConfigForm({ config, onSave }: { config: Config; onSave: (c: Config) =>
   const s = (k: keyof Config, v: any) => setF(prev => ({ ...prev, [k]: v }));
   return (
     <div className="space-y-4">
-      <div><label className="text-xs text-gray-400 block mb-1">Nombre comercial (textos al cliente)</label><input value={f.nombreEmpresa} onChange={e => s('nombreEmpresa', e.target.value)} placeholder={MARCA_COMPLETA} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
+      {soloLectura && (
+        <p className="text-xs text-red-300/90 bg-red-500/10 border border-red-500/25 rounded-xl px-3 py-2">
+          Período de prueba finalizado: los ajustes no se pueden modificar.
+        </p>
+      )}
+      <div><label className="text-xs text-gray-400 block mb-1">Nombre comercial (textos al cliente)</label><input value={f.nombreEmpresa} onChange={e => s('nombreEmpresa', e.target.value)} placeholder={MARCA_COMPLETA} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
       <div>
         <label className="text-xs text-gray-400 block mb-1">Teléfono (celular / empresa)</label>
         <input
@@ -10666,16 +11418,17 @@ function ConfigForm({ config, onSave }: { config: Config; onSave: (c: Config) =>
           autoComplete="tel"
           value={f.telefonoEmpresa}
           onChange={e => s('telefonoEmpresa', soloDigitosTelefono(e.target.value))}
-          className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"
+          className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50"
           placeholder="5491123456789"
+          disabled={soloLectura}
         />
       </div>
-      <div><label className="text-xs text-gray-400 block mb-1">Dirección</label><input value={f.direccionEmpresa} onChange={e => s('direccionEmpresa', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-      <div><label className="text-xs text-gray-400 block mb-1">RUC / CUIT</label><input value={f.ruc} onChange={e => s('ruc', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-      <div><label className="text-xs text-gray-400 block mb-1">% Mora (diario)</label><input type="number" value={f.moraPorciento} onChange={e => s('moraPorciento', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-      <div><label className="text-xs text-gray-400 block mb-1">% Interés Mercadería (M)</label><input type="number" value={f.interesCreditoM} onChange={e => s('interesCreditoM', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-      <div><label className="text-xs text-gray-400 block mb-1">% Interés Préstamo (P)</label><input type="number" value={f.interesCreditoP} onChange={e => s('interesCreditoP', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-      <div><label className="text-xs text-gray-400 block mb-1">% Comisión vendedor (sobre capital)</label><input type="number" value={f.porcentajeComisionVendedor ?? 5} onChange={e => s('porcentajeComisionVendedor', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">Dirección</label><input value={f.direccionEmpresa} onChange={e => s('direccionEmpresa', e.target.value)} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">RUC / CUIT</label><input value={f.ruc} onChange={e => s('ruc', e.target.value)} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">% Mora (diario)</label><input type="number" value={f.moraPorciento} onChange={e => s('moraPorciento', parseFloat(e.target.value))} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">% Interés Mercadería (M)</label><input type="number" value={f.interesCreditoM} onChange={e => s('interesCreditoM', parseFloat(e.target.value))} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">% Interés Préstamo (P)</label><input type="number" value={f.interesCreditoP} onChange={e => s('interesCreditoP', parseFloat(e.target.value))} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
+      <div><label className="text-xs text-gray-400 block mb-1">% Comisión vendedor (sobre capital)</label><input type="number" value={f.porcentajeComisionVendedor ?? 5} onChange={e => s('porcentajeComisionVendedor', parseFloat(e.target.value))} disabled={soloLectura} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50" /></div>
       <div>
         <label className="text-xs text-gray-400 block mb-1">WhatsApp administrador</label>
         <input
@@ -10684,16 +11437,17 @@ function ConfigForm({ config, onSave }: { config: Config; onSave: (c: Config) =>
           autoComplete="tel"
           value={f.numeroWhatsappAdmin}
           onChange={e => s('numeroWhatsappAdmin', soloDigitosTelefono(e.target.value))}
-          className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"
+          className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-50"
           placeholder="5491123456789"
+          disabled={soloLectura}
         />
       </div>
       <label className="flex items-center justify-between rounded-xl border border-gray-700 bg-gray-800/60 px-4 py-3">
         <span className="text-sm font-semibold text-gray-200">Modo Exterior (alto contraste)</span>
-        <input type="checkbox" checked={Boolean(f.modoExterior)} onChange={e => s('modoExterior', e.target.checked)} className="w-5 h-5 accent-indigo-500" />
+        <input type="checkbox" checked={Boolean(f.modoExterior)} onChange={e => s('modoExterior', e.target.checked)} disabled={soloLectura} className="w-5 h-5 accent-indigo-500 disabled:opacity-50" />
       </label>
       <div className="flex gap-3 sticky bottom-0 bg-gray-900 pt-2">
-        <button onClick={() => onSave(f)} className="flex-1 bg-indigo-500 text-white font-bold py-3 rounded-xl active:scale-95 transition-all">💾 Guardar</button>
+        <button onClick={() => onSave(f)} disabled={soloLectura} className="flex-1 bg-indigo-500 text-white font-bold py-3 rounded-xl active:scale-95 transition-all disabled:opacity-40 disabled:pointer-events-none">💾 Guardar</button>
       </div>
     </div>
   );

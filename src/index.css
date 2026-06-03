@@ -35,12 +35,30 @@ body {
   print-color-adjust: exact;
 }
 
+/* Pie en pantalla (consola Root, etc.): ancho completo, sin recorte lateral */
+.branding-footer--screen {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: visible;
+  opacity: 0.85;
+}
+
+.branding-footer--screen .branding-footer__inner {
+  width: 100%;
+  max-width: 100%;
+  justify-content: center;
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
 .branding-footer__inner {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 10px;
   min-height: 32px;
+  max-width: 100%;
 }
 
 .branding-footer--align-end .branding-footer__inner {

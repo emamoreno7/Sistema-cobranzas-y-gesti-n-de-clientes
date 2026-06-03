@@ -7,7 +7,8 @@
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",
-    "deploy": "npm run build",
+    "build:pages": "VITE_BASE_PATH=/Sistema-cobranzas-y-gesti-n-de-clientes/ npm run typecheck && vite build",
+    "deploy": "npm run build:pages",
     "preview": "vite preview"
   },
   "dependencies": {
