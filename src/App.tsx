@@ -2351,6 +2351,19 @@ function saldoCajaPropiaDesdeMovimientos(movs: MovimientoCajaPropia[]): number {
   );
 }
 
+/** Saldo en servidor (evita doble egreso con estado local desactualizado). */
+async function obtenerSaldoCajaPropiaDesdeDb(): Promise<number> {
+  const { data, error } = await supabase.from('caja_propia_movimientos').select('tipo, monto');
+  if (error) throw error;
+  let saldo = 0;
+  for (const row of data ?? []) {
+    const r = row as { tipo?: string; monto?: number };
+    const m = redondearPesos(Number(r.monto ?? 0));
+    saldo += String(r.tipo ?? 'entrada') === 'salida' ? -m : m;
+  }
+  return redondearPesos(saldo);
+}
+
 /**
  * Ruta: crédito con estado ACTIVO y cuotas pendientes (pagos efectivos < cuotas totales).
  * Monto: suma de todas las cuotas aún no cubiertas según `generarPlanillaCredito` (sin exigir vto ≤ hoy).
@@ -3138,6 +3151,9 @@ export default function App() {
   const [cartonDestacarCreditoId, setCartonDestacarCreditoId] = useState<string | null>(null);
   const deepLinkCreditoAtendidoRef = useRef<string | null>(null);
   const urlCreditoInicialAplicadoRef = useRef(false);
+  /** Evita doble clic antes de que React deshabilite el botón (caja propia / fondo crédito). */
+  const fondoCreditoProcesandoRef = useRef<Set<string>>(new Set());
+  const movCajaPropiaProcesandoRef = useRef(false);
   const [mComprobanteImagen, setMComprobanteImagen] = useState<ComprobantePagoImagen | null>(null);
   const comprobanteTicketRef = useRef<HTMLDivElement | null>(null);
   const [mRuta, setMRuta] = useState(false);
@@ -4744,9 +4760,24 @@ export default function App() {
 
   const solicitudesPendientes = creditosPendientesValidos.length;
 
+  const solicitudesFondoIdsConEgresoPropia = useMemo(
+    () =>
+      new Set(
+        movimientosCajaPropia
+          .map(m => m.solicitudFondoId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    [movimientosCajaPropia],
+  );
+
   const solicitudesFondoPendientesAdmin = useMemo(
-    () => (esMarcosPUsuario ? solicitudesFondoCredito.filter(s => s.estado === 'pendiente') : []),
-    [esMarcosPUsuario, solicitudesFondoCredito],
+    () =>
+      esMarcosPUsuario
+        ? solicitudesFondoCredito.filter(
+            s => s.estado === 'pendiente' && !solicitudesFondoIdsConEgresoPropia.has(s.id),
+          )
+        : [],
+    [esMarcosPUsuario, solicitudesFondoCredito, solicitudesFondoIdsConEgresoPropia],
   );
 
   const misSolicitudesFondoCredito = useMemo(() => {
@@ -4814,10 +4845,44 @@ export default function App() {
     const totalCobradoHoy = redondearPesos(pagosH.reduce((s, p) => s + (Number(p.monto) || 0), 0));
     const totalGastosHoy = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
 
-    const porUsuario = new Map<string, { cobrador: string; cobrado: number; gastos: number; cantCobros: number; cantGastos: number }>();
+    let totalIngresosCajaHoy = 0;
+    let totalSalidasCajaHoy = 0;
+    movimientosCaja.forEach(m => {
+      if (String(m.createdAt).slice(0, 10) !== h) return;
+      if (m.tipo === 'entrada') totalIngresosCajaHoy += redondearPesos(m.monto);
+      else totalSalidasCajaHoy += redondearPesos(m.monto);
+    });
+    totalIngresosCajaHoy = redondearPesos(totalIngresosCajaHoy);
+    totalSalidasCajaHoy = redondearPesos(totalSalidasCajaHoy);
+    const totalCajaHoy = redondearPesos(
+      totalCobradoHoy + totalIngresosCajaHoy - totalGastosHoy - totalSalidasCajaHoy,
+    );
+
+    const porUsuario = new Map<
+      string,
+      {
+        cobrador: string;
+        cobrado: number;
+        gastos: number;
+        ingresosCaja: number;
+        salidasCaja: number;
+        enMano: number;
+        cantCobros: number;
+        cantGastos: number;
+      }
+    >();
     const touch = (rawId: string) => {
       const cobrador = String(rawId || 'sin_usuario').trim() || 'sin_usuario';
-      const actual = porUsuario.get(cobrador) || { cobrador, cobrado: 0, gastos: 0, cantCobros: 0, cantGastos: 0 };
+      const actual = porUsuario.get(cobrador) || {
+        cobrador,
+        cobrado: 0,
+        gastos: 0,
+        ingresosCaja: 0,
+        salidasCaja: 0,
+        enMano: 0,
+        cantCobros: 0,
+        cantGastos: 0,
+      };
       porUsuario.set(cobrador, actual);
       return actual;
     };
@@ -4831,14 +4896,26 @@ export default function App() {
       item.gastos += redondearPesos(Number(g.monto) || 0);
       item.cantGastos += 1;
     });
+    movimientosCaja.forEach(m => {
+      if (String(m.createdAt).slice(0, 10) !== h) return;
+      const item = touch(String(m.cobradorId || 'sin_usuario'));
+      if (m.tipo === 'entrada') item.ingresosCaja += redondearPesos(m.monto);
+      else item.salidasCaja += redondearPesos(m.monto);
+    });
+    porUsuario.forEach(item => {
+      item.enMano = redondearPesos(item.cobrado + item.ingresosCaja - item.gastos - item.salidasCaja);
+    });
 
     return {
       totalCobradoHoy,
       totalGastosHoy,
+      totalIngresosCajaHoy,
+      totalSalidasCajaHoy,
+      totalCajaHoy,
       netoCampoHoy: redondearPesos(totalCobradoHoy - totalGastosHoy),
-      porUsuario: Array.from(porUsuario.values()).sort((a, b) => b.cobrado - a.cobrado),
+      porUsuario: Array.from(porUsuario.values()).sort((a, b) => b.enMano - a.enMano),
     };
-  }, [pagosOrEmpty, gastos]);
+  }, [pagosOrEmpty, gastos, movimientosCaja]);
 
   const resumenCajaPropia = useMemo(() => {
     const h = hoy();
@@ -6464,30 +6541,35 @@ export default function App() {
 
   const handleRegistrarMovimientoCajaPropia = useCallback(async () => {
     if (!esMarcosPUsuario) return;
+    if (movCajaPropiaProcesandoRef.current) return;
+    movCajaPropiaProcesandoRef.current = true;
     const tipo = formMovCajaPropia.tipo;
     const monto = redondearPesos(Number(formMovCajaPropia.monto));
     if (!monto || monto <= 0) {
       alert('Ingresá un monto válido.');
+      movCajaPropiaProcesandoRef.current = false;
       return;
     }
-    const saldoActual = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
-    if (tipo === 'salida' && saldoActual < monto) {
-      alert(`Saldo insuficiente en caja propia.\nDisponible: ${fmt(saldoActual)}\nRetiro solicitado: ${fmt(monto)}`);
-      return;
-    }
-    const actor = nombreParaMostrarSesion({
-      loginEmail,
-      usernameState: user,
-      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
-    });
-    const fechaMov = formMovCajaPropia.fecha || hoy();
-    const nota = formMovCajaPropia.nota.trim() || null;
-    const descripcion =
-      tipo === 'entrada'
-        ? 'Ingreso propio de capital'
-        : 'Egreso propio de caja (retiro)';
     setGuardandoMovCajaPropia(true);
     try {
+      if (tipo === 'salida') {
+        const saldoDb = await obtenerSaldoCajaPropiaDesdeDb();
+        if (saldoDb < monto) {
+          alert(`Saldo insuficiente en caja propia.\nDisponible: ${fmt(saldoDb)}\nRetiro solicitado: ${fmt(monto)}`);
+          return;
+        }
+      }
+      const actor = nombreParaMostrarSesion({
+        loginEmail,
+        usernameState: user,
+        authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+      });
+      const fechaMov = formMovCajaPropia.fecha || hoy();
+      const nota = formMovCajaPropia.nota.trim() || null;
+      const descripcion =
+        tipo === 'entrada'
+          ? 'Ingreso propio de capital'
+          : 'Egreso propio de caja (retiro)';
       const { error } = await supabase.from('caja_propia_movimientos').insert([{
         tipo,
         monto,
@@ -6499,7 +6581,7 @@ export default function App() {
       if (error) throw error;
       setFormMovCajaPropia({ tipo, monto: '', nota: '', fecha: hoy() });
       audit('CONFIG_CAMBIO', `${tipo === 'entrada' ? 'Ingreso' : 'Egreso'} propio caja ${fmt(monto)}`);
-      const nuevoSaldo = redondearPesos(saldoActual + (tipo === 'entrada' ? monto : -monto));
+      const nuevoSaldo = await obtenerSaldoCajaPropiaDesdeDb();
       await fetchData();
       alert(
         tipo === 'entrada'
@@ -6510,40 +6592,91 @@ export default function App() {
       console.error('handleRegistrarMovimientoCajaPropia:', e);
       alert(e instanceof Error ? e.message : 'No se pudo registrar (¿migración 039?)');
     } finally {
+      movCajaPropiaProcesandoRef.current = false;
       setGuardandoMovCajaPropia(false);
     }
-  }, [esMarcosPUsuario, formMovCajaPropia, movimientosCajaPropia, loginEmail, user, authUserMeta, audit, fetchData]);
+  }, [esMarcosPUsuario, formMovCajaPropia, loginEmail, user, authUserMeta, audit, fetchData]);
 
   const handleRegistrarIngresoFondoCredito = useCallback(async (sol: SolicitudFondoCredito) => {
     if (!esMarcosPUsuario) {
       alert('Solo Marcos puede registrar este ingreso en caja.');
       return;
     }
-    if (sol.estado !== 'pendiente') return;
-    const creditoId = fichaIdUuid(sol.credito_id);
-    const clienteId = normalizarUuidPostgrest(sol.cliente_id);
-    if (!creditoId || !clienteId) {
-      alert('Solicitud con crédito o cliente inválido.');
-      return;
-    }
-    const saldoPropio = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
-    if (saldoPropio < sol.monto) {
-      alert(
-        `Saldo de caja propia insuficiente.\nDisponible: ${fmt(saldoPropio)}\nRequerido: ${fmt(sol.monto)}\n\nRegistrá un ingreso propio en caja propia antes de habilitar al cobrador.`,
-      );
-      return;
-    }
-    const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
-    const nombreCli = nombreCompletoCliente(cli) || 'cliente';
-    const desc = descripcionIngresoMarcosCredito(nombreCli);
-    const actor = nombreParaMostrarSesion({
-      loginEmail,
-      usernameState: user,
-      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
-    });
+    if (fondoCreditoProcesandoRef.current.has(sol.id)) return;
+    fondoCreditoProcesandoRef.current.add(sol.id);
     setGuardandoFondoCreditoId(sol.id);
+
+    const revertirSolicitudPendiente = async () => {
+      await supabase
+        .from('solicitudes_fondo_credito')
+        .update({ estado: 'pendiente', fondado_at: null })
+        .eq('id', sol.id);
+    };
+
     try {
+      if (sol.estado !== 'pendiente') {
+        alert('Esta solicitud ya fue habilitada.');
+        return;
+      }
+      const creditoId = fichaIdUuid(sol.credito_id);
+      const clienteId = normalizarUuidPostgrest(sol.cliente_id);
+      if (!creditoId || !clienteId) {
+        alert('Solicitud con crédito o cliente inválido.');
+        return;
+      }
+
+      const { data: egresoPrevio } = await supabase
+        .from('caja_propia_movimientos')
+        .select('id')
+        .eq('solicitud_fondo_id', sol.id)
+        .maybeSingle();
+      if (egresoPrevio) {
+        alert('Esta solicitud ya tiene un egreso en caja propia. No se duplicó el movimiento.');
+        await fetchData();
+        return;
+      }
+
+      let saldoPropio = await obtenerSaldoCajaPropiaDesdeDb();
+      if (saldoPropio < sol.monto) {
+        alert(
+          `Saldo de caja propia insuficiente.\nDisponible: ${fmt(saldoPropio)}\nRequerido: ${fmt(sol.monto)}\n\nRegistrá un ingreso propio en caja propia antes de habilitar al cobrador.`,
+        );
+        return;
+      }
+
+      const { data: claimed, error: claimErr } = await supabase
+        .from('solicitudes_fondo_credito')
+        .update({ estado: 'fondado', fondado_at: new Date().toISOString() })
+        .eq('id', sol.id)
+        .eq('estado', 'pendiente')
+        .select('id')
+        .maybeSingle();
+      if (claimErr) throw claimErr;
+      if (!claimed) {
+        alert('Esta solicitud ya fue procesada por otro intento. No se duplicó el egreso.');
+        await fetchData();
+        return;
+      }
+
+      saldoPropio = await obtenerSaldoCajaPropiaDesdeDb();
+      if (saldoPropio < sol.monto) {
+        await revertirSolicitudPendiente();
+        alert(
+          `Saldo de caja propia insuficiente.\nDisponible: ${fmt(saldoPropio)}\nRequerido: ${fmt(sol.monto)}`,
+        );
+        return;
+      }
+
+      const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
+      const nombreCli = nombreCompletoCliente(cli) || 'cliente';
+      const desc = descripcionIngresoMarcosCredito(nombreCli);
+      const actor = nombreParaMostrarSesion({
+        loginEmail,
+        usernameState: user,
+        authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+      });
       const cobradorCaja = String(sol.cobrador_id || 'sin_usuario').trim();
+
       const { data: cajaRow, error: cajaErr } = await supabase
         .from('caja')
         .insert([{
@@ -6556,8 +6689,12 @@ export default function App() {
         } as Record<string, unknown>])
         .select('id')
         .single();
-      if (cajaErr) throw cajaErr;
+      if (cajaErr) {
+        await revertirSolicitudPendiente();
+        throw cajaErr;
+      }
       const cajaId = cajaRow != null ? String((cajaRow as Record<string, unknown>).id ?? '') : '';
+
       const { error: propErr } = await supabase.from('caja_propia_movimientos').insert([{
         tipo: 'salida',
         monto: sol.monto,
@@ -6568,12 +6705,17 @@ export default function App() {
         caja_referencia_id: cajaId || null,
         fecha: hoy(),
       }]);
-      if (propErr) throw propErr;
-      const { error: solErr } = await supabase
-        .from('solicitudes_fondo_credito')
-        .update({ estado: 'fondado', fondado_at: new Date().toISOString() })
-        .eq('id', sol.id);
-      if (solErr) throw solErr;
+      if (propErr) {
+        await revertirSolicitudPendiente();
+        const code = (propErr as { code?: string }).code;
+        if (code === '23505') {
+          alert('El egreso ya estaba registrado. No se duplicó.');
+          await fetchData();
+          return;
+        }
+        throw propErr;
+      }
+
       const emailCob = normalizarEmail(sol.solicitante_email);
       if (emailCob) {
         await crearNotificacion({
@@ -6585,14 +6727,16 @@ export default function App() {
       }
       audit('CONFIG_CAMBIO', `Egreso caja propia + ingreso cobrador ${fmt(sol.monto)} — ${nombreCli}`);
       await fetchData();
-      alert(`Habilitado: ${fmt(sol.monto)} al cobrador para ${nombreCli}. Egreso registrado en caja propia.`);
+      const saldoFinal = await obtenerSaldoCajaPropiaDesdeDb();
+      alert(`Habilitado: ${fmt(sol.monto)} al cobrador para ${nombreCli}. Saldo caja propia: ${fmt(saldoFinal)}.`);
     } catch (e: unknown) {
       console.error('handleRegistrarIngresoFondoCredito:', e);
-      alert(e instanceof Error ? e.message : 'No se pudo registrar el ingreso (¿migraciones 038/039?)');
+      alert(e instanceof Error ? e.message : 'No se pudo registrar el ingreso (¿migraciones 038/039/040?)');
     } finally {
+      fondoCreditoProcesandoRef.current.delete(sol.id);
       setGuardandoFondoCreditoId(null);
     }
-  }, [esMarcosPUsuario, clientesOrEmpty, movimientosCajaPropia, crearNotificacion, audit, fetchData, loginEmail, user, authUserMeta]);
+  }, [esMarcosPUsuario, clientesOrEmpty, crearNotificacion, audit, fetchData, loginEmail, user, authUserMeta]);
 
   const handleCrearCredito = async (payload: {
     cliente_id: any; tipo: 'M' | 'P'; monto_solicitado: number; detalle_mercaderia: string | null; fecha_inicio: string;
@@ -8665,18 +8809,22 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               </button>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div className="bg-gray-900/60 border border-emerald-500/35 rounded-2xl p-4">
-                <p className="text-xs text-gray-400">Total cobrado hoy</p>
-                <p className="text-2xl font-black text-emerald-400 mt-1">{fmt(resumenCajaMarcosDia.totalCobradoHoy)}</p>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="bg-gray-900/60 border border-emerald-500/35 rounded-2xl p-3">
+                <p className="text-[10px] text-gray-400 leading-tight">Total cobrado hoy</p>
+                <p className="text-lg font-black text-emerald-400 mt-1">{fmt(resumenCajaMarcosDia.totalCobradoHoy)}</p>
               </div>
-              <div className="bg-gray-900/60 border border-orange-500/35 rounded-2xl p-4">
-                <p className="text-xs text-gray-400">Total gastos hoy</p>
-                <p className="text-2xl font-black text-orange-400 mt-1">{fmt(resumenCajaMarcosDia.totalGastosHoy)}</p>
+              <div className="bg-gray-900/60 border border-orange-500/35 rounded-2xl p-3">
+                <p className="text-[10px] text-gray-400 leading-tight">Total gastos hoy</p>
+                <p className="text-lg font-black text-orange-400 mt-1">{fmt(resumenCajaMarcosDia.totalGastosHoy)}</p>
+              </div>
+              <div className="bg-gray-900/60 border border-sky-500/35 rounded-2xl p-3">
+                <p className="text-[10px] text-gray-400 leading-tight">Total Caja</p>
+                <p className="text-lg font-black text-sky-300 mt-1">{fmt(resumenCajaMarcosDia.totalCajaHoy)}</p>
               </div>
             </div>
             <p className="text-[11px] text-gray-500 text-center">
-              Neto campo hoy (cobrado − gastos): <span className="text-gray-300 font-semibold">{fmt(resumenCajaMarcosDia.netoCampoHoy)}</span>
+              Efectivo líquido en campo (cobrado + ingresos caja − gastos − salidas caja).
             </p>
 
             <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-3">
@@ -8687,7 +8835,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               {resumenCajaMarcosDia.porUsuario.map(u => (
                 <div key={u.cobrador} className="bg-gray-800/60 rounded-xl p-3 space-y-2">
                   <p className="font-semibold text-sm text-white">{etiquetaCobradorMovimiento(u.cobrador)}</p>
-                  <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div className="grid grid-cols-3 gap-2 text-sm">
                     <div className="rounded-lg bg-green-950/40 border border-green-500/25 px-2 py-1.5">
                       <p className="text-[10px] text-green-300/80 uppercase">Cobrado</p>
                       <p className="font-bold text-green-400">{fmt(u.cobrado)}</p>
@@ -8697,6 +8845,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                       <p className="text-[10px] text-orange-300/80 uppercase">Gastos</p>
                       <p className="font-bold text-orange-400">{fmt(u.gastos)}</p>
                       <p className="text-[10px] text-gray-500">{u.cantGastos} gasto/s</p>
+                    </div>
+                    <div className="rounded-lg bg-sky-950/40 border border-sky-500/25 px-2 py-1.5">
+                      <p className="text-[10px] text-sky-300/80 uppercase">En mano</p>
+                      <p className="font-bold text-sky-300">{fmt(u.enMano)}</p>
+                      <p className="text-[10px] text-gray-500">líquido hoy</p>
                     </div>
                   </div>
                 </div>
@@ -8713,7 +8866,9 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               <div className="grid grid-cols-3 gap-2 text-center">
                 <div className="rounded-xl bg-violet-950/50 border border-violet-500/30 p-2">
                   <p className="text-[10px] text-gray-400">Saldo disponible</p>
-                  <p className="text-lg font-black text-violet-200">{fmt(resumenCajaPropia.saldo)}</p>
+                  <p className={`text-lg font-black ${resumenCajaPropia.saldo < 0 ? 'text-red-400' : 'text-violet-200'}`}>
+                    {fmt(resumenCajaPropia.saldo)}
+                  </p>
                 </div>
                 <div className="rounded-xl bg-green-950/30 border border-green-500/20 p-2">
                   <p className="text-[10px] text-gray-400">Ingresos hoy</p>
@@ -8724,6 +8879,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                   <p className="text-sm font-bold text-orange-400">−{fmt(resumenCajaPropia.egresosHoy)}</p>
                 </div>
               </div>
+              {resumenCajaPropia.saldo < 0 && (
+                <p className="text-[11px] text-red-300 bg-red-950/40 border border-red-500/30 rounded-xl px-3 py-2">
+                  El saldo no debería ser negativo. Si hubo un doble egreso, eliminá el movimiento duplicado en Supabase (tabla caja_propia_movimientos) y recargá.
+                </p>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -8861,7 +9021,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     )}
                     <button
                       type="button"
-                      disabled={guardandoFondoCreditoId === sol.id || sinSaldo}
+                      disabled={guardandoFondoCreditoId != null || sinSaldo}
                       onClick={() => void handleRegistrarIngresoFondoCredito(sol)}
                       className="w-full bg-amber-600 disabled:opacity-50 text-white rounded-xl py-2.5 text-sm font-bold active:scale-95 transition"
                     >
