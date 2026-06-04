@@ -958,6 +958,22 @@ interface Notificacion {
   created_at?: string;
 }
 
+/** Admin que autoriza ingresos en caja para créditos sin recaudado previo. */
+const EMAIL_ADMIN_MARCOS_CAJA = 'emamoreno7@hotmail.com';
+
+interface SolicitudFondoCredito {
+  id: string;
+  created_at: string;
+  credito_id: string;
+  cliente_id: string;
+  cobrador_id: string;
+  solicitante_email: string | null;
+  solicitante_nombre: string | null;
+  monto: number;
+  estado: 'pendiente' | 'fondado' | 'cancelado';
+  fondado_at: string | null;
+}
+
 /** Metadatos guardados en cp_data_v2 (clientes/fichas/gastos van aparte en cp_cli, cp_fic, cp_gas). */
 interface AppMeta {
   cierres: Cierre[];
@@ -2255,6 +2271,51 @@ function mapFilaCajaSupabase(row: Record<string, unknown>): MovimientoCaja {
   };
 }
 
+function mapSolicitudFondoCredito(row: Record<string, unknown>): SolicitudFondoCredito {
+  const est = String(row.estado ?? 'pendiente').trim().toLowerCase();
+  return {
+    id: String(row.id ?? genId()),
+    created_at: String(row.created_at ?? new Date().toISOString()),
+    credito_id: String(row.credito_id ?? ''),
+    cliente_id: String(row.cliente_id ?? ''),
+    cobrador_id: String(row.cobrador_id ?? 'sin_usuario'),
+    solicitante_email: row.solicitante_email != null ? String(row.solicitante_email) : null,
+    solicitante_nombre: row.solicitante_nombre != null ? String(row.solicitante_nombre) : null,
+    monto: redondearPesos(Number(row.monto ?? 0)),
+    estado: est === 'fondado' || est === 'cancelado' ? est : 'pendiente',
+    fondado_at: row.fondado_at != null ? String(row.fondado_at) : null,
+  };
+}
+
+/** Sin cobranzas ni ingresos previos en caja del cobrador que crea el crédito. */
+function cobradorSinRecaudadoEnCaja(
+  cobradorId: string,
+  pagos: PagoRegistro[],
+  movimientos: MovimientoCaja[],
+  authUserId: string | null,
+  username: string | null,
+  loginEmail: string | null,
+): boolean {
+  const cobradoPagos = pagos
+    .filter(p => esPagoEfectivo(p) && esRegistroDelCobrador(p, authUserId, username, loginEmail))
+    .reduce((s, p) => s + redondearPesos(Number(p.monto) || 0), 0);
+  if (cobradoPagos > 0) return false;
+  const k = String(cobradorId || authUserId || username || loginEmail || '').trim();
+  const entradas = movimientos
+    .filter(m => {
+      if (m.tipo !== 'entrada' || m.monto <= 0) return false;
+      const mc = String(m.cobradorId || '').trim();
+      return mc === k || esRegistroDelCobrador({ cobradorId: mc, userId: mc } as PagoRegistro, authUserId, username, loginEmail);
+    })
+    .reduce((s, m) => s + m.monto, 0);
+  return entradas <= 0;
+}
+
+function descripcionIngresoMarcosCredito(nombreCliente: string): string {
+  const nom = (nombreCliente || 'cliente').trim();
+  return `Ingreso de Marcos para crédito entregado — ${nom}`;
+}
+
 /**
  * Ruta: crédito con estado ACTIVO y cuotas pendientes (pagos efectivos < cuotas totales).
  * Monto: suma de todas las cuotas aún no cubiertas según `generarPlanillaCredito` (sin exigir vto ≤ hoy).
@@ -2941,6 +3002,8 @@ export default function App() {
   const [cartonesCredito, setCartonesCredito] = useState<Record<string, string>>(() => cargar('cp_cartones_credito', {} as Record<string, string>));
   const [notificaciones, setNotificaciones] = useState<Notificacion[]>([]);
   const [movimientosCaja, setMovimientosCaja] = useState<MovimientoCaja[]>([]);
+  const [solicitudesFondoCredito, setSolicitudesFondoCredito] = useState<SolicitudFondoCredito[]>([]);
+  const [guardandoFondoCreditoId, setGuardandoFondoCreditoId] = useState<string | null>(null);
   const [gastos, setGastos] = useState<Gasto[]>(() => {
     const v = cargar('cp_gas', [] as Gasto[]);
     if (Array.isArray(v) && v.length) return v;
@@ -3439,12 +3502,16 @@ export default function App() {
           timestamp: Number(g?.timestamp ?? new Date(g?.created_at ?? Date.now()).getTime()),
         })) as Gasto[]);
       }
-      if (verTodosLosCreditos) {
-        const { data: cajaDb, error: cajaErr } = await supabase
-          .from('caja')
-          .select('*')
-          .order('created_at', { ascending: false })
-          .limit(500);
+      {
+        let cajaQuery = supabase.from('caja').select('*').order('created_at', { ascending: false }).limit(300);
+        if (!verTodosLosCreditos) {
+          if (cobradorIdsFilter.length === 0) {
+            cajaQuery = cajaQuery.limit(0);
+          } else {
+            cajaQuery = cajaQuery.in('cobrador_id', cobradorIdsFilter);
+          }
+        }
+        const { data: cajaDb, error: cajaErr } = await cajaQuery;
         if (cajaErr) {
           devWarn('Supabase fetch caja:', cajaErr);
           setMovimientosCaja([]);
@@ -3453,8 +3520,26 @@ export default function App() {
             (Array.isArray(cajaDb) ? cajaDb : []).map(r => mapFilaCajaSupabase(r as Record<string, unknown>)),
           );
         }
+      }
+
+      let solicitudesFondoQuery = supabase
+        .from('solicitudes_fondo_credito')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(200);
+      if (!verTodosLosCreditos && cobradorIdsFilter.length > 0) {
+        solicitudesFondoQuery = solicitudesFondoQuery.in('cobrador_id', cobradorIdsFilter);
+      } else if (!verTodosLosCreditos) {
+        solicitudesFondoQuery = solicitudesFondoQuery.limit(0);
+      }
+      const { data: solFondoDb, error: solFondoErr } = await solicitudesFondoQuery;
+      if (solFondoErr) {
+        devWarn('Supabase fetch solicitudes_fondo_credito (¿migración 038?):', solFondoErr);
+        setSolicitudesFondoCredito([]);
       } else {
-        setMovimientosCaja([]);
+        setSolicitudesFondoCredito(
+          (Array.isArray(solFondoDb) ? solFondoDb : []).map(r => mapSolicitudFondoCredito(r as Record<string, unknown>)),
+        );
       }
       const { data: rendicionesDb, error: rendErr } = await supabase.from('rendiciones').select('*').order('created_at', { ascending: false });
       if (rendErr) {
@@ -4201,6 +4286,7 @@ export default function App() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'rendiciones' }, () => { void fetchData(); })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'gastos' }, () => { void fetchData(); })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'caja' }, () => { void fetchData(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_fondo_credito' }, () => { void fetchData(); })
       .subscribe();
     return () => {
       void supabase.removeChannel(channel);
@@ -4523,13 +4609,25 @@ export default function App() {
     const totalCobrado = redondearPesos(pagosH.reduce((s, p) => s + (Number(p.monto) || 0), 0));
     const gastosH = gList.filter(g => String(g.fecha || '').slice(0, 10) === h && esGastoDelCobrador(g, authUserId, user, loginEmail));
     const totalGastos = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
+    const movsHoy = movimientosCaja.filter(m => {
+      if (String(m.createdAt).slice(0, 10) !== h) return false;
+      return esRegistroDelCobrador({ cobradorId: m.cobradorId, userId: m.cobradorId } as PagoRegistro, authUserId, user, loginEmail);
+    });
+    const ingresosCaja = redondearPesos(
+      movsHoy.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0),
+    );
+    const salidasCaja = redondearPesos(
+      movsHoy.filter(m => m.tipo === 'salida').reduce((s, m) => s + m.monto, 0),
+    );
     return {
       totalCobrado,
       totalGastos,
-      efectivoEnMano: redondearPesos(totalCobrado - totalGastos),
+      ingresosCaja,
+      salidasCaja,
+      efectivoEnMano: redondearPesos(totalCobrado + ingresosCaja - totalGastos - salidasCaja),
       cantGastos: gastosH.length,
     };
-  }, [pagosOrEmpty, gastos, authUserId, user, loginEmail]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail]);
 
   const miRendicionHoy = useMemo(() => {
     const h = hoy();
@@ -4582,6 +4680,25 @@ export default function App() {
   }, [creditosConClienteValido]);
 
   const solicitudesPendientes = creditosPendientesValidos.length;
+
+  const solicitudesFondoPendientesAdmin = useMemo(
+    () => (esMarcosPUsuario ? solicitudesFondoCredito.filter(s => s.estado === 'pendiente') : []),
+    [esMarcosPUsuario, solicitudesFondoCredito],
+  );
+
+  const misSolicitudesFondoCredito = useMemo(() => {
+    const emailNorm = normalizarEmail(loginEmail);
+    return solicitudesFondoCredito.filter(s => {
+      const em = normalizarEmail(s.solicitante_email);
+      if (emailNorm && em && em === emailNorm) return true;
+      return esRegistroDelCobrador(
+        { cobradorId: s.cobrador_id, userId: s.cobrador_id } as PagoRegistro,
+        authUserId,
+        user,
+        loginEmail,
+      );
+    });
+  }, [solicitudesFondoCredito, loginEmail, authUserId, user]);
 
   const cumpleañosHoy = useMemo(() => {
     const ahora = new Date();
@@ -6223,6 +6340,59 @@ export default function App() {
       destinatario_usuario: email,
     })));
   }, [crearNotificacion]);
+
+  const handleRegistrarIngresoFondoCredito = useCallback(async (sol: SolicitudFondoCredito) => {
+    if (!esMarcosPUsuario) {
+      alert('Solo Marcos puede registrar este ingreso en caja.');
+      return;
+    }
+    if (sol.estado !== 'pendiente') return;
+    const creditoId = fichaIdUuid(sol.credito_id);
+    const clienteId = normalizarUuidPostgrest(sol.cliente_id);
+    if (!creditoId || !clienteId) {
+      alert('Solicitud con crédito o cliente inválido.');
+      return;
+    }
+    const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
+    const nombreCli = nombreCompletoCliente(cli) || 'cliente';
+    const desc = descripcionIngresoMarcosCredito(nombreCli);
+    setGuardandoFondoCreditoId(sol.id);
+    try {
+      const cobradorCaja = String(sol.cobrador_id || 'sin_usuario').trim();
+      const { error: cajaErr } = await supabase.from('caja').insert([{
+        tipo: 'entrada',
+        monto: sol.monto,
+        descripcion: desc,
+        cobrador_id: cobradorCaja,
+        cliente_id: clienteId,
+        ficha_id: creditoId,
+      } as Record<string, unknown>]);
+      if (cajaErr) throw cajaErr;
+      const { error: solErr } = await supabase
+        .from('solicitudes_fondo_credito')
+        .update({ estado: 'fondado', fondado_at: new Date().toISOString() })
+        .eq('id', sol.id);
+      if (solErr) throw solErr;
+      const emailCob = normalizarEmail(sol.solicitante_email);
+      if (emailCob) {
+        await crearNotificacion({
+          titulo: 'Ingreso en caja',
+          mensaje: `Marcos ingresó ${fmt(sol.monto)} para el crédito de ${nombreCli}. Ya figura en tu caja como ingreso para crédito entregado.`,
+          destinatario_usuario: emailCob,
+          accion: 'go_creditos',
+        });
+      }
+      audit('CONFIG_CAMBIO', `Ingreso caja fondo crédito ${creditoId} — ${fmt(sol.monto)} — ${nombreCli}`);
+      await fetchData();
+      alert(`Ingreso registrado: ${fmt(sol.monto)} para ${nombreCli}. El cobrador lo verá en movimientos de caja.`);
+    } catch (e: unknown) {
+      console.error('handleRegistrarIngresoFondoCredito:', e);
+      alert(e instanceof Error ? e.message : 'No se pudo registrar el ingreso (¿migración 038?)');
+    } finally {
+      setGuardandoFondoCreditoId(null);
+    }
+  }, [esMarcosPUsuario, clientesOrEmpty, crearNotificacion, audit, fetchData]);
+
   const handleCrearCredito = async (payload: {
     cliente_id: any; tipo: 'M' | 'P'; monto_solicitado: number; detalle_mercaderia: string | null; fecha_inicio: string;
     plazo_unidad: 'Días' | 'Semanas' | 'Meses'; plazo_cantidad: number; total_con_interes: number; interes_aplicado: number;
@@ -6317,11 +6487,12 @@ export default function App() {
       return;
     }
     const created = insCred.data;
+    let creditoCreado: Credito | null = null;
     if (created) {
-      const creditoCreado = created as unknown as Credito;
+      creditoCreado = created as unknown as Credito;
       const nroCarton = String(creditoCreado.nro_carton ?? '').trim();
-      if (nroCarton) setCartonesCredito(prev => ({ ...prev, [creditoCreado.id]: nroCarton }));
-      setCreditos(prev => [{ ...creditoCreado, nro_carton: nroCarton || creditoCreado.nro_carton }, ...prev]);
+      if (nroCarton) setCartonesCredito(prev => ({ ...prev, [creditoCreado!.id]: nroCarton }));
+      setCreditos(prev => [{ ...creditoCreado!, nro_carton: nroCarton || creditoCreado!.nro_carton }, ...prev]);
       if (esMensualCred) {
         await sincronizarCuotasCreditoSupabase(creditoCreado, { fechaActivacion: hoy() });
       }
@@ -6331,13 +6502,61 @@ export default function App() {
     setMCreditoTipo(null);
     const idPlanoCred = String(clienteIdPlano ?? '').trim();
     const cli = listaPostCredito.find(c => c.id === idPlanoCred || normalizarId(c.id) === normalizarId(idPlanoCred));
+    const nombreCliCred = (nombreCompletoCliente(cli) || '').trim() || String(idPlanoCred);
+    const creditoIdNuevo = creditoCreado ? fichaIdUuid(creditoCreado.id) : '';
+    const capitalOtorgar = redondearPesos(Number(payload.monto_solicitado) || 0);
+    const esCreadorSinMarcos = !esUsuarioMarcosOperador(user, loginEmail) && !esMarcosPUsuario;
+
+    if (esCreadorSinMarcos && !esMensualCred && creditoIdNuevo && capitalOtorgar > 0) {
+      const sinRecaudado = cobradorSinRecaudadoEnCaja(
+        cobradorCreditoNorm,
+        pagosOrEmpty,
+        movimientosCaja,
+        authUserId,
+        user,
+        loginEmail,
+      );
+      if (sinRecaudado) {
+        try {
+          const { error: solInsErr } = await supabase.from('solicitudes_fondo_credito').insert([{
+            credito_id: creditoIdNuevo,
+            cliente_id: clienteIdNorm,
+            cobrador_id: cobradorCreditoNorm || String(authUserId || user || 'sin_usuario'),
+            solicitante_email: emailSesion || null,
+            solicitante_nombre: etiquetaCreadorCredito,
+            monto: capitalOtorgar,
+            estado: 'pendiente',
+          }]);
+          if (solInsErr) {
+            devWarn('solicitudes_fondo_credito insert:', solInsErr);
+          } else {
+            await crearNotificacion({
+              titulo: 'Solicitud ingreso en caja',
+              mensaje: `${etiquetaCreadorCredito} solicita ${fmt(capitalOtorgar)} en caja para crédito de ${nombreCliCred} (sin recaudado previo).`,
+              destinatario_usuario: EMAIL_ADMIN_MARCOS_CAJA,
+              destinatario_rol: 'admin',
+              accion: `go_fondo_credito:${creditoIdNuevo}`,
+            });
+            await crearNotificacion({
+              titulo: 'Fondo solicitado a Marcos',
+              mensaje: `Se envió a Marcos la solicitud de ingreso de ${fmt(capitalOtorgar)} para el crédito de ${nombreCliCred}. Verás el ingreso en caja cuando lo registre.`,
+              destinatario_usuario: emailSesion || null,
+              accion: 'go_creditos',
+            });
+          }
+        } catch (solEx) {
+          devWarn('No se pudo crear solicitud de fondo:', solEx);
+        }
+      }
+    }
+
     if (!esMensualCred) {
     try {
       await crearNotificacionesPorEmail({
         titulo: 'Nueva Solicitud',
-        mensaje: `Nueva solicitud pendiente de ${nombreCompletoCliente(cli) || String(payload.cliente_id)}`,
+        mensaje: `Nueva solicitud pendiente de ${nombreCliCred}`,
         accion: 'go_creditos',
-      }, [loginEmail]);
+      }, [EMAIL_ADMIN_MARCOS_CAJA, loginEmail]);
     } catch (error) {
       devWarn('No se pudo crear la notificación de nueva solicitud:', error);
     }
@@ -6398,12 +6617,24 @@ export default function App() {
       alert('Solo el administrador puede aprobar, activar o rechazar solicitudes de crédito.');
       return;
     }
+    const idCredito = fichaIdUuid(credito.id);
+    if (estado === 'APROBADO') {
+      const solPend = solicitudesFondoCredito.find(
+        s => fichaIdUuid(s.credito_id) === idCredito && s.estado === 'pendiente',
+      );
+      if (solPend) {
+        alert(
+          `Hay una solicitud de ingreso en caja pendiente (${fmt(solPend.monto)}). Registrala en Cierre de Caja antes de activar el crédito.`,
+        );
+        setPage('cierre_caja');
+        return;
+      }
+    }
     if (review && normalizarPlazoUnidad(review.plazo_unidad) === 'Meses') {
       alert('El plan mensual no está disponible. Elegí Diario o Semanal.');
       return;
     }
     const estadoDb: Credito['estado'] = estado === 'APROBADO' ? 'ACTIVO' : 'RECHAZADO';
-    const idCredito = fichaIdUuid(credito.id);
     const cobradorIdActivo = (() => {
       const desdeAdmin = review?.cobrador_id_admin != null ? String(review.cobrador_id_admin).trim() : '';
       if (estadoDb === 'ACTIVO' && desdeAdmin !== '') return desdeAdmin;
@@ -6799,6 +7030,16 @@ export default function App() {
       setPage('creditos');
       setSearch('');
       setFilterStatus('all');
+      setMNotificaciones(false);
+      return;
+    }
+    if (
+      n.accion?.startsWith('go_fondo_credito:')
+      || titulo.includes('ingreso en caja')
+      || (mensaje.includes('solicita') && mensaje.includes('caja'))
+      || (titulo.includes('fondo') && mensaje.includes('Marcos'))
+    ) {
+      setPage('cierre_caja');
       setMNotificaciones(false);
       return;
     }
@@ -7608,6 +7849,33 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             </button>
           </div>
         )}
+        {misSolicitudesFondoCredito.some(s => s.estado === 'pendiente') && (
+          <div className="mb-4 rounded-2xl border border-amber-500/35 bg-amber-950/40 px-4 py-3 text-sm text-amber-100">
+            <p className="font-semibold text-amber-200">Solicitud de fondo en caja</p>
+            <p className="mt-1 text-xs leading-relaxed">
+              {misSolicitudesFondoCredito.filter(s => s.estado === 'pendiente').map(s => {
+                const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(s.cliente_id));
+                return `Esperando que Marcos ingrese ${fmt(s.monto)} para el crédito de ${nombreCompletoCliente(cli) || 'cliente'}.`;
+              }).join(' ')}
+            </p>
+          </div>
+        )}
+        {misSolicitudesFondoCredito.some(s => s.estado === 'fondado') && (
+          <div className="mb-4 rounded-2xl border border-green-500/35 bg-green-950/30 px-4 py-3 text-sm text-green-100">
+            <p className="font-semibold text-green-300">Ingresos de Marcos en tu caja</p>
+            <ul className="mt-2 space-y-1 text-xs">
+              {misSolicitudesFondoCredito.filter(s => s.estado === 'fondado').slice(0, 5).map(s => {
+                const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(s.cliente_id));
+                return (
+                  <li key={s.id}>
+                    +{fmt(s.monto)} — crédito de {nombreCompletoCliente(cli) || 'cliente'}
+                    {s.fondado_at ? ` (${new Date(s.fondado_at).toLocaleDateString('es-AR')})` : ''}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
         {/* DASHBOARD */}
         {page === 'dashboard' && esUsuarioMensualUsuario && (
           <div className="space-y-4">
@@ -7860,6 +8128,9 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                   <p className="text-[11px] text-emerald-100/70 mb-3">Cada gasto operativo resta del efectivo que llevás. Jornada = día calendario (00:00–00:00).</p>
                   <div className="grid grid-cols-1 gap-2 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Cobrado</span><span className="font-semibold text-white">{fmt(cajaCobradorDia.totalCobrado)}</span></div>
+                    {cajaCobradorDia.ingresosCaja > 0 && (
+                      <div className="flex justify-between"><span className="text-gray-400">Ingreso Marcos (crédito)</span><span className="font-semibold text-amber-300">+ {fmt(cajaCobradorDia.ingresosCaja)}</span></div>
+                    )}
                     <div className="flex justify-between"><span className="text-gray-400">Gastos</span><span className="font-semibold text-orange-300">− {fmt(cajaCobradorDia.totalGastos)}</span></div>
                     <div className="flex justify-between border-t border-emerald-500/25 pt-2 mt-1"><span className="text-emerald-200 font-semibold">En mano</span><span className="font-black text-emerald-300 text-lg">{fmt(cajaCobradorDia.efectivoEnMano)}</span></div>
                   </div>
@@ -8225,6 +8496,45 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                   </div>
                 ))}
               </div>
+            </div>
+            <div className="bg-gray-900/60 border border-amber-500/40 rounded-2xl p-4 space-y-3">
+              <div>
+                <h3 className="font-bold text-sm text-amber-200">💰 Ingresos en caja por créditos (sin recaudado)</h3>
+                <p className="text-xs text-gray-400 mt-1">
+                  Cuando un cobrador/vendedor crea un crédito sin haber cobrado aún, debe figurar acá. Al registrar el ingreso, el cobrador lo ve en su caja.
+                </p>
+              </div>
+              {solicitudesFondoPendientesAdmin.length === 0 && (
+                <p className="text-sm text-gray-500">No hay solicitudes de ingreso pendientes.</p>
+              )}
+              {solicitudesFondoPendientesAdmin.map(sol => {
+                const cliSol = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
+                const nombreCliSol = nombreCompletoCliente(cliSol) || 'Cliente';
+                return (
+                  <div key={sol.id} className="bg-amber-950/30 border border-amber-500/30 rounded-xl p-3 space-y-2">
+                    <div className="flex flex-wrap justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-sm text-white truncate">{nombreCliSol}</p>
+                        <p className="text-xs text-gray-400">
+                          {sol.solicitante_nombre || etiquetaCobradorMovimiento(sol.cobrador_id)} · {new Date(sol.created_at).toLocaleString('es-AR')}
+                        </p>
+                      </div>
+                      <p className="text-lg font-black text-amber-300 shrink-0">{fmt(sol.monto)}</p>
+                    </div>
+                    <p className="text-[11px] text-amber-100/80">
+                      Capital a otorgar (monto solicitado del crédito). Quedará como: «{descripcionIngresoMarcosCredito(nombreCliSol)}».
+                    </p>
+                    <button
+                      type="button"
+                      disabled={guardandoFondoCreditoId === sol.id}
+                      onClick={() => void handleRegistrarIngresoFondoCredito(sol)}
+                      className="w-full bg-amber-600 disabled:opacity-50 text-white rounded-xl py-2.5 text-sm font-bold active:scale-95 transition"
+                    >
+                      {guardandoFondoCreditoId === sol.id ? 'Registrando…' : `Registrar ingreso en caja (${fmt(sol.monto)})`}
+                    </button>
+                  </div>
+                );
+              })}
             </div>
             <div className="bg-gray-900/60 border border-sky-500/35 rounded-2xl p-4 space-y-4">
               <div>
