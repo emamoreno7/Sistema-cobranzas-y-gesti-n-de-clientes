@@ -1,24 +1,29 @@
+# Publica el build en /docs para GitHub Pages (carpeta del repo).
+# En Settings → Pages: Source = "Deploy from a branch", Branch main, Folder /docs
+
 name: Deploy GitHub Pages
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
+  group: pages-docs
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-and-publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -27,29 +32,27 @@ jobs:
 
       - run: npm ci
 
-      - name: Build for GitHub Pages
+      - name: Build para GitHub Pages
         run: npm run build:pages
 
-      - name: Verificar build (no debe quedar /src/main.tsx)
+      - name: Verificar index compilado
         run: |
           grep -q 'Sistema-cobranzas-y-gesti-n-de-clientes/assets/' dist/index.html
-          ! grep -q '/src/main.tsx' dist/index.html || (echo 'ERROR: index.html sin compilar' && exit 1)
+          if grep -qE 'main\.tsx|%BASE_URL%' dist/index.html; then
+            echo 'ERROR: dist/index.html no es build de producción'
+            cat dist/index.html
+            exit 1
+          fi
           test -f dist/.nojekyll
-          echo "OK: dist listo para Pages"
 
-      - name: SPA fallback (404 → index)
-        run: cp dist/index.html dist/404.html
+      - name: Copiar build a docs/
+        run: |
+          rm -rf docs
+          cp -a dist/. docs/
+          touch docs/.nojekyll
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Commit docs/ (evita loop con paths-ignore)
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          path: dist
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          commit_message: 'chore(pages): publicar build en docs [skip ci]'
+          file_pattern: docs/**

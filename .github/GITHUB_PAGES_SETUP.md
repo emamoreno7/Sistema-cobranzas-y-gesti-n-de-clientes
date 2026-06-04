@@ -1,14 +1,29 @@
-# GitHub Pages — configuración obligatoria
+# GitHub Pages — configuración
 
-Si la app abre en blanco y la consola pide `/src/main.tsx` (404), **Pages está publicando la carpeta del repo**, no el build de Vite.
+## Síntoma
 
-## Pasos (una sola vez)
+Pantalla en blanco, consola con:
 
-1. Repo en GitHub → **Settings** → **Pages**
-2. En **Build and deployment** → **Source**, elegir **GitHub Actions** (no “Deploy from a branch”).
-3. Hacer push a `main` o ejecutar el workflow **Deploy GitHub Pages** manualmente (**Actions** → workflow → **Run workflow**).
-4. Cuando termine en verde, recargar:  
+- `Failed to load module script` / MIME `application/octet-stream`
+- peticiones a `/src/main.tsx` o `%BASE_URL%manifest.json`
+
+Eso significa que Pages está sirviendo el **código fuente** (raíz del repo), no el build.
+
+## Configuración correcta (una vez)
+
+1. Repo → **Settings** → **Pages**
+2. **Build and deployment** → **Source**: **Deploy from a branch**
+3. **Branch**: `main` → carpeta **`/docs`** (no `/ (root)`)
+4. Guardar y esperar 1–2 minutos
+5. Recargar con Cmd+Shift+R:  
    https://emamoreno7.github.io/Sistema-cobranzas-y-gesti-n-de-clientes/
 
-El HTML correcto debe referenciar  
-`/Sistema-cobranzas-y-gesti-n-de-clientes/assets/...js`, no `/src/main.tsx`.
+El workflow **Deploy GitHub Pages** genera `docs/` en cada push a `main` (salvo commits que solo tocan `docs/`).
+
+## Comprobar que está bien
+
+En el HTML de la URL debe aparecer algo como:
+
+`/Sistema-cobranzas-y-gesti-n-de-clientes/assets/index-….js`
+
+y **no** `./src/main.tsx`.
