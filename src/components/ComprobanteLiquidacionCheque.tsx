@@ -60,7 +60,6 @@ export function ComprobanteLiquidacionCheque({
         border: '1px solid #bae6fd',
       }}
     >
-      {/* Encabezado marca */}
       <div
         style={{
           background: 'linear-gradient(135deg, #0c4a6e 0%, #075985 55%, #0369a1 100%)',
@@ -125,7 +124,6 @@ export function ComprobanteLiquidacionCheque({
       </div>
 
       <div style={{ padding: '18px 20px 20px' }}>
-        {/* Saludo / contexto */}
         <p
           style={{
             margin: '0 0 14px',
@@ -136,10 +134,9 @@ export function ComprobanteLiquidacionCheque({
           }}
         >
           Estimado/a <strong style={{ color: '#0c4a6e', fontStyle: 'normal' }}>{cheque.solicitante}</strong>,
-          {' '}detallamos la liquidación acordada para su cheque según los días al vencimiento.
+          {' '}detallamos la liquidación acordada para su cheque.
         </p>
 
-        {/* Foto cheque */}
         {cheque.foto_url && (
           <div
             style={{
@@ -178,7 +175,6 @@ export function ComprobanteLiquidacionCheque({
           </div>
         )}
 
-        {/* Datos */}
         <div
           style={{
             display: 'grid',
@@ -192,9 +188,6 @@ export function ComprobanteLiquidacionCheque({
             { label: 'Titular', value: cheque.solicitante, span: 2 },
             { label: 'Vencimiento', value: fmtFechaLarga(cheque.fecha_vencimiento), span: 2 },
             { label: 'Importe del cheque', value: fmtPesos(liq.importe), accent: true },
-            { label: 'Días al vencimiento', value: `${liq.dias} días` },
-            { label: 'Tasa diaria', value: `${liq.tasaDiariaPct} %` },
-            { label: 'Interés calculado', value: fmtPesos(liq.interes), warn: true },
           ].map((item, i) => (
             <div
               key={i}
@@ -214,7 +207,7 @@ export function ComprobanteLiquidacionCheque({
                   margin: '4px 0 0',
                   fontSize: item.span === 2 ? '13px' : '14px',
                   fontWeight: 700,
-                  color: item.accent ? '#0c4a6e' : item.warn ? '#b45309' : '#1e293b',
+                  color: item.accent ? '#0c4a6e' : '#1e293b',
                 }}
               >
                 {item.value}
@@ -223,7 +216,6 @@ export function ComprobanteLiquidacionCheque({
           ))}
         </div>
 
-        {/* Monto destacado */}
         <div
           style={{
             background: 'linear-gradient(135deg, #ecfeff 0%, #cffafe 100%)',
@@ -257,11 +249,10 @@ export function ComprobanteLiquidacionCheque({
             {fmtPesos(liq.montoRecibir)}
           </p>
           <p style={{ margin: '10px 0 0', fontSize: '11px', color: '#475569', lineHeight: 1.45 }}>
-            {fmtPesos(liq.importe)} (valor del cheque) − {fmtPesos(liq.interes)} (interés por {liq.dias} días al {liq.tasaDiariaPct} % diario)
+            Monto neto acordado para entrega, sobre valor de cheque de {fmtPesos(liq.importe)}.
           </p>
         </div>
 
-        {/* Pie */}
         <div
           style={{
             marginTop: '18px',

@@ -753,6 +753,26 @@ interface Ficha {
   Mora: number; moraPorciento: number;
 }
 interface Gasto { id: string; fecha: string; categoria: string; monto: number; nota: string; userId: string; sync: boolean; timestamp: number; }
+interface MovimientoCaja {
+  id: string;
+  createdAt: string;
+  tipo: 'entrada' | 'salida';
+  monto: number;
+  descripcion: string;
+  cobradorId: string;
+  clienteId?: string | null;
+  fichaId?: string | null;
+  pagoId?: string | null;
+}
+type FilaMovimientoControl = {
+  id: string;
+  ts: number;
+  tipo: 'entrada' | 'salida';
+  monto: number;
+  descripcion: string;
+  cobradorId: string;
+  origen: 'caja' | 'pago' | 'gasto' | 'credito';
+};
 interface Cierre {
   id: string;
   fecha: string;
@@ -2191,6 +2211,50 @@ function esCreditoActivo(credito: Credito | null | undefined) {
   return ['ACTIVO', 'VIGENTE', 'APROBADO'].includes(String(credito?.estado || '').trim().toUpperCase());
 }
 
+/** Suma de montos de cuotas con vencimiento en la fecha indicada (típicamente hoy). */
+function sumaMontosACobrarEnFechaCredito(credito: Credito, fechaRef: string): number {
+  if (!esCreditoActivo(credito)) return 0;
+  return redondearPesos(
+    generarPlanillaCredito(credito)
+      .filter(cu => String(cu.vencimiento).slice(0, 10) === fechaRef)
+      .reduce((s, cu) => s + redondearPesos(Number(cu.monto) || 0), 0),
+  );
+}
+
+function totalACobrarHoyDesdeCreditos(creditos: Credito[], fechaRef: string): number {
+  return redondearPesos(creditos.reduce((s, c) => s + sumaMontosACobrarEnFechaCredito(c, fechaRef), 0));
+}
+
+function totalACobrarHoyCobrador(creditos: Credito[], cobradorKey: string, fechaRef: string): number {
+  const k = String(cobradorKey || 'sin_usuario').trim();
+  return redondearPesos(
+    creditos
+      .filter(c => String(c.cobrador_id ?? c.creado_por ?? 'sin_usuario').trim() === k)
+      .reduce((s, c) => s + sumaMontosACobrarEnFechaCredito(c, fechaRef), 0),
+  );
+}
+
+function efectividadCobroPorMonto(cobrado: number, aCobrar: number): number {
+  const meta = redondearPesos(aCobrar);
+  const real = redondearPesos(cobrado);
+  if (meta <= 0) return real > 0 ? 100 : 0;
+  return (real / meta) * 100;
+}
+
+function mapFilaCajaSupabase(row: Record<string, unknown>): MovimientoCaja {
+  return {
+    id: String(row.id ?? genId()),
+    createdAt: String(row.created_at ?? new Date().toISOString()),
+    tipo: String(row.tipo ?? 'entrada') === 'salida' ? 'salida' : 'entrada',
+    monto: redondearPesos(Number(row.monto ?? 0)),
+    descripcion: String(row.descripcion ?? 'Movimiento de caja'),
+    cobradorId: String(row.cobrador_id ?? 'sin_usuario'),
+    clienteId: row.cliente_id != null ? String(row.cliente_id) : null,
+    fichaId: row.ficha_id != null ? String(row.ficha_id) : null,
+    pagoId: row.pago_id != null ? String(row.pago_id) : null,
+  };
+}
+
 /**
  * Ruta: crédito con estado ACTIVO y cuotas pendientes (pagos efectivos < cuotas totales).
  * Monto: suma de todas las cuotas aún no cubiertas según `generarPlanillaCredito` (sin exigir vto ≤ hoy).
@@ -2876,6 +2940,7 @@ export default function App() {
   const [creditos, setCreditos] = useState<Credito[]>([]);
   const [cartonesCredito, setCartonesCredito] = useState<Record<string, string>>(() => cargar('cp_cartones_credito', {} as Record<string, string>));
   const [notificaciones, setNotificaciones] = useState<Notificacion[]>([]);
+  const [movimientosCaja, setMovimientosCaja] = useState<MovimientoCaja[]>([]);
   const [gastos, setGastos] = useState<Gasto[]>(() => {
     const v = cargar('cp_gas', [] as Gasto[]);
     if (Array.isArray(v) && v.length) return v;
@@ -3373,6 +3438,23 @@ export default function App() {
           sync: true,
           timestamp: Number(g?.timestamp ?? new Date(g?.created_at ?? Date.now()).getTime()),
         })) as Gasto[]);
+      }
+      if (verTodosLosCreditos) {
+        const { data: cajaDb, error: cajaErr } = await supabase
+          .from('caja')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(500);
+        if (cajaErr) {
+          devWarn('Supabase fetch caja:', cajaErr);
+          setMovimientosCaja([]);
+        } else {
+          setMovimientosCaja(
+            (Array.isArray(cajaDb) ? cajaDb : []).map(r => mapFilaCajaSupabase(r as Record<string, unknown>)),
+          );
+        }
+      } else {
+        setMovimientosCaja([]);
       }
       const { data: rendicionesDb, error: rendErr } = await supabase.from('rendiciones').select('*').order('created_at', { ascending: false });
       if (rendErr) {
@@ -4089,6 +4171,11 @@ export default function App() {
     void fetchData();
   }, [page, user, fetchData]);
 
+  useEffect(() => {
+    if (!user || !esMarcosPUsuario) return;
+    if (page === 'panel_control' || page === 'dashboard') void fetchData();
+  }, [page, user, esMarcosPUsuario, fetchData]);
+
   /** En Ruta (una vez por visita): insertar no pagos $0 acumulados; índice único evita duplicados. */
   const rutaNoPagoSyncRef = useRef(false);
   useEffect(() => {
@@ -4112,6 +4199,8 @@ export default function App() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'creditos' }, () => { void fetchData(); })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'notificaciones' }, () => { void fetchData(); })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'rendiciones' }, () => { void fetchData(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gastos' }, () => { void fetchData(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'caja' }, () => { void fetchData(); })
       .subscribe();
     return () => {
       void supabase.removeChannel(channel);
@@ -4376,17 +4465,35 @@ export default function App() {
     const gastosHoy = gastosList.filter(g => g && String(g.fecha || '').slice(0, 10) === h);
     const totalGastosHoy = gastosHoy.reduce((s, g) => s + (Number(g?.monto) || 0), 0);
 
-    const cuotasProgramadasHoy = creditosOrEmpty
-      .filter(c => esCreditoActivo(c))
-      .reduce((s, c) => s + generarPlanillaCredito(c).filter(cuota => cuota.vencimiento === h).length, 0);
+    const totalACobrarHoy = isAdminOrRoot(rol)
+      ? totalACobrarHoyDesdeCreditos(creditosOrEmpty, h)
+      : totalACobrarHoyDesdeCreditos(
+        creditosOrEmpty.filter(c => {
+          const cc = String(c.cobrador_id ?? c.creado_por ?? '').trim();
+          const u = String(authUserId || user || loginEmail || '').trim();
+          return !u || cc === u;
+        }),
+        h,
+      );
 
-    const efectividad = cuotasProgramadasHoy > 0 ? (cuotasCobradasHoy / cuotasProgramadasHoy) * 100 : 0;
+    const efectividad = efectividadCobroPorMonto(totalCobradoHoy, totalACobrarHoy);
     const gananciaNeta = totalCobradoHoy - totalGastosHoy;
 
     const promesasCount = clientesOrEmpty.filter(c => c?.promesaFecha === h).length;
 
-    return { moraClientes: moraClientes.length, totalMora, totalCobradoHoy, totalGastosHoy, efectividad, gananciaNeta, promesasCount, clientesConDeuda: clientesConDeuda.length, cuotasCobradasHoy, cuotasProgramadasHoy };
-  }, [clientesOrEmpty, gastos, pagosOrEmpty, user, loginEmail, rol, creditosOrEmpty]);
+    return {
+      moraClientes: moraClientes.length,
+      totalMora,
+      totalCobradoHoy,
+      totalGastosHoy,
+      totalACobrarHoy,
+      efectividad,
+      gananciaNeta,
+      promesasCount,
+      clientesConDeuda: clientesConDeuda.length,
+      cuotasCobradasHoy,
+    };
+  }, [clientesOrEmpty, gastos, pagosOrEmpty, user, loginEmail, rol, creditosOrEmpty, authUserId]);
   const resumenCobrador = useMemo(() => {
     const h = hoy();
     const pagosHoy = pagosOrEmpty.filter((p: any) => {
@@ -5953,6 +6060,13 @@ export default function App() {
       });
       if (error) throw error;
       nuevo.sync = true;
+      const { error: cajaGastoErr } = await supabase.from('caja').insert([{
+        tipo: 'salida',
+        monto: montoG,
+        descripcion: `Gasto — ${nuevo.categoria}`,
+        cobrador_id: cobradorFuerte || user || '',
+      } as Record<string, unknown>]);
+      if (cajaGastoErr) devWarn('Caja gasto no insertada:', cajaGastoErr);
     } catch (error) {
       devWarn('No se pudo guardar gasto en Supabase. Verificar tabla/políticas de gastos; queda guardado localmente:', error);
       nuevo.sync = false;
@@ -6355,6 +6469,18 @@ export default function App() {
     if (estadoDb === 'ACTIVO') {
       const baseSync = (updated as Credito | null) ?? ({ ...credito, ...cambios } as Credito);
       await sincronizarCuotasCreditoSupabase(baseSync, { fechaActivacion: hoy() });
+      const capitalEntrega = redondearPesos(Number(baseSync.monto_solicitado ?? credito.monto_solicitado) || 0);
+      if (capitalEntrega > 0) {
+        const { error: cajaCredErr } = await supabase.from('caja').insert([{
+          tipo: 'salida',
+          monto: capitalEntrega,
+          descripcion: `Entrega crédito — ${String(baseSync.tipo || credito.tipo || 'P')}`,
+          cobrador_id: cobradorIdActivo || String(authUserId || loginEmail || user || 'marcos').trim(),
+          cliente_id: String(baseSync.cliente_id ?? credito.cliente_id ?? '').trim() || null,
+          ficha_id: idCredito,
+        } as Record<string, unknown>]);
+        if (cajaCredErr) devWarn('Caja entrega crédito no insertada:', cajaCredErr);
+      }
       const vid = String(baseSync.vendedor_id ?? credito.vendedor_id ?? '').trim();
       const comisionPrev = Number(baseSync.comision_vendedor ?? credito.comision_vendedor ?? 0);
       if (vid && comisionPrev <= 0) {
@@ -6449,23 +6575,31 @@ export default function App() {
     const totalClientes = clientesOrEmpty.filter(c => c.activo !== false).length || 1;
     const clientesRojo = creditosOrEmpty.filter(c => getDiasAtrasoCredito(c) > 5).length;
     const indiceMora = (clientesRojo / totalClientes) * 100;
-    const cuotasProgramadas = creditosOrEmpty
-      .filter(c => esCreditoActivo(c))
-      .reduce((acc, c) => acc + generarPlanillaCredito(c).filter(cuota => cuota.vencimiento === hoyIso).length, 0);
-    const cuotasCobradas = pagosHoyEfectivos.length;
-    const efectividad = cuotasProgramadas > 0 ? (cuotasCobradas / cuotasProgramadas) * 100 : 0;
+    const totalACobrarHoy = totalACobrarHoyDesdeCreditos(creditosOrEmpty, hoyIso);
+    const efectividad = efectividadCobroPorMonto(cobradoHoy, totalACobrarHoy);
 
-    const cobradores = new Map<string, { cobrador: string; totalCobrado: number; gastos: number; cuotasCobradas: number; cuotasProgramadas: number; efectividad: number }>();
+    const cobradores = new Map<string, {
+      cobrador: string;
+      totalCobrado: number;
+      gastos: number;
+      totalACobrar: number;
+      efectividad: number;
+    }>();
     const ensure = (id: string) => {
       const cobrador = id || 'sin_usuario';
-      const actual = cobradores.get(cobrador) || { cobrador, totalCobrado: 0, gastos: 0, cuotasCobradas: 0, cuotasProgramadas: 0, efectividad: 0 };
+      const actual = cobradores.get(cobrador) || {
+        cobrador,
+        totalCobrado: 0,
+        gastos: 0,
+        totalACobrar: 0,
+        efectividad: 0,
+      };
       cobradores.set(cobrador, actual);
       return actual;
     };
     pagosHoyEfectivos.forEach(p => {
       const item = ensure(String(p.cobradorId ?? p.userId ?? 'sin_usuario').trim());
       item.totalCobrado += Number(p.monto) || 0;
-      item.cuotasCobradas += 1;
     });
     (Array.isArray(gastos) ? gastos : [])
       .filter(g => g && String(g.fecha || '').slice(0, 10) === hoyIso)
@@ -6476,15 +6610,99 @@ export default function App() {
     creditosOrEmpty
       .filter(c => esCreditoActivo(c))
       .forEach(c => {
-        const item = ensure(String(c.cobrador_id ?? c.creado_por ?? 'sin_usuario').trim());
-        item.cuotasProgramadas += generarPlanillaCredito(c).filter(cuota => cuota.vencimiento === hoyIso).length;
+        ensure(String(c.cobrador_id ?? c.creado_por ?? 'sin_usuario').trim());
       });
+    cobradores.forEach(item => {
+      item.totalACobrar = totalACobrarHoyCobrador(creditosOrEmpty, item.cobrador, hoyIso);
+    });
     const porCobrador = Array.from(cobradores.values())
-      .map(item => ({ ...item, efectividad: item.cuotasProgramadas > 0 ? (item.cuotasCobradas / item.cuotasProgramadas) * 100 : 0 }))
+      .map(item => ({
+        ...item,
+        efectividad: efectividadCobroPorMonto(item.totalCobrado, item.totalACobrar),
+      }))
       .sort((a, b) => b.totalCobrado - a.totalCobrado);
 
-    return { cobradoHoy, capitalCalle, indiceMora, cuotasCobradas, cuotasProgramadas, efectividad, porCobrador };
+    return { cobradoHoy, capitalCalle, indiceMora, totalACobrarHoy, efectividad, porCobrador };
   }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito]);
+
+  const feedMovimientosControl = useMemo((): FilaMovimientoControl[] => {
+    const filas: FilaMovimientoControl[] = [];
+    const pagoIdsEnCaja = new Set<string>();
+
+    movimientosCaja.forEach(m => {
+      if (m.pagoId) pagoIdsEnCaja.add(m.pagoId);
+      filas.push({
+        id: `caja-${m.id}`,
+        ts: new Date(m.createdAt).getTime() || Date.now(),
+        tipo: m.tipo,
+        monto: m.monto,
+        descripcion: m.descripcion,
+        cobradorId: m.cobradorId,
+        origen: 'caja',
+      });
+    });
+
+    pagosOrEmpty.filter(p => esPagoEfectivo(p) && redondearPesos(Number(p.monto) || 0) > 0).forEach(p => {
+      const pid = String(p.id ?? '');
+      if (pid && pagoIdsEnCaja.has(pid)) return;
+      const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
+      filas.push({
+        id: `pago-${pid || genId()}`,
+        ts: new Date(`${fd}T12:00:00`).getTime(),
+        tipo: 'entrada',
+        monto: redondearPesos(Number(p.monto) || 0),
+        descripcion: 'Cobranza en ruta',
+        cobradorId: String(p.cobradorId ?? p.userId ?? 'sin_usuario'),
+        origen: 'pago',
+      });
+    });
+
+    const claveGastoEnCaja = new Set(
+      movimientosCaja
+        .filter(m => m.tipo === 'salida' && /gasto/i.test(m.descripcion))
+        .map(m => `${m.cobradorId}|${m.monto}|${m.createdAt.slice(0, 10)}`),
+    );
+    (Array.isArray(gastos) ? gastos : []).forEach(g => {
+      if (!g || redondearPesos(Number(g.monto) || 0) <= 0) return;
+      const fd = String(g.fecha || '').slice(0, 10);
+      const montoG = redondearPesos(Number(g.monto) || 0);
+      const cob = String(g.userId || 'sin_usuario');
+      if (claveGastoEnCaja.has(`${cob}|${montoG}|${fd}`)) return;
+      filas.push({
+        id: `gasto-${g.id}`,
+        ts: Number(g.timestamp) || new Date(`${fd}T12:00:00`).getTime(),
+        tipo: 'salida',
+        monto: montoG,
+        descripcion: `Gasto — ${g.categoria}${g.nota ? `: ${g.nota}` : ''}`,
+        cobradorId: cob,
+        origen: 'gasto',
+      });
+    });
+
+    creditosOrEmpty
+      .filter(c => esCreditoActivo(c))
+      .forEach(c => {
+        const capital = redondearPesos(Number(c.monto_solicitado) || 0);
+        if (capital <= 0) return;
+        const fAct = String(c.fecha_inicio ?? c.created_at ?? '').slice(0, 10);
+        if (!fAct) return;
+        const yaEnCaja = movimientosCaja.some(
+          m => m.tipo === 'salida' && m.fichaId === fichaIdUuid(c.id) && m.monto === capital,
+        );
+        if (yaEnCaja) return;
+        filas.push({
+          id: `credito-${c.id}`,
+          ts: new Date(`${fAct}T08:00:00`).getTime(),
+          tipo: 'salida',
+          monto: capital,
+          descripcion: `Entrega crédito ${String(c.tipo || 'P')}`,
+          cobradorId: String(c.cobrador_id ?? c.creado_por ?? 'sin_usuario'),
+          origen: 'credito',
+        });
+      });
+
+    return filas.sort((a, b) => b.ts - a.ts).slice(0, 200);
+  }, [movimientosCaja, pagosOrEmpty, gastos, creditosOrEmpty]);
   const getNroCartonCredito = useCallback((credito: Credito, indiceFallback = 0) => {
     const directo = String(credito?.nro_carton || '').trim();
     if (directo) return directo;
@@ -7459,7 +7677,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                   {[
                     { label: 'En Mora', valor: kpis.moraClientes, icon: '🚩', color: 'from-red-500/20 to-red-600/10 border-red-500/30', textColor: 'text-red-400', onClick: () => { setFilterStatus('mora'); go('clientes'); } },
                     { label: 'Cobrado Hoy', valor: fmt(kpis.totalCobradoHoy), icon: '💵', color: 'from-green-500/20 to-green-600/10 border-green-500/30', textColor: 'text-green-400', onClick: () => {} },
-                    { label: 'Gastos Hoy', valor: fmt(kpis.totalGastosHoy), icon: '📤', color: 'from-orange-500/20 to-orange-600/10 border-orange-500/30', textColor: 'text-orange-400', onClick: () => go('gastos') },
+                    { label: 'Total a cobrar hoy', valor: fmt(kpis.totalACobrarHoy), icon: '📋', color: 'from-orange-500/20 to-orange-600/10 border-orange-500/30', textColor: 'text-orange-400', onClick: () => go('panel_control') },
                     { label: 'Efectividad', valor: `${kpis.efectividad.toFixed(0)}%`, icon: '📊', color: 'from-blue-500/20 to-blue-600/10 border-blue-500/30', textColor: 'text-blue-400', onClick: () => {} },
                   ].map((k, i) => (
                     <button key={i} onClick={k.onClick} className={`bg-gradient-to-br ${k.color} border rounded-2xl p-4 text-left active:scale-95 transition-all`}>
@@ -8306,17 +8524,45 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 <p className="text-2xl font-bold text-green-400">{fmt(panelControlStats.cobradoHoy)}</p>
               </div>
               <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-                <p className="text-xs text-gray-400">Cuotas Cobradas / Programadas</p>
-                <p className="text-2xl font-bold text-indigo-300">{panelControlStats.cuotasCobradas}/{panelControlStats.cuotasProgramadas}</p>
+                <p className="text-xs text-gray-400">Total a cobrar hoy</p>
+                <p className="text-2xl font-bold text-indigo-300">{fmt(panelControlStats.totalACobrarHoy)}</p>
               </div>
               <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-                <p className="text-xs text-gray-400">Efectividad</p>
+                <p className="text-xs text-gray-400">Efectividad diaria</p>
                 <p className="text-2xl font-bold text-blue-400">{panelControlStats.efectividad.toFixed(1)}%</p>
+                <p className="text-[10px] text-gray-500 mt-1">Cobrado ÷ total a cobrar</p>
               </div>
+            </div>
+            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-2 max-h-[420px] overflow-y-auto">
+              <h3 className="font-semibold sticky top-0 bg-gray-900/95 py-1 z-10">Movimientos de caja (todos los usuarios)</h3>
+              <p className="text-[11px] text-gray-500">Cobros, gastos y entregas de crédito en tiempo real.</p>
+              {feedMovimientosControl.length === 0 && (
+                <p className="text-sm text-gray-500 py-4">Sin movimientos registrados.</p>
+              )}
+              {feedMovimientosControl.map(m => (
+                <div
+                  key={m.id}
+                  className={`flex items-start justify-between gap-2 rounded-xl px-3 py-2 border ${
+                    m.tipo === 'entrada'
+                      ? 'bg-green-950/30 border-green-500/25'
+                      : 'bg-orange-950/25 border-orange-500/25'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold text-white truncate">{m.descripcion}</p>
+                    <p className="text-[10px] text-gray-500 mt-0.5">
+                      {etiquetaCobradorMovimiento(m.cobradorId)} · {new Date(m.ts).toLocaleString('es-AR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                    </p>
+                  </div>
+                  <p className={`shrink-0 text-sm font-bold ${m.tipo === 'entrada' ? 'text-green-400' : 'text-orange-400'}`}>
+                    {m.tipo === 'entrada' ? '+' : '−'}{fmt(m.monto)}
+                  </p>
+                </div>
+              ))}
             </div>
             <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-3">
               <h3 className="font-semibold">Control por cobrador</h3>
-              {panelControlStats.porCobrador.length === 0 && <p className="text-sm text-gray-500">Sin pagos, gastos ni cuotas programadas para hoy.</p>}
+              {panelControlStats.porCobrador.length === 0 && <p className="text-sm text-gray-500">Sin actividad ni cuotas a cobrar hoy.</p>}
               {panelControlStats.porCobrador.map(item => (
                 <div key={item.cobrador} className="bg-gray-800/60 rounded-xl p-3 grid grid-cols-2 sm:grid-cols-5 gap-2 items-center">
                   <div className="col-span-2 sm:col-span-1">
@@ -8332,8 +8578,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     <p className="font-semibold text-orange-400">{fmt(item.gastos)}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Cuotas</p>
-                    <p className="font-semibold text-indigo-300">{item.cuotasCobradas}/{item.cuotasProgramadas}</p>
+                    <p className="text-xs text-gray-400">Total a cobrar</p>
+                    <p className="font-semibold text-indigo-300">{fmt(item.totalACobrar)}</p>
                   </div>
                   <div>
                     <p className="text-xs text-gray-400">Efectividad</p>

@@ -4,8 +4,12 @@ import { supabase } from '../supabaseClient';
 import { ComprobanteLiquidacionCheque } from './ComprobanteLiquidacionCheque';
 import {
   calcularLiquidacionCheque,
+  DIAS_RETENCION_CHEQUE_ACEPTADO,
+  DIAS_RETENCION_CHEQUE_RECHAZADO,
   diasHastaVencimientoCheque,
   fmtPesos,
+  INTERES_MINIMO_CHEQUE_PCT,
+  TASA_INTERES_CHEQUE_DIARIA_PCT,
   type LiquidacionCheque,
 } from '../utils/chequesCalculo';
 
@@ -194,7 +198,7 @@ export function VistaCheques({
 
   const revisarCheque = async (id: string, accion: 'aceptado' | 'rechazado') => {
     if (!esMarcosOperador) return;
-    const diasRet = accion === 'aceptado' ? 90 : 7;
+    const diasRet = accion === 'aceptado' ? DIAS_RETENCION_CHEQUE_ACEPTADO : DIAS_RETENCION_CHEQUE_RECHAZADO;
     const eliminarEn = new Date(Date.now() + diasRet * 86400000).toISOString();
     const { error } = await supabase.from('cheques').update({
       estado: accion,
@@ -268,7 +272,7 @@ export function VistaCheques({
         <div>
           <h2 className="text-lg font-bold text-white">Cheques</h2>
           <p className="text-xs text-gray-400 mt-0.5">
-            Interés 0,5 % por día hasta el vencimiento.
+            Comisión 0,4 %/día (mín. {INTERES_MINIMO_CHEQUE_PCT} %), hasta vencimiento +1 día admin. Aceptados se archivan {DIAS_RETENCION_CHEQUE_ACEPTADO} días.
             {esMarcosOperador ? ' Podés aprobar, rechazar y eliminar registros.' : esAdminCheques ? ' Podés eliminar registros.' : ' Marcos aprueba las solicitudes.'}
           </p>
         </div>
@@ -326,19 +330,28 @@ export function VistaCheques({
                     <p className="text-cyan-300 font-bold">{fmtPesos(Number(c.importe))}</p>
                   </div>
                   <div>
-                    <p className="text-gray-500">Días al vencimiento</p>
+                    <p className="text-gray-500">Venc. (días)</p>
                     <p className="text-gray-200 font-medium">{dias}</p>
                   </div>
                   <div>
-                    <p className="text-gray-500">Interés ({liq.tasaDiariaPct}% × día)</p>
-                    <p className="text-amber-300 font-medium">{fmtPesos(liq.interes)}</p>
+                    <p className="text-gray-500">Días comisión (venc.+1)</p>
+                    <p className="text-gray-200 font-medium">{liq.dias}</p>
+                  </div>
+                  <div>
+                    <p className="text-gray-500">
+                      Comisión ({TASA_INTERES_CHEQUE_DIARIA_PCT}%/día, mín. {INTERES_MINIMO_CHEQUE_PCT}%)
+                    </p>
+                    <p className="text-amber-300 font-medium">
+                      {fmtPesos(liq.interes)}
+                      {liq.interesMinimoAplicado ? ' · mín.' : ''}
+                    </p>
                   </div>
                 </div>
                 <div className="rounded-xl bg-indigo-950/40 border border-indigo-500/30 px-3 py-2">
                   <p className="text-[10px] text-indigo-300/80 uppercase tracking-wide">Monto a entregar al cliente</p>
                   <p className="text-lg font-bold text-indigo-100">{fmtPesos(liq.montoRecibir)}</p>
                   <p className="text-[10px] text-gray-500 mt-0.5">
-                    {fmtPesos(Number(c.importe))} − {fmtPesos(liq.interes)} (interés por {liq.dias} días)
+                    {fmtPesos(Number(c.importe))} − {fmtPesos(liq.interes)} · redondeo a $1.000
                   </p>
                 </div>
                 {c.eliminar_en && (
@@ -460,7 +473,10 @@ export function VistaCheques({
                   const liq = calcularLiquidacionCheque(Number(form.importe), form.fecha_vencimiento);
                   return (
                     <>
-                      <p>Vista previa: {liq.dias} días · Interés {fmtPesos(liq.interes)}</p>
+                      <p>
+                        Vista previa: {liq.dias} días (venc.+1) · Comisión {fmtPesos(liq.interes)}
+                        {liq.interesMinimoAplicado ? ` (mín. ${INTERES_MINIMO_CHEQUE_PCT}%)` : ''}
+                      </p>
                       <p className="font-bold mt-1">A recibir: {fmtPesos(liq.montoRecibir)}</p>
                     </>
                   );

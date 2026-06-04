@@ -47,7 +47,7 @@ export const MODULOS_SISTEMA_DESTACADOS: ModuloSistemaDestacado[] = [
   {
     icon: '🧭',
     titulo: 'Panel de control',
-    descripcion: 'Efectividad por cobrador: cobrado, gastos, cuotas y rendimiento del día.',
+    descripcion: 'Efectividad por cobrador: cobrado, gastos, total a cobrar hoy y movimientos de caja en vivo.',
     pestana: 'Control',
   },
   {
