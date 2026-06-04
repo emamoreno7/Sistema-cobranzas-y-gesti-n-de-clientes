@@ -961,6 +961,20 @@ interface Notificacion {
 /** Admin que autoriza ingresos en caja para créditos sin recaudado previo. */
 const EMAIL_ADMIN_MARCOS_CAJA = 'emamoreno7@hotmail.com';
 
+/** Identificador lógico de la caja propia de Marcos (no es un usuario de campo). */
+interface MovimientoCajaPropia {
+  id: string;
+  createdAt: string;
+  fecha: string;
+  tipo: 'entrada' | 'salida';
+  monto: number;
+  descripcion: string;
+  nota: string | null;
+  registradoPor: string | null;
+  solicitudFondoId: string | null;
+  cajaReferenciaId: string | null;
+}
+
 interface SolicitudFondoCredito {
   id: string;
   created_at: string;
@@ -2316,6 +2330,27 @@ function descripcionIngresoMarcosCredito(nombreCliente: string): string {
   return `Ingreso de Marcos para crédito entregado — ${nom}`;
 }
 
+function mapMovimientoCajaPropia(row: Record<string, unknown>): MovimientoCajaPropia {
+  return {
+    id: String(row.id ?? genId()),
+    createdAt: String(row.created_at ?? new Date().toISOString()),
+    fecha: String(row.fecha ?? hoy()).slice(0, 10),
+    tipo: String(row.tipo ?? 'entrada') === 'salida' ? 'salida' : 'entrada',
+    monto: redondearPesos(Number(row.monto ?? 0)),
+    descripcion: String(row.descripcion ?? 'Movimiento caja propia'),
+    nota: row.nota != null ? String(row.nota) : null,
+    registradoPor: row.registrado_por != null ? String(row.registrado_por) : null,
+    solicitudFondoId: row.solicitud_fondo_id != null ? String(row.solicitud_fondo_id) : null,
+    cajaReferenciaId: row.caja_referencia_id != null ? String(row.caja_referencia_id) : null,
+  };
+}
+
+function saldoCajaPropiaDesdeMovimientos(movs: MovimientoCajaPropia[]): number {
+  return redondearPesos(
+    movs.reduce((s, m) => s + (m.tipo === 'entrada' ? m.monto : -m.monto), 0),
+  );
+}
+
 /**
  * Ruta: crédito con estado ACTIVO y cuotas pendientes (pagos efectivos < cuotas totales).
  * Monto: suma de todas las cuotas aún no cubiertas según `generarPlanillaCredito` (sin exigir vto ≤ hoy).
@@ -3004,6 +3039,14 @@ export default function App() {
   const [movimientosCaja, setMovimientosCaja] = useState<MovimientoCaja[]>([]);
   const [solicitudesFondoCredito, setSolicitudesFondoCredito] = useState<SolicitudFondoCredito[]>([]);
   const [guardandoFondoCreditoId, setGuardandoFondoCreditoId] = useState<string | null>(null);
+  const [movimientosCajaPropia, setMovimientosCajaPropia] = useState<MovimientoCajaPropia[]>([]);
+  const [formMovCajaPropia, setFormMovCajaPropia] = useState<{
+    tipo: 'entrada' | 'salida';
+    monto: string;
+    nota: string;
+    fecha: string;
+  }>({ tipo: 'entrada', monto: '', nota: '', fecha: hoy() });
+  const [guardandoMovCajaPropia, setGuardandoMovCajaPropia] = useState(false);
   const [gastos, setGastos] = useState<Gasto[]>(() => {
     const v = cargar('cp_gas', [] as Gasto[]);
     if (Array.isArray(v) && v.length) return v;
@@ -3541,6 +3584,25 @@ export default function App() {
           (Array.isArray(solFondoDb) ? solFondoDb : []).map(r => mapSolicitudFondoCredito(r as Record<string, unknown>)),
         );
       }
+
+      if (verTodosLosCreditos) {
+        const { data: propDb, error: propErr } = await supabase
+          .from('caja_propia_movimientos')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(400);
+        if (propErr) {
+          devWarn('Supabase fetch caja_propia_movimientos (¿migración 039?):', propErr);
+          setMovimientosCajaPropia([]);
+        } else {
+          setMovimientosCajaPropia(
+            (Array.isArray(propDb) ? propDb : []).map(r => mapMovimientoCajaPropia(r as Record<string, unknown>)),
+          );
+        }
+      } else {
+        setMovimientosCajaPropia([]);
+      }
+
       const { data: rendicionesDb, error: rendErr } = await supabase.from('rendiciones').select('*').order('created_at', { ascending: false });
       if (rendErr) {
         devWarn('Supabase fetch rendiciones:', rendErr.message || rendErr);
@@ -4287,6 +4349,7 @@ export default function App() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'gastos' }, () => { void fetchData(); })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'caja' }, () => { void fetchData(); })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_fondo_credito' }, () => { void fetchData(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'caja_propia_movimientos' }, () => { void fetchData(); })
       .subscribe();
     return () => {
       void supabase.removeChannel(channel);
@@ -4738,6 +4801,64 @@ export default function App() {
       clientesCobrados,
     };
   }, [pagosOrEmpty, clientesOrEmpty]);
+
+  const resumenCajaMarcosDia = useMemo(() => {
+    const h = hoy();
+    const pagosH = pagosOrEmpty.filter(p => {
+      const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
+      return fd === h && esPagoEfectivo(p) && redondearPesos(Number(p.monto) || 0) > 0;
+    });
+    const gastosH = (Array.isArray(gastos) ? gastos : []).filter(
+      g => g && String(g.fecha || '').slice(0, 10) === h,
+    );
+    const totalCobradoHoy = redondearPesos(pagosH.reduce((s, p) => s + (Number(p.monto) || 0), 0));
+    const totalGastosHoy = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
+
+    const porUsuario = new Map<string, { cobrador: string; cobrado: number; gastos: number; cantCobros: number; cantGastos: number }>();
+    const touch = (rawId: string) => {
+      const cobrador = String(rawId || 'sin_usuario').trim() || 'sin_usuario';
+      const actual = porUsuario.get(cobrador) || { cobrador, cobrado: 0, gastos: 0, cantCobros: 0, cantGastos: 0 };
+      porUsuario.set(cobrador, actual);
+      return actual;
+    };
+    pagosH.forEach(p => {
+      const item = touch(String(p.cobradorId ?? p.userId ?? 'sin_usuario'));
+      item.cobrado += redondearPesos(Number(p.monto) || 0);
+      item.cantCobros += 1;
+    });
+    gastosH.forEach(g => {
+      const item = touch(String(g.userId || 'sin_usuario'));
+      item.gastos += redondearPesos(Number(g.monto) || 0);
+      item.cantGastos += 1;
+    });
+
+    return {
+      totalCobradoHoy,
+      totalGastosHoy,
+      netoCampoHoy: redondearPesos(totalCobradoHoy - totalGastosHoy),
+      porUsuario: Array.from(porUsuario.values()).sort((a, b) => b.cobrado - a.cobrado),
+    };
+  }, [pagosOrEmpty, gastos]);
+
+  const resumenCajaPropia = useMemo(() => {
+    const h = hoy();
+    const saldo = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
+    const ingresosTotal = redondearPesos(
+      movimientosCajaPropia.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0),
+    );
+    const egresosTotal = redondearPesos(
+      movimientosCajaPropia.filter(m => m.tipo === 'salida').reduce((s, m) => s + m.monto, 0),
+    );
+    const movsHoy = movimientosCajaPropia.filter(m => m.fecha === h);
+    return {
+      saldo,
+      ingresosTotal,
+      egresosTotal,
+      movimientos: movimientosCajaPropia.slice(0, 80),
+      ingresosHoy: redondearPesos(movsHoy.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0)),
+      egresosHoy: redondearPesos(movsHoy.filter(m => m.tipo === 'salida').reduce((s, m) => s + m.monto, 0)),
+    };
+  }, [movimientosCajaPropia]);
 
   // ==========================================
   // GPS
@@ -6341,6 +6462,58 @@ export default function App() {
     })));
   }, [crearNotificacion]);
 
+  const handleRegistrarMovimientoCajaPropia = useCallback(async () => {
+    if (!esMarcosPUsuario) return;
+    const tipo = formMovCajaPropia.tipo;
+    const monto = redondearPesos(Number(formMovCajaPropia.monto));
+    if (!monto || monto <= 0) {
+      alert('Ingresá un monto válido.');
+      return;
+    }
+    const saldoActual = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
+    if (tipo === 'salida' && saldoActual < monto) {
+      alert(`Saldo insuficiente en caja propia.\nDisponible: ${fmt(saldoActual)}\nRetiro solicitado: ${fmt(monto)}`);
+      return;
+    }
+    const actor = nombreParaMostrarSesion({
+      loginEmail,
+      usernameState: user,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    });
+    const fechaMov = formMovCajaPropia.fecha || hoy();
+    const nota = formMovCajaPropia.nota.trim() || null;
+    const descripcion =
+      tipo === 'entrada'
+        ? 'Ingreso propio de capital'
+        : 'Egreso propio de caja (retiro)';
+    setGuardandoMovCajaPropia(true);
+    try {
+      const { error } = await supabase.from('caja_propia_movimientos').insert([{
+        tipo,
+        monto,
+        descripcion,
+        nota,
+        registrado_por: actor || 'Marcos',
+        fecha: fechaMov,
+      }]);
+      if (error) throw error;
+      setFormMovCajaPropia({ tipo, monto: '', nota: '', fecha: hoy() });
+      audit('CONFIG_CAMBIO', `${tipo === 'entrada' ? 'Ingreso' : 'Egreso'} propio caja ${fmt(monto)}`);
+      const nuevoSaldo = redondearPesos(saldoActual + (tipo === 'entrada' ? monto : -monto));
+      await fetchData();
+      alert(
+        tipo === 'entrada'
+          ? `Ingreso propio registrado: ${fmt(monto)}. Saldo caja propia: ${fmt(nuevoSaldo)}.`
+          : `Egreso propio registrado: ${fmt(monto)}. Saldo caja propia: ${fmt(nuevoSaldo)}.`,
+      );
+    } catch (e: unknown) {
+      console.error('handleRegistrarMovimientoCajaPropia:', e);
+      alert(e instanceof Error ? e.message : 'No se pudo registrar (¿migración 039?)');
+    } finally {
+      setGuardandoMovCajaPropia(false);
+    }
+  }, [esMarcosPUsuario, formMovCajaPropia, movimientosCajaPropia, loginEmail, user, authUserMeta, audit, fetchData]);
+
   const handleRegistrarIngresoFondoCredito = useCallback(async (sol: SolicitudFondoCredito) => {
     if (!esMarcosPUsuario) {
       alert('Solo Marcos puede registrar este ingreso en caja.');
@@ -6353,21 +6526,49 @@ export default function App() {
       alert('Solicitud con crédito o cliente inválido.');
       return;
     }
+    const saldoPropio = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
+    if (saldoPropio < sol.monto) {
+      alert(
+        `Saldo de caja propia insuficiente.\nDisponible: ${fmt(saldoPropio)}\nRequerido: ${fmt(sol.monto)}\n\nRegistrá un ingreso propio en caja propia antes de habilitar al cobrador.`,
+      );
+      return;
+    }
     const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
     const nombreCli = nombreCompletoCliente(cli) || 'cliente';
     const desc = descripcionIngresoMarcosCredito(nombreCli);
+    const actor = nombreParaMostrarSesion({
+      loginEmail,
+      usernameState: user,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    });
     setGuardandoFondoCreditoId(sol.id);
     try {
       const cobradorCaja = String(sol.cobrador_id || 'sin_usuario').trim();
-      const { error: cajaErr } = await supabase.from('caja').insert([{
-        tipo: 'entrada',
-        monto: sol.monto,
-        descripcion: desc,
-        cobrador_id: cobradorCaja,
-        cliente_id: clienteId,
-        ficha_id: creditoId,
-      } as Record<string, unknown>]);
+      const { data: cajaRow, error: cajaErr } = await supabase
+        .from('caja')
+        .insert([{
+          tipo: 'entrada',
+          monto: sol.monto,
+          descripcion: desc,
+          cobrador_id: cobradorCaja,
+          cliente_id: clienteId,
+          ficha_id: creditoId,
+        } as Record<string, unknown>])
+        .select('id')
+        .single();
       if (cajaErr) throw cajaErr;
+      const cajaId = cajaRow != null ? String((cajaRow as Record<string, unknown>).id ?? '') : '';
+      const { error: propErr } = await supabase.from('caja_propia_movimientos').insert([{
+        tipo: 'salida',
+        monto: sol.monto,
+        descripcion: `Egreso caja propia — habilitación crédito ${nombreCli}`,
+        nota: `Solicitud fondo · cobrador ${etiquetaCobradorMovimiento(cobradorCaja)}`,
+        registrado_por: actor || 'Marcos',
+        solicitud_fondo_id: sol.id,
+        caja_referencia_id: cajaId || null,
+        fecha: hoy(),
+      }]);
+      if (propErr) throw propErr;
       const { error: solErr } = await supabase
         .from('solicitudes_fondo_credito')
         .update({ estado: 'fondado', fondado_at: new Date().toISOString() })
@@ -6377,21 +6578,21 @@ export default function App() {
       if (emailCob) {
         await crearNotificacion({
           titulo: 'Ingreso en caja',
-          mensaje: `Marcos ingresó ${fmt(sol.monto)} para el crédito de ${nombreCli}. Ya figura en tu caja como ingreso para crédito entregado.`,
+          mensaje: `Marcos ingresó ${fmt(sol.monto)} desde caja propia para el crédito de ${nombreCli}. Ya figura en tu caja.`,
           destinatario_usuario: emailCob,
           accion: 'go_creditos',
         });
       }
-      audit('CONFIG_CAMBIO', `Ingreso caja fondo crédito ${creditoId} — ${fmt(sol.monto)} — ${nombreCli}`);
+      audit('CONFIG_CAMBIO', `Egreso caja propia + ingreso cobrador ${fmt(sol.monto)} — ${nombreCli}`);
       await fetchData();
-      alert(`Ingreso registrado: ${fmt(sol.monto)} para ${nombreCli}. El cobrador lo verá en movimientos de caja.`);
+      alert(`Habilitado: ${fmt(sol.monto)} al cobrador para ${nombreCli}. Egreso registrado en caja propia.`);
     } catch (e: unknown) {
       console.error('handleRegistrarIngresoFondoCredito:', e);
-      alert(e instanceof Error ? e.message : 'No se pudo registrar el ingreso (¿migración 038?)');
+      alert(e instanceof Error ? e.message : 'No se pudo registrar el ingreso (¿migraciones 038/039?)');
     } finally {
       setGuardandoFondoCreditoId(null);
     }
-  }, [esMarcosPUsuario, clientesOrEmpty, crearNotificacion, audit, fetchData]);
+  }, [esMarcosPUsuario, clientesOrEmpty, movimientosCajaPropia, crearNotificacion, audit, fetchData, loginEmail, user, authUserMeta]);
 
   const handleCrearCredito = async (payload: {
     cliente_id: any; tipo: 'M' | 'P'; monto_solicitado: number; detalle_mercaderia: string | null; fecha_inicio: string;
@@ -8452,8 +8653,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <h2 className="text-lg font-bold">🧾 Cierre de Caja</h2>
-                <p className="text-xs text-gray-400">Rendición diaria por cobrador y clientes cobrados.</p>
+                <h2 className="text-lg font-bold">🧾 Caja y movimientos</h2>
+                <p className="text-xs text-gray-400">Recaudación del día, gastos de campo y caja propia para habilitar créditos.</p>
               </div>
               <button
                 type="button"
@@ -8463,46 +8664,176 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 Cerrar Día
               </button>
             </div>
-            <div className="bg-gray-900/60 border border-emerald-500/30 rounded-2xl p-4">
-              <p className="text-xs text-gray-400">Total cobrado hoy</p>
-              <p className="text-3xl font-black text-emerald-400 mt-1">{fmt(cierreCajaHoy.total)}</p>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="bg-gray-900/60 border border-emerald-500/35 rounded-2xl p-4">
+                <p className="text-xs text-gray-400">Total cobrado hoy</p>
+                <p className="text-2xl font-black text-emerald-400 mt-1">{fmt(resumenCajaMarcosDia.totalCobradoHoy)}</p>
+              </div>
+              <div className="bg-gray-900/60 border border-orange-500/35 rounded-2xl p-4">
+                <p className="text-xs text-gray-400">Total gastos hoy</p>
+                <p className="text-2xl font-black text-orange-400 mt-1">{fmt(resumenCajaMarcosDia.totalGastosHoy)}</p>
+              </div>
             </div>
-            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-              <h3 className="font-bold text-sm text-gray-300 mb-3">Por cobrador</h3>
-              {cierreCajaHoy.porCobrador.length === 0 && <p className="text-sm text-gray-500">Sin cobros registrados hoy.</p>}
-              <div className="space-y-2">
-                {cierreCajaHoy.porCobrador.map(c => (
-                  <div key={c.cobrador} className="flex items-center justify-between gap-3 bg-gray-800/60 rounded-xl p-3">
-                    <div>
-                      <p className="font-semibold text-sm">{etiquetaCobradorMovimiento(c.cobrador)}</p>
-                      <p className="text-xs text-gray-400">{c.cantidad} cobro/s</p>
+            <p className="text-[11px] text-gray-500 text-center">
+              Neto campo hoy (cobrado − gastos): <span className="text-gray-300 font-semibold">{fmt(resumenCajaMarcosDia.netoCampoHoy)}</span>
+            </p>
+
+            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-3">
+              <h3 className="font-bold text-sm text-gray-300">Movimientos por usuario (hoy)</h3>
+              {resumenCajaMarcosDia.porUsuario.length === 0 && (
+                <p className="text-sm text-gray-500">Sin cobros ni gastos registrados hoy.</p>
+              )}
+              {resumenCajaMarcosDia.porUsuario.map(u => (
+                <div key={u.cobrador} className="bg-gray-800/60 rounded-xl p-3 space-y-2">
+                  <p className="font-semibold text-sm text-white">{etiquetaCobradorMovimiento(u.cobrador)}</p>
+                  <div className="grid grid-cols-2 gap-2 text-sm">
+                    <div className="rounded-lg bg-green-950/40 border border-green-500/25 px-2 py-1.5">
+                      <p className="text-[10px] text-green-300/80 uppercase">Cobrado</p>
+                      <p className="font-bold text-green-400">{fmt(u.cobrado)}</p>
+                      <p className="text-[10px] text-gray-500">{u.cantCobros} cobro/s</p>
                     </div>
-                    <p className="font-bold text-emerald-400">{fmt(c.total)}</p>
+                    <div className="rounded-lg bg-orange-950/40 border border-orange-500/25 px-2 py-1.5">
+                      <p className="text-[10px] text-orange-300/80 uppercase">Gastos</p>
+                      <p className="font-bold text-orange-400">{fmt(u.gastos)}</p>
+                      <p className="text-[10px] text-gray-500">{u.cantGastos} gasto/s</p>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="bg-gray-900/60 border border-violet-500/40 rounded-2xl p-4 space-y-4">
+              <div>
+                <h3 className="font-bold text-sm text-violet-200">🏦 Caja propia</h3>
+                <p className="text-xs text-gray-400 mt-1">
+                  Dinero propio de Marcos: ingresá capital, retirá cuando el recaudado de cobradores/vendedores se acumule, o usalo para habilitar créditos. Sin proveedor, usuarios ni comisiones.
+                </p>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="rounded-xl bg-violet-950/50 border border-violet-500/30 p-2">
+                  <p className="text-[10px] text-gray-400">Saldo disponible</p>
+                  <p className="text-lg font-black text-violet-200">{fmt(resumenCajaPropia.saldo)}</p>
+                </div>
+                <div className="rounded-xl bg-green-950/30 border border-green-500/20 p-2">
+                  <p className="text-[10px] text-gray-400">Ingresos hoy</p>
+                  <p className="text-sm font-bold text-green-400">+{fmt(resumenCajaPropia.ingresosHoy)}</p>
+                </div>
+                <div className="rounded-xl bg-orange-950/30 border border-orange-500/20 p-2">
+                  <p className="text-[10px] text-gray-400">Egresos hoy</p>
+                  <p className="text-sm font-bold text-orange-400">−{fmt(resumenCajaPropia.egresosHoy)}</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setFormMovCajaPropia(f => ({ ...f, tipo: 'entrada' }))}
+                  className={`rounded-xl py-2.5 text-sm font-bold border transition ${
+                    formMovCajaPropia.tipo === 'entrada'
+                      ? 'bg-green-600/90 border-green-400 text-white'
+                      : 'bg-gray-800 border-gray-700 text-gray-400'
+                  }`}
+                >
+                  Ingreso propio
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFormMovCajaPropia(f => ({ ...f, tipo: 'salida' }))}
+                  className={`rounded-xl py-2.5 text-sm font-bold border transition ${
+                    formMovCajaPropia.tipo === 'salida'
+                      ? 'bg-orange-600/90 border-orange-400 text-white'
+                      : 'bg-gray-800 border-gray-700 text-gray-400'
+                  }`}
+                >
+                  Egreso propio
+                </button>
+              </div>
+              {formMovCajaPropia.tipo === 'salida' && (
+                <p className="text-[11px] text-orange-200/80">
+                  Retiro de efectivo acumulado (recaudación de campo, devoluciones, etc.). Saldo actual: {fmt(resumenCajaPropia.saldo)}.
+                </p>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">
+                    Monto {formMovCajaPropia.tipo === 'entrada' ? 'ingreso' : 'egreso'} ($)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={formMovCajaPropia.monto}
+                    onChange={e => setFormMovCajaPropia(f => ({ ...f, monto: e.target.value }))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                    placeholder="0"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">Fecha</label>
+                  <input
+                    type="date"
+                    value={formMovCajaPropia.fecha}
+                    onChange={e => setFormMovCajaPropia(f => ({ ...f, fecha: e.target.value }))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                  />
+                </div>
+              </div>
+              <input
+                value={formMovCajaPropia.nota}
+                onChange={e => setFormMovCajaPropia(f => ({ ...f, nota: e.target.value }))}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
+                placeholder={
+                  formMovCajaPropia.tipo === 'entrada'
+                    ? 'Nota opcional (origen del capital, referencia…)'
+                    : 'Nota opcional (motivo del retiro, destino del efectivo…)'
+                }
+              />
+              <button
+                type="button"
+                disabled={
+                  guardandoMovCajaPropia ||
+                  (formMovCajaPropia.tipo === 'salida' &&
+                    resumenCajaPropia.saldo < redondearPesos(Number(formMovCajaPropia.monto) || 0))
+                }
+                onClick={() => void handleRegistrarMovimientoCajaPropia()}
+                className={`w-full disabled:opacity-50 text-white rounded-xl py-3 text-sm font-bold active:scale-95 transition ${
+                  formMovCajaPropia.tipo === 'entrada' ? 'bg-violet-600' : 'bg-orange-600'
+                }`}
+              >
+                {guardandoMovCajaPropia
+                  ? 'Registrando…'
+                  : formMovCajaPropia.tipo === 'entrada'
+                    ? 'Registrar ingreso propio'
+                    : 'Registrar egreso propio'}
+              </button>
+              <div className="max-h-52 overflow-y-auto space-y-1.5 border-t border-gray-800 pt-3">
+                <p className="text-xs text-gray-500 font-semibold sticky top-0 bg-gray-900/95 py-1">Historial caja propia</p>
+                {resumenCajaPropia.movimientos.length === 0 && (
+                  <p className="text-xs text-gray-500 py-2">Sin movimientos aún.</p>
+                )}
+                {resumenCajaPropia.movimientos.map(m => (
+                  <div
+                    key={m.id}
+                    className={`flex justify-between gap-2 rounded-lg px-2 py-1.5 text-xs ${
+                      m.tipo === 'entrada' ? 'bg-green-950/25 text-green-100' : 'bg-orange-950/25 text-orange-100'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <p className="font-medium truncate">{m.descripcion}</p>
+                      <p className="text-[10px] opacity-70">{m.fecha} · {m.registradoPor || '—'}</p>
+                    </div>
+                    <p className="shrink-0 font-bold">{m.tipo === 'entrada' ? '+' : '−'}{fmt(m.monto)}</p>
                   </div>
                 ))}
               </div>
             </div>
-            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-              <h3 className="font-bold text-sm text-gray-300 mb-3">Clientes cobrados hoy</h3>
-              {cierreCajaHoy.clientesCobrados.length === 0 && <p className="text-sm text-gray-500">Todavía no hay clientes cobrados hoy.</p>}
-              <div className="space-y-2">
-                {cierreCajaHoy.clientesCobrados.map(c => (
-                  <div key={c.id} className="bg-gray-800/60 rounded-xl p-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="font-semibold text-sm truncate">{c.cliente}</p>
-                      <p className="font-bold text-green-400">{fmt(c.monto)}</p>
-                    </div>
-                    <p className="text-xs text-gray-400 mt-1">{c.metodo} · Cobrador: {etiquetaCobradorMovimiento(c.cobrador)}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
+
             <div className="bg-gray-900/60 border border-amber-500/40 rounded-2xl p-4 space-y-3">
               <div>
-                <h3 className="font-bold text-sm text-amber-200">💰 Ingresos en caja por créditos (sin recaudado)</h3>
+                <h3 className="font-bold text-sm text-amber-200">💰 Habilitar créditos (desde caja propia)</h3>
                 <p className="text-xs text-gray-400 mt-1">
-                  Cuando un cobrador/vendedor crea un crédito sin haber cobrado aún, debe figurar acá. Al registrar el ingreso, el cobrador lo ve en su caja.
+                  Solicitudes de cobradores sin recaudado previo. Al confirmar, egresa de caja propia e ingresa al cobrador para el cliente indicado.
                 </p>
+                <p className="text-xs text-violet-300/90 mt-2">Saldo caja propia: <strong>{fmt(resumenCajaPropia.saldo)}</strong></p>
               </div>
               {solicitudesFondoPendientesAdmin.length === 0 && (
                 <p className="text-sm text-gray-500">No hay solicitudes de ingreso pendientes.</p>
@@ -8510,6 +8841,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               {solicitudesFondoPendientesAdmin.map(sol => {
                 const cliSol = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
                 const nombreCliSol = nombreCompletoCliente(cliSol) || 'Cliente';
+                const sinSaldo = resumenCajaPropia.saldo < sol.monto;
                 return (
                   <div key={sol.id} className="bg-amber-950/30 border border-amber-500/30 rounded-xl p-3 space-y-2">
                     <div className="flex flex-wrap justify-between gap-2">
@@ -8522,20 +8854,24 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                       <p className="text-lg font-black text-amber-300 shrink-0">{fmt(sol.monto)}</p>
                     </div>
                     <p className="text-[11px] text-amber-100/80">
-                      Capital a otorgar (monto solicitado del crédito). Quedará como: «{descripcionIngresoMarcosCredito(nombreCliSol)}».
+                      El cobrador verá: «{descripcionIngresoMarcosCredito(nombreCliSol)}».
                     </p>
+                    {sinSaldo && (
+                      <p className="text-[11px] text-red-300">Saldo caja propia insuficiente. Registrá un ingreso propio en la sección de arriba.</p>
+                    )}
                     <button
                       type="button"
-                      disabled={guardandoFondoCreditoId === sol.id}
+                      disabled={guardandoFondoCreditoId === sol.id || sinSaldo}
                       onClick={() => void handleRegistrarIngresoFondoCredito(sol)}
                       className="w-full bg-amber-600 disabled:opacity-50 text-white rounded-xl py-2.5 text-sm font-bold active:scale-95 transition"
                     >
-                      {guardandoFondoCreditoId === sol.id ? 'Registrando…' : `Registrar ingreso en caja (${fmt(sol.monto)})`}
+                      {guardandoFondoCreditoId === sol.id ? 'Registrando…' : `Habilitar desde caja propia (${fmt(sol.monto)})`}
                     </button>
                   </div>
                 );
               })}
             </div>
+
             <div className="bg-gray-900/60 border border-sky-500/35 rounded-2xl p-4 space-y-4">
               <div>
                 <h3 className="font-bold text-sm text-sky-200">💵 Ingresos externos de dinero</h3>
