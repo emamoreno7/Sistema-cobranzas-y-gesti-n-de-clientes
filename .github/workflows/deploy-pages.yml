@@ -29,8 +29,13 @@ jobs:
 
       - name: Build for GitHub Pages
         run: npm run build:pages
-        env:
-          VITE_BASE_PATH: /Sistema-cobranzas-y-gesti-n-de-clientes/
+
+      - name: Verificar build (no debe quedar /src/main.tsx)
+        run: |
+          grep -q 'Sistema-cobranzas-y-gesti-n-de-clientes/assets/' dist/index.html
+          ! grep -q '/src/main.tsx' dist/index.html || (echo 'ERROR: index.html sin compilar' && exit 1)
+          test -f dist/.nojekyll
+          echo "OK: dist listo para Pages"
 
       - name: SPA fallback (404 → index)
         run: cp dist/index.html dist/404.html

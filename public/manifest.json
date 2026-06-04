@@ -2,23 +2,23 @@
   "name": "DotCom Sistema de Gestión",
   "short_name": "DotCom",
   "description": "DotCom: gestión de cobranzas, stock y rutas para equipos de campo",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#020617",
   "theme_color": "#0c4a6e",
   "orientation": "portrait-primary",
-  "scope": "/",
+  "scope": "./",
   "lang": "es-AR",
   "categories": ["business", "finance", "productivity"],
   "icons": [
     {
-      "src": "/apple-touch-icon.png?v=2",
+      "src": "apple-touch-icon.png?v=2",
       "sizes": "180x180",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/splash.png",
+      "src": "splash.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
@@ -29,7 +29,7 @@
       "name": "Registrar Cobro",
       "short_name": "Cobrar",
       "description": "Registrar un nuevo pago",
-      "url": "/?action=cobrar",
+      "url": "./?action=cobrar",
       "icons": [
         {
           "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><rect width='96' height='96' rx='18' fill='%230c4a6e'/><text x='48' y='68' font-size='48' text-anchor='middle' fill='white'>💵</text></svg>",
@@ -41,7 +41,7 @@
       "name": "Hoja de Ruta",
       "short_name": "Ruta",
       "description": "Ver clientes del día",
-      "url": "/?page=ruta",
+      "url": "./?page=ruta",
       "icons": [
         {
           "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><rect width='96' height='96' rx='18' fill='%23075985'/><text x='48' y='68' font-size='48' text-anchor='middle' fill='white'>🗺️</text></svg>",
