@@ -6505,7 +6505,16 @@ export default function App() {
         createdBy: actor || 'Marcos',
       });
       if (!resultado.ok) {
-        alert(`${resultado.error}\n\nSi persiste, ejecutá la migración 019 en Supabase (fix pgcrypto).`);
+        const errProv = resultado.error;
+        const hint = errProv.includes('Solo el administrador')
+          ? 'La sesión de Supabase Auth no coincide con un admin en la BD.\n\n'
+            + '• Entrá con marcos / emamoreno7@hotmail.com (o prueba@emd.com).\n'
+            + '• Ejecutá la migración 043 en Supabase (es_admin_sesion ampliado).\n'
+            + '• Cerrá sesión y volvé a iniciar.'
+          : errProv.toLowerCase().includes('crypt') || errProv.toLowerCase().includes('gen_salt')
+            ? 'Ejecutá la migración 019 en Supabase (fix pgcrypto).'
+            : 'Verificá las migraciones 017, 018 y 043 en Supabase.';
+        alert(`${errProv}\n\n${hint}`);
         return;
       }
       const provRow = resultado.proveedor;
