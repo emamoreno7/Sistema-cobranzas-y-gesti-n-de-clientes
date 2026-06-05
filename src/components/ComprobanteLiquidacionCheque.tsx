@@ -235,7 +235,7 @@ export function ComprobanteLiquidacionCheque({
               color: '#0e7490',
             }}
           >
-            Monto a entregar al cliente
+            Monto a Cobrar
           </p>
           <p
             style={{

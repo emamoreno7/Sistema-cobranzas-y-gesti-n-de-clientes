@@ -1533,16 +1533,27 @@ function puedeCargaRetroactivaCredito(rol: string | null | undefined) {
   return isAdminOrRoot(rol);
 }
 
-const MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO = 7;
+const MAX_DIAS_FUTURO_FECHA_INICIO_DIARIO = 7;
+const MAX_DIAS_FUTURO_FECHA_INICIO_SEMANAL = 12;
 
-/** Validación al crear crédito: no más de 7 días hacia adelante desde hoy. */
-function validarFechaInicioCredito(fecha: string, puedeRetro: boolean): string | null {
+function maxDiasFuturoFechaInicioCredito(plazoUnidad?: 'Días' | 'Semanas' | 'Meses' | string): number {
+  const u = normalizarPlazoUnidad(plazoUnidad ?? 'Días');
+  return u === 'Semanas' ? MAX_DIAS_FUTURO_FECHA_INICIO_SEMANAL : MAX_DIAS_FUTURO_FECHA_INICIO_DIARIO;
+}
+
+/** Validación al crear crédito: máx. 7 días (diario/mensual) o 12 días (semanal) hacia adelante desde hoy. */
+function validarFechaInicioCredito(
+  fecha: string,
+  puedeRetro: boolean,
+  plazoUnidad?: 'Días' | 'Semanas' | 'Meses' | string,
+): string | null {
   const f = String(fecha || '').slice(0, 10);
   if (!f) return 'Indicá la fecha de inicio del crédito.';
   const h = hoy();
-  const maxFut = addDias(h, MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO);
+  const maxDias = maxDiasFuturoFechaInicioCredito(plazoUnidad);
+  const maxFut = addDias(h, maxDias);
   if (!puedeRetro && f < h) return 'La fecha de inicio no puede ser anterior a hoy.';
-  if (f > h && f > maxFut) return `La fecha de inicio no puede ser más de ${MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO} días en el futuro.`;
+  if (f > h && f > maxFut) return `La fecha de inicio no puede ser más de ${maxDias} días en el futuro.`;
   return null;
 }
 
@@ -3084,6 +3095,7 @@ export default function App() {
     fecha: string;
   }>({ tipo: 'entrada', monto: '', nota: '', fecha: hoy() });
   const [guardandoMovCajaPropia, setGuardandoMovCajaPropia] = useState(false);
+  const [guardandoBorrarCajaPropia, setGuardandoBorrarCajaPropia] = useState(false);
   const [gastos, setGastos] = useState<Gasto[]>(() => {
     const v = cargar('cp_gas', [] as Gasto[]);
     if (Array.isArray(v) && v.length) return v;
@@ -6666,6 +6678,58 @@ export default function App() {
     }
   }, [esMarcosPUsuario, formMovCajaPropia, loginEmail, user, authUserMeta, audit, fetchData]);
 
+  const handleDejarCajaPropiaEnCero = useCallback(async () => {
+    if (!esMarcosPUsuario) return;
+    if (movCajaPropiaProcesandoRef.current) return;
+    const saldoDb = await obtenerSaldoCajaPropiaDesdeDb();
+    if (saldoDb <= 0) {
+      alert(saldoDb < 0
+        ? 'El saldo está negativo. Corregí movimientos en Supabase antes de usar esta opción.'
+        : 'La caja propia ya está en $0.');
+      return;
+    }
+    if (
+      !confirm(
+        `¿Dejar caja propia en $0?\n\nSe registrará un egreso de ${fmt(saldoDb)} por el saldo completo.\n(Es un atajo; para retiros parciales usá «Egreso propio».)`,
+      )
+    ) {
+      return;
+    }
+    movCajaPropiaProcesandoRef.current = true;
+    setGuardandoBorrarCajaPropia(true);
+    try {
+      const saldoConfirmado = await obtenerSaldoCajaPropiaDesdeDb();
+      if (saldoConfirmado <= 0) {
+        alert('El saldo cambió. Recargá e intentá de nuevo.');
+        return;
+      }
+      const actor = nombreParaMostrarSesion({
+        loginEmail,
+        usernameState: user,
+        authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+      });
+      const { error } = await supabase.from('caja_propia_movimientos').insert([{
+        tipo: 'salida',
+        monto: saldoConfirmado,
+        descripcion: 'Ajuste — dejar caja propia en cero',
+        nota: 'Cierre rápido de saldo (no reemplaza egresos parciales)',
+        registrado_por: actor || 'Marcos',
+        fecha: hoy(),
+      }]);
+      if (error) throw error;
+      audit('CONFIG_CAMBIO', `Caja propia en cero — egreso ${fmt(saldoConfirmado)}`);
+      await fetchData();
+      const saldoFinal = await obtenerSaldoCajaPropiaDesdeDb();
+      alert(`Caja propia en $0. Último ajuste: ${fmt(saldoConfirmado)}. Saldo actual: ${fmt(saldoFinal)}.`);
+    } catch (e: unknown) {
+      console.error('handleDejarCajaPropiaEnCero:', e);
+      alert(e instanceof Error ? e.message : 'No se pudo dejar la caja en cero.');
+    } finally {
+      movCajaPropiaProcesandoRef.current = false;
+      setGuardandoBorrarCajaPropia(false);
+    }
+  }, [esMarcosPUsuario, loginEmail, user, authUserMeta, audit, fetchData]);
+
   const handleRegistrarIngresoFondoCredito = useCallback(async (sol: SolicitudFondoCredito) => {
     if (!esMarcosPUsuario) {
       alert('Solo Marcos puede registrar este ingreso en caja.');
@@ -6822,7 +6886,7 @@ export default function App() {
     }
     const puedeRetro = puedeCargaRetroactivaCredito(rol);
     const fechaInicioNorm = String(payload.fecha_inicio || hoy()).slice(0, 10);
-    const errFecha = validarFechaInicioCredito(fechaInicioNorm, puedeRetro);
+    const errFecha = validarFechaInicioCredito(fechaInicioNorm, puedeRetro, payload.plazo_unidad);
     if (errFecha) {
       alert(errFecha);
       return;
@@ -9026,7 +9090,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               <div>
                 <h3 className="font-bold text-sm text-violet-200">🏦 Caja propia</h3>
                 <p className="text-xs text-gray-400 mt-1">
-                  Dinero propio de Marcos: ingresá capital, retirá cuando el recaudado de cobradores/vendedores se acumule, o usalo para habilitar créditos. Sin proveedor, usuarios ni comisiones.
+                  Capital propio: ingresos, egresos parciales o dejar en $0 de un clic. Sin proveedor, usuarios ni comisiones.
                 </p>
               </div>
               <div className="grid grid-cols-3 gap-2 text-center">
@@ -9076,7 +9140,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               </div>
               {formMovCajaPropia.tipo === 'salida' && (
                 <p className="text-[11px] text-orange-200/80">
-                  Retiro de efectivo acumulado (recaudación de campo, devoluciones, etc.). Saldo actual: {fmt(resumenCajaPropia.saldo)}.
+                  Egreso parcial: retirá solo el monto que indiques. Saldo actual: {fmt(resumenCajaPropia.saldo)}.
                 </p>
               )}
               <div className="grid grid-cols-2 gap-2">
@@ -9117,6 +9181,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 type="button"
                 disabled={
                   guardandoMovCajaPropia ||
+                  guardandoBorrarCajaPropia ||
                   (formMovCajaPropia.tipo === 'salida' &&
                     resumenCajaPropia.saldo < redondearPesos(Number(formMovCajaPropia.monto) || 0))
                 }
@@ -9131,6 +9196,25 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     ? 'Registrar ingreso propio'
                     : 'Registrar egreso propio'}
               </button>
+              <button
+                type="button"
+                disabled={
+                  guardandoBorrarCajaPropia ||
+                  guardandoMovCajaPropia ||
+                  resumenCajaPropia.saldo <= 0
+                }
+                onClick={() => void handleDejarCajaPropiaEnCero()}
+                className="w-full disabled:opacity-50 border border-red-500/40 bg-red-950/40 hover:bg-red-950/60 text-red-200 rounded-xl py-2.5 text-sm font-bold active:scale-95 transition"
+              >
+                {guardandoBorrarCajaPropia
+                  ? 'Dejando en $0…'
+                  : resumenCajaPropia.saldo > 0
+                    ? `Dejar caja en $0 (${fmt(resumenCajaPropia.saldo)})`
+                    : 'Caja ya en $0'}
+              </button>
+              <p className="text-[10px] text-gray-500 text-center">
+                «Dejar en $0» egresa todo el saldo de una vez. «Egreso propio» es para montos parciales.
+              </p>
               <div className="max-h-52 overflow-y-auto space-y-1.5 border-t border-gray-800 pt-3">
                 <p className="text-xs text-gray-500 font-semibold sticky top-0 bg-gray-900/95 py-1">Historial caja propia</p>
                 {resumenCajaPropia.movimientos.length === 0 && (
@@ -12814,23 +12898,25 @@ function CreditoForm({
 }) {
   const [busqueda, setBusqueda] = useState('');
   const [clienteId, setClienteId] = useState('');
-  const fechaMaxFutura = useMemo(() => addDias(hoy(), MAX_DIAS_FUTURO_FECHA_INICIO_CREDITO), []);
   const [fechaInicio, setFechaInicio] = useState(() => hoy());
   const [detalleMercaderia, setDetalleMercaderia] = useState('');
   const [montoCapital, setMontoCapital] = useState('');
   const [interesAplicado, setInteresAplicado] = useState<number>(30);
   const [plazoUnidad, setPlazoUnidad] = useState<'Días' | 'Semanas' | 'Meses'>(() => (soloPlanMensual ? 'Meses' : 'Semanas'));
   const [plazoCantidad, setPlazoCantidad] = useState<number>(() => (soloPlanMensual ? PLAN_MENSUAL_OPCIONES[0] : 1));
+  const plazoUnidadFecha = soloPlanMensual ? 'Meses' : plazoUnidad;
+  const maxDiasFuturoFecha = maxDiasFuturoFechaInicioCredito(plazoUnidadFecha);
+  const fechaMaxFutura = useMemo(() => addDias(hoy(), maxDiasFuturoFecha), [maxDiasFuturoFecha]);
 
   const esCobrador = String(rol || '').toLowerCase() === 'cobrador';
   const puedeRetro = puedeCargaRetroactivaCredito(rol);
   useEffect(() => {
-    const err = validarFechaInicioCredito(fechaInicio, puedeRetro);
+    const err = validarFechaInicioCredito(fechaInicio, puedeRetro, plazoUnidadFecha);
     if (err) {
       if (!puedeRetro && fechaInicio < hoy()) setFechaInicio(hoy());
       else if (fechaInicio > fechaMaxFutura) setFechaInicio(fechaMaxFutura);
     }
-  }, [puedeRetro, fechaInicio, fechaMaxFutura]);
+  }, [puedeRetro, fechaInicio, fechaMaxFutura, plazoUnidadFecha]);
   useEffect(() => {
     if (soloPlanMensual) {
       setInteresAplicado(tasaInteresMensualPorMeses(plazoCantidad, configTasasMensual));
@@ -12928,8 +13014,8 @@ function CreditoForm({
         />
         <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
           {puedeRetro
-            ? 'Referencia administrativa del crédito. Podés usar fechas pasadas (retroactivo). Hacia adelante, máximo 7 días desde hoy.'
-            : 'Referencia del crédito (por defecto hoy). Hacia adelante, máximo 7 días. El cobrador verá las cuotas para cobrar desde el día siguiente a la aprobación.'}
+            ? `Referencia administrativa del crédito. Podés usar fechas pasadas (retroactivo). Hacia adelante, máximo ${maxDiasFuturoFecha} días desde hoy (${plazoUnidadFecha === 'Semanas' ? 'plan semanal' : 'plan diario/mensual'}).`
+            : `Referencia del crédito (por defecto hoy). Hacia adelante, máximo ${maxDiasFuturoFecha} días (${plazoUnidadFecha === 'Semanas' ? 'semanal' : 'diario/mensual'}). El cobrador verá las cuotas para cobrar desde el día siguiente a la aprobación.`}
         </p>
       </div>
       {tipo === 'M' && (
@@ -13024,7 +13110,7 @@ function CreditoForm({
             || !esUuidClienteId(clienteId)
             || base <= 0
             || (tipo === 'M' && !detalleMercaderia.trim())
-            || Boolean(validarFechaInicioCredito(fechaInicio, puedeRetro))
+            || Boolean(validarFechaInicioCredito(fechaInicio, puedeRetro, plazoUnidadFecha))
           }
           className="flex-1 bg-indigo-500 text-white rounded-xl py-3 font-bold disabled:opacity-50"
         >
