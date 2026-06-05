@@ -813,6 +813,7 @@ interface Config {
   porcentajeComisionVendedor: number;
   modoExterior: boolean;
   trialFin?: string | null;
+  cierreCajaMarcosAt?: string | null;
 }
 interface VisitaFallida { clienteId: string; fecha: string; hora: string; motivo: 'no_domicilio' | 'sin_dinero' | 'promesa_pago' | 'local_cerrado'; lat: number; lng: number; observaciones?: string; promesaFecha?: string; }
 interface Credito {
@@ -973,6 +974,7 @@ interface MovimientoCajaPropia {
   registradoPor: string | null;
   solicitudFondoId: string | null;
   cajaReferenciaId: string | null;
+  rendicionId: string | null;
 }
 
 interface SolicitudFondoCredito {
@@ -2342,7 +2344,29 @@ function mapMovimientoCajaPropia(row: Record<string, unknown>): MovimientoCajaPr
     registradoPor: row.registrado_por != null ? String(row.registrado_por) : null,
     solicitudFondoId: row.solicitud_fondo_id != null ? String(row.solicitud_fondo_id) : null,
     cajaReferenciaId: row.caja_referencia_id != null ? String(row.caja_referencia_id) : null,
+    rendicionId: row.rendicion_id != null ? String(row.rendicion_id) : null,
   };
+}
+
+function timestampDesdeFechaMov(fecha: string, ts?: string | number | null): number {
+  if (ts != null && ts !== '') {
+    const n = typeof ts === 'number' ? ts : new Date(String(ts)).getTime();
+    if (Number.isFinite(n)) return n;
+  }
+  const f = String(fecha || '').slice(0, 10);
+  return f ? new Date(`${f}T23:59:59`).getTime() : 0;
+}
+
+/** Movimiento del día visible en contadores de Marcos tras un cierre de día (mismo calendario). */
+function perteneceContadorMarcosActivo(fecha: string, ts?: string | number | null, corteAt?: string | null): boolean {
+  const h = hoy();
+  const fd = String(fecha || '').slice(0, 10);
+  if (fd !== h) return false;
+  if (!corteAt) return true;
+  const corteMs = new Date(corteAt).getTime();
+  if (!Number.isFinite(corteMs)) return true;
+  if (String(corteAt).slice(0, 10) !== h) return true;
+  return timestampDesdeFechaMov(fd, ts) > corteMs;
 }
 
 function saldoCajaPropiaDesdeMovimientos(movs: MovimientoCajaPropia[]): number {
@@ -3154,6 +3178,7 @@ export default function App() {
   /** Evita doble clic antes de que React deshabilite el botón (caja propia / fondo crédito). */
   const fondoCreditoProcesandoRef = useRef<Set<string>>(new Set());
   const movCajaPropiaProcesandoRef = useRef(false);
+  const aceptarRendicionProcesandoRef = useRef<Set<string>>(new Set());
   const [mComprobanteImagen, setMComprobanteImagen] = useState<ComprobantePagoImagen | null>(null);
   const comprobanteTicketRef = useRef<HTMLDivElement | null>(null);
   const [mRuta, setMRuta] = useState(false);
@@ -4678,8 +4703,40 @@ export default function App() {
     return { totalCobros, totalRecaudado, clientesVisitados: clientesVisitados.size, efectividad };
   }, [pagosOrEmpty, data.visitasFallidas, user, authUserId, loginEmail]);
 
+  const esUsuarioCampoConCaja = useMemo(() => {
+    if (esMarcosPUsuario) return false;
+    const r = (rol || '').toLowerCase();
+    return r === 'cobrador' || r === 'vendedor';
+  }, [esMarcosPUsuario, rol]);
+
+  const cierreCajaMarcosAt = useMemo(
+    () => data.config.cierreCajaMarcosAt ?? null,
+    [data.config.cierreCajaMarcosAt],
+  );
+
+  const miRendicionHoy = useMemo(() => {
+    const h = hoy();
+    return cierresJornada.find(c => c.fecha === h && rendicionEsDelUsuarioActual(c, authUserId, user));
+  }, [cierresJornada, authUserId, user]);
+
   const cajaCobradorDia = useMemo(() => {
     const h = hoy();
+    if (miRendicionHoy) {
+      const totalCobrado = redondearPesos(Number(miRendicionHoy.totalSistema) || 0);
+      const totalGastos = redondearPesos(Number(miRendicionHoy.totalGastos) || 0);
+      const neto = redondearPesos(
+        Number(miRendicionHoy.netoEntregar) || totalCobrado - totalGastos,
+      );
+      return {
+        totalCobrado,
+        totalGastos,
+        ingresosCaja: 0,
+        salidasCaja: 0,
+        efectivoEnMano: neto,
+        cantGastos: 0,
+        congeladoRendicion: true as const,
+      };
+    }
     const gList = Array.isArray(gastos) ? gastos : [];
     const pagosH = pagosOrEmpty.filter(p => {
       const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
@@ -4705,13 +4762,9 @@ export default function App() {
       salidasCaja,
       efectivoEnMano: redondearPesos(totalCobrado + ingresosCaja - totalGastos - salidasCaja),
       cantGastos: gastosH.length,
+      congeladoRendicion: false as const,
     };
-  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail]);
-
-  const miRendicionHoy = useMemo(() => {
-    const h = hoy();
-    return cierresJornada.find(c => c.fecha === h && rendicionEsDelUsuarioActual(c, authUserId, user));
-  }, [cierresJornada, authUserId, user]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy]);
 
   const esperandoValidacionRendicion = useMemo(() => Boolean(miRendicionHoy && !miRendicionHoy.validado), [miRendicionHoy]);
   const jornadaCerradaValidadaHoy = useMemo(() => Boolean(miRendicionHoy && miRendicionHoy.validado), [miRendicionHoy]);
@@ -4719,9 +4772,13 @@ export default function App() {
     () => (rol || '').toLowerCase() === 'cobrador' && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
     [rol, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
   );
-  const puedeCerrarJornadaCobrador = useMemo(
-    () => (rol || '').toLowerCase() === 'cobrador' && !miRendicionHoy,
-    [rol, miRendicionHoy],
+  const puedeCerrarJornadaCampo = useMemo(
+    () => esUsuarioCampoConCaja && !miRendicionHoy,
+    [esUsuarioCampoConCaja, miRendicionHoy],
+  );
+  const usuarioCampoBloqueadoOperaciones = useMemo(
+    () => esUsuarioCampoConCaja && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
+    [esUsuarioCampoConCaja, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
   );
   const rendicionesPendientesAdmin = useMemo(
     () => cierresJornada.filter(c => !c.validado),
@@ -4807,40 +4864,23 @@ export default function App() {
     });
   }, [clientesOrEmpty]);
 
-  const cierreCajaHoy = useMemo(() => {
-    const h = hoy();
-    const pagosHoy = pagosOrEmpty.filter(p => p.fecha === h && esPagoEfectivo(p));
-    const porCobrador = new Map<string, { cobrador: string; total: number; cantidad: number }>();
-    const clientesCobrados = pagosHoy.map(p => {
-      const cobrador = String(p.userId || 'sin_usuario');
-      const actual = porCobrador.get(cobrador) || { cobrador, total: 0, cantidad: 0 };
-      actual.total += Number(p.monto) || 0;
-      actual.cantidad += 1;
-      porCobrador.set(cobrador, actual);
-      const cliente = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(p.clienteId));
-      return {
-        id: p.id,
-        cliente: nombreCompletoCliente(cliente) || p.clienteId || 'Cliente sin identificar',
-        cobrador,
-        monto: Number(p.monto) || 0,
-        metodo: 'Hoja de Ruta cumplida',
-      };
-    });
-    return {
-      total: pagosHoy.reduce((s, p) => s + (Number(p.monto) || 0), 0),
-      porCobrador: Array.from(porCobrador.values()).sort((a, b) => b.total - a.total),
-      clientesCobrados,
-    };
-  }, [pagosOrEmpty, clientesOrEmpty]);
-
   const resumenCajaMarcosDia = useMemo(() => {
     const h = hoy();
+    const corte = cierreCajaMarcosAt;
     const pagosH = pagosOrEmpty.filter(p => {
       const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
-      return fd === h && esPagoEfectivo(p) && redondearPesos(Number(p.monto) || 0) > 0;
+      return (
+        fd === h
+        && esPagoEfectivo(p)
+        && redondearPesos(Number(p.monto) || 0) > 0
+        && perteneceContadorMarcosActivo(fd, p.fechaPago ?? (p as { timestamp?: number }).timestamp, corte)
+      );
     });
     const gastosH = (Array.isArray(gastos) ? gastos : []).filter(
-      g => g && String(g.fecha || '').slice(0, 10) === h,
+      g =>
+        g
+        && String(g.fecha || '').slice(0, 10) === h
+        && perteneceContadorMarcosActivo(String(g.fecha || '').slice(0, 10), g.timestamp, corte),
     );
     const totalCobradoHoy = redondearPesos(pagosH.reduce((s, p) => s + (Number(p.monto) || 0), 0));
     const totalGastosHoy = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
@@ -4848,7 +4888,8 @@ export default function App() {
     let totalIngresosCajaHoy = 0;
     let totalSalidasCajaHoy = 0;
     movimientosCaja.forEach(m => {
-      if (String(m.createdAt).slice(0, 10) !== h) return;
+      const fd = String(m.createdAt).slice(0, 10);
+      if (fd !== h || !perteneceContadorMarcosActivo(fd, m.createdAt, corte)) return;
       if (m.tipo === 'entrada') totalIngresosCajaHoy += redondearPesos(m.monto);
       else totalSalidasCajaHoy += redondearPesos(m.monto);
     });
@@ -4897,7 +4938,8 @@ export default function App() {
       item.cantGastos += 1;
     });
     movimientosCaja.forEach(m => {
-      if (String(m.createdAt).slice(0, 10) !== h) return;
+      const fd = String(m.createdAt).slice(0, 10);
+      if (fd !== h || !perteneceContadorMarcosActivo(fd, m.createdAt, corte)) return;
       const item = touch(String(m.cobradorId || 'sin_usuario'));
       if (m.tipo === 'entrada') item.ingresosCaja += redondearPesos(m.monto);
       else item.salidasCaja += redondearPesos(m.monto);
@@ -4914,8 +4956,9 @@ export default function App() {
       totalCajaHoy,
       netoCampoHoy: redondearPesos(totalCobradoHoy - totalGastosHoy),
       porUsuario: Array.from(porUsuario.values()).sort((a, b) => b.enMano - a.enMano),
+      corteActivo: corte,
     };
-  }, [pagosOrEmpty, gastos, movimientosCaja]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, cierreCajaMarcosAt]);
 
   const resumenCajaPropia = useMemo(() => {
     const h = hoy();
@@ -5817,23 +5860,49 @@ export default function App() {
     }
   };
 
-  const generarResumenCierreCaja = () => {
-    const lineas = [
-      `CIERRE DE CAJA - ${MARCA_PRIMARIA} · ${new Date().toLocaleDateString('es-AR')}`,
-      `Total cobrado hoy: ${fmt(cierreCajaHoy.total)}`,
-      '',
-      'Por cobrador:',
-      ...(cierreCajaHoy.porCobrador.length
-        ? cierreCajaHoy.porCobrador.map(c => `- ${etiquetaCobradorMovimiento(c.cobrador)}: ${fmt(c.total)} (${c.cantidad} cobro/s)`)
-        : ['- Sin cobros registrados hoy']),
-      '',
-      'Clientes cobrados:',
-      ...(cierreCajaHoy.clientesCobrados.length
-        ? cierreCajaHoy.clientesCobrados.map(c => `- ${c.cliente}: ${fmt(c.monto)} | ${etiquetaCobradorMovimiento(c.cobrador)} | ${c.metodo}`)
-        : ['- Sin clientes cobrados hoy']),
-    ];
-    setMCierreCajaResumen(lineas.join('\n'));
-  };
+  const handleCerrarDiaMarcos = useCallback(async () => {
+    if (!esMarcosPUsuario) return;
+    const pendientes = rendicionesPendientesAdmin.filter(c => c.fecha === hoy());
+    if (pendientes.length > 0) {
+      if (
+        !confirm(
+          `Hay ${pendientes.length} rendición(es) sin aceptar.\n\n¿Cerrar el día igual? Los contadores en pantalla pasan a $0; el acumulado queda en caja propia hasta que registres un egreso.`,
+        )
+      ) {
+        return;
+      }
+    } else if (
+      !confirm(
+        '¿Cerrar el día?\n\nLos contadores en tiempo real (Total cobrado, gastos, Total Caja) vuelven a $0.\nEl saldo de caja propia se mantiene hasta que registres un egreso.',
+      )
+    ) {
+      return;
+    }
+    const now = new Date().toISOString();
+    const { error } = await supabase
+      .from('configuracion')
+      .update({ cierre_caja_marcos_at: now, updated_at: now })
+      .eq('id', 'global_config');
+    if (error) {
+      const { error: insErr } = await supabase.from('configuracion').upsert([{
+        id: 'global_config',
+        cierre_caja_marcos_at: now,
+        updated_at: now,
+        nombre_empresa: data.config.nombreEmpresa,
+        interes_credito_m: data.config.interesCreditoM,
+        interes_credito_p: data.config.interesCreditoP,
+      } as Record<string, unknown>]);
+      if (insErr) {
+        alert('No se pudo cerrar el día (¿migración 042?): ' + (insErr.message || ''));
+        return;
+      }
+    }
+    const saldoAntes = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
+    audit('CONFIG_CAMBIO', `Cierre de día Marcos — contadores reiniciados · caja propia ${fmt(saldoAntes)}`);
+    await fetchData();
+    const saldo = await obtenerSaldoCajaPropiaDesdeDb();
+    alert(`Día cerrado. Contadores en $0. Saldo caja propia (acumulado): ${fmt(saldo)}.`);
+  }, [esMarcosPUsuario, rendicionesPendientesAdmin, data.config, movimientosCajaPropia, audit, fetchData]);
 
   // ==========================================
   // FICHAS
@@ -7142,9 +7211,15 @@ export default function App() {
   }, []);
   const panelControlStats = useMemo(() => {
     const hoyIso = hoy();
-    const pagosHoyEfectivos = pagosOrEmpty.filter(
-      p => String(p.fechaPago ?? p.fecha ?? '').slice(0, 10) === hoyIso && esPagoEfectivo(p),
-    );
+    const corte = cierreCajaMarcosAt;
+    const pagosHoyEfectivos = pagosOrEmpty.filter(p => {
+      const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
+      return (
+        fd === hoyIso
+        && esPagoEfectivo(p)
+        && perteneceContadorMarcosActivo(fd, p.fechaPago ?? (p as { timestamp?: number }).timestamp, corte)
+      );
+    });
     const cobradoHoy = pagosHoyEfectivos
       .reduce((acc, p) => acc + (Number(p.monto) || 0), 0);
     const capitalCalle = clientesOrEmpty.reduce((acc, c) => acc + Math.max(0, Number(c.saldo) || 0), 0);
@@ -7178,7 +7253,10 @@ export default function App() {
       item.totalCobrado += Number(p.monto) || 0;
     });
     (Array.isArray(gastos) ? gastos : [])
-      .filter(g => g && String(g.fecha || '').slice(0, 10) === hoyIso)
+      .filter(g => {
+        const fd = String(g?.fecha || '').slice(0, 10);
+        return g && fd === hoyIso && perteneceContadorMarcosActivo(fd, g.timestamp, corte);
+      })
       .forEach(g => {
         const item = ensure(String(g?.userId || 'sin_usuario').trim());
         item.gastos += Number(g?.monto) || 0;
@@ -7199,7 +7277,7 @@ export default function App() {
       .sort((a, b) => b.totalCobrado - a.totalCobrado);
 
     return { cobradoHoy, capitalCalle, indiceMora, totalACobrarHoy, efectividad, porCobrador };
-  }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito]);
+  }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito, cierreCajaMarcosAt]);
 
   const feedMovimientosControl = useMemo((): FilaMovimientoControl[] => {
     const filas: FilaMovimientoControl[] = [];
@@ -7378,6 +7456,11 @@ export default function App() {
       setMNotificaciones(false);
       return;
     }
+    if (n.accion === 'go_rendiciones' || titulo.includes('rendición pendiente')) {
+      setPage('rendiciones');
+      setMNotificaciones(false);
+      return;
+    }
     if (
       n.accion?.startsWith('go_fondo_credito:')
       || titulo.includes('ingreso en caja')
@@ -7506,7 +7589,18 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
     setMCierre(cierre);
     setMJornada(false);
 
-    if (confirm('✅ Rendición enviada (pendiente de validación). ¿Enviar copia al administrador por WhatsApp?')) {
+    try {
+      await crearNotificacion({
+        titulo: 'Rendición pendiente de recepción',
+        mensaje: `${nombrePantallaJornada} cerró jornada — ${fmt(netoEntregar)} a recibir. Aceptá en Rendiciones.`,
+        destinatario_usuario: EMAIL_ADMIN_MARCOS_CAJA,
+        accion: 'go_rendiciones',
+      });
+    } catch (err) {
+      devWarn('Notificación rendición a Marcos:', err);
+    }
+
+    if (confirm('✅ Rendición enviada (pendiente de aceptación por Marcos). ¿Enviar copia al administrador por WhatsApp?')) {
       if (linkWA) window.open(linkWA, '_blank');
       else alert('Configurá el WhatsApp del administrador (solo números, prefijo 549) en Ajustes para enviar la copia.');
     }
@@ -7514,27 +7608,88 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
 
   const handleAceptarRendicion = async (c: Cierre) => {
     if (!esMarcosPUsuario) return;
-    const neto = redondearPesos(c.netoEntregar ?? (c.totalSistema - (c.totalGastos ?? 0)));
-    const { error } = await supabase.from('rendiciones').update({
-      validado: true,
-      validado_at: new Date().toISOString(),
-      validado_por: nombreParaMostrarSesion({
-        loginEmail,
-        usernameState: user,
-        authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
-      }),
-      ingreso_caja_central: neto,
-    } as any).eq('id', c.id);
-    if (error) {
-      console.error(error);
-      alert('No se pudo aceptar la rendición: ' + (error.message || ''));
+    if (aceptarRendicionProcesandoRef.current.has(c.id)) return;
+    if (c.validado) {
+      alert('Esta rendición ya fue aceptada.');
       return;
     }
-    audit(
-      'RENDICION_ACEPTADA',
-      `Rendición ${c.id} — ${etiquetaCobradorMovimiento(c.username || c.userId)} — ${fmt(neto)} ingresa a caja central`,
-    );
-    await fetchData();
+    aceptarRendicionProcesandoRef.current.add(c.id);
+    const neto = redondearPesos(c.netoEntregar ?? (c.totalSistema - (c.totalGastos ?? 0)));
+    const actor = nombreParaMostrarSesion({
+      loginEmail,
+      usernameState: user,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    });
+    const etiquetaCob = etiquetaCobradorMovimiento(c.username || c.userId);
+    const cobradorCaja = String(c.userId || 'sin_usuario').trim();
+
+    try {
+      const { data: propiaPrev } = await supabase
+        .from('caja_propia_movimientos')
+        .select('id')
+        .eq('rendicion_id', c.id)
+        .maybeSingle();
+      if (propiaPrev) {
+        alert('Esta rendición ya fue recepcionada en caja propia.');
+        await fetchData();
+        return;
+      }
+
+      const { data: claimed, error: claimErr } = await supabase
+        .from('rendiciones')
+        .update({
+          validado: true,
+          validado_at: new Date().toISOString(),
+          validado_por: actor || 'Marcos',
+          ingreso_caja_central: neto,
+        } as Record<string, unknown>)
+        .eq('id', c.id)
+        .eq('validado', false)
+        .select('id')
+        .maybeSingle();
+      if (claimErr) throw claimErr;
+      if (!claimed) {
+        alert('La rendición ya fue procesada por otro intento.');
+        await fetchData();
+        return;
+      }
+
+      if (neto > 0) {
+        const { error: salidaErr } = await supabase.from('caja').insert([{
+          tipo: 'salida',
+          monto: neto,
+          descripcion: 'Rendición entregada — recepción administrador',
+          cobrador_id: cobradorCaja,
+        } as Record<string, unknown>]);
+        if (salidaErr) throw salidaErr;
+
+        const { error: propErr } = await supabase.from('caja_propia_movimientos').insert([{
+          tipo: 'entrada',
+          monto: neto,
+          descripcion: `Recepción rendición — ${etiquetaCob}`,
+          nota: `Jornada ${c.fecha}`,
+          registrado_por: actor || 'Marcos',
+          rendicion_id: c.id,
+          fecha: hoy(),
+        }]);
+        if (propErr) {
+          const code = (propErr as { code?: string }).code;
+          if (code !== '23505') throw propErr;
+        }
+      }
+
+      audit(
+        'RENDICION_ACEPTADA',
+        `Rendición ${c.id} — ${etiquetaCob} — ${fmt(neto)} ingresa a caja propia`,
+      );
+      await fetchData();
+      alert(`Rendición aceptada. ${fmt(neto)} ingresó a caja propia. ${etiquetaCob} queda liberado tras las 00:00.`);
+    } catch (e: unknown) {
+      console.error('handleAceptarRendicion:', e);
+      alert(e instanceof Error ? e.message : 'No se pudo aceptar la rendición (¿migración 042?)');
+    } finally {
+      aceptarRendicionProcesandoRef.current.delete(c.id);
+    }
   };
 
   // ==========================================
@@ -8455,10 +8610,10 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               </div>
             )}
 
-            {/* Cobrador: caja del día, gastos, cierre de jornada */}
-            {(rol || '').toLowerCase() === 'cobrador' && (
+            {/* Cobrador / vendedor: caja del día y cierre de jornada (pendiente hasta recepción Marcos) */}
+            {esUsuarioCampoConCaja && (
               <div className="space-y-3">
-                {cobradorBloqueadoCobros && (
+                {(usuarioCampoBloqueadoOperaciones || cobradorBloqueadoCobros) && (
                   <div className={`rounded-2xl border p-3 text-center text-sm ${esperandoValidacionRendicion ? 'border-amber-500/50 bg-amber-500/10 text-amber-200' : 'border-sky-500/40 bg-sky-500/10 text-sky-200'}`}>
                     {esperandoValidacionRendicion && (
                       <p className="font-semibold">⏳ Esperando validación del administrador. No podés registrar cobros hasta que acepte la rendición.</p>
@@ -8470,7 +8625,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 )}
                 <div className="bg-emerald-500/10 border border-emerald-500/35 rounded-2xl p-4">
                   <h3 className="font-bold text-sm text-emerald-200 mb-3">💵 Efectivo en mano (hoy)</h3>
-                  <p className="text-[11px] text-emerald-100/70 mb-3">Cada gasto operativo resta del efectivo que llevás. Jornada = día calendario (00:00–00:00).</p>
+                  <p className="text-[11px] text-emerald-100/70 mb-3">
+                    {cajaCobradorDia.congeladoRendicion
+                      ? 'Montos congelados al cerrar jornada. Pendiente de recepción por Marcos.'
+                      : 'Cada gasto operativo resta del efectivo que llevás. Jornada = día calendario (00:00–00:00).'}
+                  </p>
                   <div className="grid grid-cols-1 gap-2 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Cobrado</span><span className="font-semibold text-white">{fmt(cajaCobradorDia.totalCobrado)}</span></div>
                     {cajaCobradorDia.ingresosCaja > 0 && (
@@ -8479,15 +8638,17 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     <div className="flex justify-between"><span className="text-gray-400">Gastos</span><span className="font-semibold text-orange-300">− {fmt(cajaCobradorDia.totalGastos)}</span></div>
                     <div className="flex justify-between border-t border-emerald-500/25 pt-2 mt-1"><span className="text-emerald-200 font-semibold">En mano</span><span className="font-black text-emerald-300 text-lg">{fmt(cajaCobradorDia.efectivoEnMano)}</span></div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setMGasto({ categoria: 'Combustible' })}
-                    className="mt-4 w-full bg-orange-500/25 border border-orange-500/40 text-orange-100 rounded-xl py-3 text-sm font-bold active:scale-[0.99] transition"
-                  >
-                    + Registrar gasto operativo
-                  </button>
+                  {(rol || '').toLowerCase() === 'cobrador' && !usuarioCampoBloqueadoOperaciones && (
+                    <button
+                      type="button"
+                      onClick={() => setMGasto({ categoria: 'Combustible' })}
+                      className="mt-4 w-full bg-orange-500/25 border border-orange-500/40 text-orange-100 rounded-xl py-3 text-sm font-bold active:scale-[0.99] transition"
+                    >
+                      + Registrar gasto operativo
+                    </button>
+                  )}
                 </div>
-                {puedeCerrarJornadaCobrador && (
+                {puedeCerrarJornadaCampo && (
                   <button
                     type="button"
                     onClick={() => setMJornada(true)}
@@ -8497,8 +8658,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                       <span className="text-2xl">🏁</span>
                     </div>
                     <div className="text-left flex-1">
-                      <p className="text-white font-semibold">Cerrar jornada</p>
-                      <p className="text-gray-400 text-xs">Resumen cobrado − gastos = neto a entregar</p>
+                      <p className="text-white font-semibold">Cerrar caja / jornada</p>
+                      <p className="text-gray-400 text-xs">Queda pendiente hasta que Marcos acepte la recepción</p>
                     </div>
                     <span className="text-gray-500">→</span>
                   </button>
@@ -8802,7 +8963,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               </div>
               <button
                 type="button"
-                onClick={generarResumenCierreCaja}
+                onClick={() => void handleCerrarDiaMarcos()}
                 className="bg-emerald-600 text-white rounded-xl px-4 py-2 text-sm font-bold active:scale-95 transition"
               >
                 Cerrar Día
@@ -8825,6 +8986,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             </div>
             <p className="text-[11px] text-gray-500 text-center">
               Efectivo líquido en campo (cobrado + ingresos caja − gastos − salidas caja).
+              {resumenCajaMarcosDia.corteActivo && (
+                <span className="block mt-1 text-violet-300/80">
+                  Último cierre de día: {new Date(resumenCajaMarcosDia.corteActivo).toLocaleString('es-AR')}
+                </span>
+              )}
             </p>
 
             <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-3">
@@ -9186,7 +9352,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           <div className="space-y-4">
             <div>
               <h2 className="text-lg font-bold">📑 Rendiciones pendientes</h2>
-              <p className="text-xs text-gray-400">Validá cada cierre de jornada. Al aceptar, el neto ingresa a caja central y el cobrador queda liberado para la próxima jornada (después de las 00:00).</p>
+              <p className="text-xs text-gray-400">Aceptá cada cierre de caja. El neto ingresa a caja propia; el usuario queda en pendiente hasta la recepción y liberado tras las 00:00.</p>
             </div>
             <div className="flex rounded-xl overflow-hidden border border-gray-700">
               <button
@@ -9227,12 +9393,12 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                       type="button"
                       onClick={() => {
                         const neto = c.netoEntregar ?? redondearPesos(c.totalSistema - (c.totalGastos ?? 0));
-                        if (!confirm(`¿Aceptar rendición de ${etiquetaCobradorMovimiento(c.username || c.userId) || 'este cobrador'}? Ingresan ${fmt(neto)} a caja central y queda liberado para la próxima jornada.`)) return;
+                        if (!confirm(`¿Recibir rendición de ${etiquetaCobradorMovimiento(c.username || c.userId) || 'este usuario'}? Ingresan ${fmt(neto)} a caja propia.`)) return;
                         void handleAceptarRendicion(c);
                       }}
                       className="w-full bg-green-600 hover:bg-green-500 text-white font-bold py-3 rounded-xl active:scale-[0.99] transition"
                     >
-                      Aceptar rendición
+                      Recibir en caja propia
                     </button>
                   </div>
                 ))}

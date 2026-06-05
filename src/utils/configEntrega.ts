@@ -18,6 +18,8 @@ export type ConfigApp = {
   porcentajeComisionVendedor: number;
   modoExterior: boolean;
   trialFin: string | null;
+  /** Último cierre de día de Marcos: contadores en pantalla solo cuentan movimientos posteriores (mismo día). */
+  cierreCajaMarcosAt: string | null;
 };
 
 export const CONFIG_DEFECTO: ConfigApp = {
@@ -34,6 +36,7 @@ export const CONFIG_DEFECTO: ConfigApp = {
   porcentajeComisionVendedor: 5,
   modoExterior: false,
   trialFin: null,
+  cierreCajaMarcosAt: null,
 };
 
 function soloDigitosTel(v: string): string {
@@ -76,6 +79,10 @@ export function configDesdeSupabase(raw: Record<string, unknown> | null | undefi
     ...(Number.isFinite(mora) ? { moraPorciento: mora } : {}),
     modoExterior: Boolean(cfg.modo_exterior ?? cfg.modoExterior),
     trialFin: parseTrialFinDesdeDb(cfg.trial_fin ?? cfg.trialFin),
+    cierreCajaMarcosAt:
+      cfg.cierre_caja_marcos_at != null && String(cfg.cierre_caja_marcos_at).trim()
+        ? String(cfg.cierre_caja_marcos_at)
+        : null,
     nombreEmpresa: textoEmpresaPermitido(cfg.nombre_empresa ?? cfg.nombreEmpresa, CONFIG_DEFECTO.nombreEmpresa),
     direccionEmpresa: textoEmpresaPermitido(cfg.direccion_empresa ?? cfg.direccionEmpresa, CONFIG_DEFECTO.direccionEmpresa),
     ruc: String(cfg.ruc ?? CONFIG_DEFECTO.ruc).trim() || CONFIG_DEFECTO.ruc,
