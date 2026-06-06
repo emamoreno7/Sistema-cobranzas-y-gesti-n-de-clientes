@@ -33,7 +33,6 @@ import {
   parseResultadoAccesoDemo,
   trialExpirado,
 } from './utils/trialLicencia';
-import { DashboardLogsSistema } from './components/Dashboard';
 import { devWarn } from './utils/devConsole';
 import {
   type Proveedor,
@@ -400,39 +399,37 @@ async function registrarCobranzaDirectaSupabase(
   if (eIns || !pagoId) return { ok: false, error: eIns ?? new Error('Directa: insert en pagos sin id') };
 
   if (Boolean(params.es_registro_no_pago) === false && montoRound > 0) {
-    const nowIso = new Date().toISOString();
-    dbgSupabaseTbl('cuotas', 'update', {
-      credito_id: creditoUuid,
-      nro_cuota: nCuota,
-      pago_id: pagoId,
-    });
-    const { data: cuUp, error: eCu } = await supabase
-      .from('cuotas')
-      .update({
-        estado: 'pagado',
-        pago_id: pagoId,
-        pagado_at: params.fecha_pago,
-        updated_at: nowIso,
-      } as any)
-      .eq('credito_id', creditoUuid)
-      .eq('nro_cuota', nCuota)
-      .neq('estado', 'pagado')
-      .select('id');
-    const cuotaActualizada = !eCu && Array.isArray(cuUp) && cuUp.length > 0;
-    if (eCu) {
-      void insertarLogAuditoriaSupabase({
-        tipo: 'cobro',
-        contexto: 'cobro_cuotas_update_fallido',
-        mensaje_error: String((eCu as { message?: string })?.message ?? eCu).slice(0, 2000),
-        datos_enviados: {
-          credito_id: creditoUuid,
-          cliente_id: clienteUuid,
-          nro_cuota: nCuota,
+    dbgSupabaseTbl('cuotas', 'sync_estado_por_pagos', { credito_id: creditoUuid, nro_cuota: nCuota, pago_id: pagoId });
+    const cuotaActualizada = await aplicarEstadoCuotasSegunPagosCredito(creditoUuid);
+    if (!cuotaActualizada) {
+      const nowIso = new Date().toISOString();
+      const { error: eCu } = await supabase
+        .from('cuotas')
+        .update({
+          estado: 'pagado',
           pago_id: pagoId,
-          code: (eCu as { code?: string })?.code,
-        },
-        actor: null,
-      });
+          pagado_at: params.fecha_pago,
+          updated_at: nowIso,
+        } as any)
+        .eq('credito_id', creditoUuid)
+        .eq('nro_cuota', nCuota)
+        .neq('estado', 'pagado')
+        .select('id');
+      if (eCu) {
+        void insertarLogAuditoriaSupabase({
+          tipo: 'cobro',
+          contexto: 'cobro_cuotas_update_fallido',
+          mensaje_error: String((eCu as { message?: string })?.message ?? eCu).slice(0, 2000),
+          datos_enviados: {
+            credito_id: creditoUuid,
+            cliente_id: clienteUuid,
+            nro_cuota: nCuota,
+            pago_id: pagoId,
+            code: (eCu as { code?: string })?.code,
+          },
+          actor: null,
+        });
+      }
     }
 
     let saldoPendiente: number | undefined;
@@ -902,11 +899,178 @@ function pagosEfectivosCredito(pagos: PagoRegistro[], creditoId: string): PagoRe
     .sort((a, b) => String(a.fechaPago || a.fecha || '').localeCompare(String(b.fechaPago || b.fecha || '')));
 }
 
+/** Cuota actual, faltante y progreso según monto acumulado (admite parciales y adelantos). */
+function contextoCobroCredito(credito: Credito, pagos: PagoRegistro[]) {
+  const planilla = generarPlanillaCredito(credito);
+  const montoTotal = redondearPesos(Number(credito.monto_total ?? credito.total_con_interes) || 0);
+  const totalPagado = redondearPesos(
+    pagosEfectivosCredito(pagos, credito.id).reduce((s, p) => s + redondearPesos(Number(p.monto) || 0), 0),
+  );
+  let acum = 0;
+  let cuotasCompletas = 0;
+  let cuotaActualNro: number | null = null;
+  let montoCuotaActual = 0;
+  let montoFaltanteCuotaActual = 0;
+  for (const cuo of planilla) {
+    const montoCuo = redondearPesos(Number(cuo.monto) || 0);
+    if (totalPagado >= acum + montoCuo) {
+      acum += montoCuo;
+      cuotasCompletas += 1;
+    } else {
+      cuotaActualNro = cuo.nro;
+      montoCuotaActual = montoCuo;
+      montoFaltanteCuotaActual = redondearPesos(acum + montoCuo - totalPagado);
+      break;
+    }
+  }
+  const creditoFinalizado = cuotasCompletas >= planilla.length || totalPagado >= montoTotal;
+  if (!creditoFinalizado && cuotaActualNro == null && planilla.length > 0) {
+    const next = planilla[cuotasCompletas];
+    if (next) {
+      cuotaActualNro = next.nro;
+      montoCuotaActual = redondearPesos(Number(next.monto) || 0);
+      montoFaltanteCuotaActual = montoCuotaActual;
+    }
+  }
+  return {
+    totalPagado,
+    planilla,
+    cuotasCompletas,
+    cuotaActualNro,
+    montoCuotaActual,
+    montoFaltanteCuotaActual: creditoFinalizado ? 0 : montoFaltanteCuotaActual,
+    saldoCredito: Math.max(0, montoTotal - totalPagado),
+    creditoFinalizado,
+  };
+}
+
+type FilaRecaudacionCampo = {
+  cobrador: string;
+  cobrado: number;
+  gastos: number;
+  neto: number;
+  cantCobros: number;
+  cantGastos: number;
+};
+
+function calcularRecaudacionCampoHoy(
+  pagos: PagoRegistro[],
+  gastosList: Gasto[],
+  fecha = hoy(),
+): {
+  ingresosCampoHoy: number;
+  egresosCampoHoy: number;
+  cobradoAcumuladoCampo: number;
+  porUsuarioCampo: FilaRecaudacionCampo[];
+} {
+  const pagosCampoHoy = pagos.filter(p => {
+    const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
+    return (
+      fd === fecha
+      && esPagoEfectivo(p)
+      && redondearPesos(Number(p.monto) || 0) > 0
+      && esMovimientoUsuarioCampo(p.cobradorId ?? p.userId)
+    );
+  });
+  const gastosCampoHoy = gastosList.filter(
+    g =>
+      g
+      && String(g.fecha || '').slice(0, 10) === fecha
+      && esMovimientoUsuarioCampo(g.userId),
+  );
+  const ingresosCampoHoy = redondearPesos(
+    pagosCampoHoy.reduce((s, p) => s + (Number(p.monto) || 0), 0),
+  );
+  const egresosCampoHoy = redondearPesos(
+    gastosCampoHoy.reduce((s, g) => s + (Number(g.monto) || 0), 0),
+  );
+  const porUsuarioCampo = new Map<string, FilaRecaudacionCampo>();
+  const touchCampo = (rawId: string) => {
+    const cobrador = String(rawId || 'sin_usuario').trim() || 'sin_usuario';
+    const actual = porUsuarioCampo.get(cobrador) || {
+      cobrador,
+      cobrado: 0,
+      gastos: 0,
+      neto: 0,
+      cantCobros: 0,
+      cantGastos: 0,
+    };
+    porUsuarioCampo.set(cobrador, actual);
+    return actual;
+  };
+  pagosCampoHoy.forEach(p => {
+    const item = touchCampo(String(p.cobradorId ?? p.userId ?? 'sin_usuario'));
+    item.cobrado += redondearPesos(Number(p.monto) || 0);
+    item.cantCobros += 1;
+  });
+  gastosCampoHoy.forEach(g => {
+    const item = touchCampo(String(g.userId || 'sin_usuario'));
+    item.gastos += redondearPesos(Number(g.monto) || 0);
+    item.cantGastos += 1;
+  });
+  porUsuarioCampo.forEach(item => {
+    item.neto = redondearPesos(item.cobrado - item.gastos);
+  });
+  return {
+    ingresosCampoHoy,
+    egresosCampoHoy,
+    cobradoAcumuladoCampo: redondearPesos(ingresosCampoHoy - egresosCampoHoy),
+    porUsuarioCampo: Array.from(porUsuarioCampo.values()).sort((a, b) => b.neto - a.neto),
+  };
+}
+
+/** Marca cuotas pagadas/pendientes según el monto acumulado real en `pagos`. */
+async function aplicarEstadoCuotasSegunPagosCredito(creditoUuid: string): Promise<boolean> {
+  const { data: cuotasDb, error: eCuotas } = await supabase
+    .from('cuotas')
+    .select('nro_cuota, monto')
+    .eq('credito_id', creditoUuid)
+    .order('nro_cuota', { ascending: true });
+  if (eCuotas || !Array.isArray(cuotasDb) || cuotasDb.length === 0) return false;
+  const { data: pagosDb, error: ePagos } = await supabase
+    .from('pagos')
+    .select('monto')
+    .eq('ficha_id', creditoUuid)
+    .eq('es_registro_no_pago', false);
+  if (ePagos) return false;
+  const totalPagado = redondearPesos(
+    (pagosDb ?? []).reduce((s, p) => s + redondearPesos(Number((p as { monto?: number }).monto) || 0), 0),
+  );
+  let acum = 0;
+  const nowIso = new Date().toISOString();
+  let algunaActualizada = false;
+  for (const row of cuotasDb) {
+    const nro = Math.max(1, Math.round(Number((row as { nro_cuota?: number }).nro_cuota) || 1));
+    const montoCuo = redondearPesos(Number((row as { monto?: number }).monto) || 0);
+    const pagada = totalPagado >= acum + montoCuo;
+    acum += montoCuo;
+    const patchPagada = {
+      estado: 'pagado',
+      pagado_at: nowIso,
+      updated_at: nowIso,
+    };
+    const patchPendiente = {
+      estado: 'pendiente',
+      pago_id: null,
+      pagado_at: null,
+      updated_at: nowIso,
+    };
+    const { data: up, error: eUp } = await supabase
+      .from('cuotas')
+      .update((pagada ? patchPagada : patchPendiente) as any)
+      .eq('credito_id', creditoUuid)
+      .eq('nro_cuota', nro)
+      .select('id');
+    if (!eUp && Array.isArray(up) && up.length > 0) algunaActualizada = true;
+  }
+  return algunaActualizada;
+}
+
 /** Días corridos desde el vencimiento de la primera cuota aún impaga (0 si la próxima cuota es futura). */
 function diasSinPagoDesdePrimeraCuotaImpaga(credito: Credito, pagos: PagoRegistro[]): number {
   const planilla = generarPlanillaCredito(credito);
-  const pe = pagosEfectivosCredito(pagos, credito.id);
-  const pend = planilla[pe.length];
+  const ctx = contextoCobroCredito(credito, pagos);
+  const pend = planilla[ctx.cuotasCompletas];
   if (!pend) return 0;
   const vto = String(pend.vencimiento).slice(0, 10);
   if (vto > hoy()) return 0;
@@ -1133,26 +1297,126 @@ function montoCuotaCreditoDesdeTotal(totalCredito: number, cantCuotas: number): 
   return dist[0] ?? 0;
 }
 
+/** Todos los identificadores de la sesión (UUID, email, login, usernameBd, alias). */
+function idsEmparejamientoCobradorSesion(
+  authId: string | null | undefined,
+  username: string | null | undefined,
+  email: string | null | undefined,
+): Set<string> {
+  const perfil = resolverPerfilDesdeAuthEmail(email) || resolverPerfilDesdeEntradaLogin(username);
+  const raw = [
+    ...cobradorIdsParaFiltroSesion({
+      user: { id: authId ?? undefined, email: email ?? undefined },
+    }),
+    ...idsReferenciaPerfil(perfil),
+    String(username ?? '').trim(),
+    String(email ?? '').trim(),
+    perfil?.login,
+    perfil?.usernameBd,
+    perfil?.authEmail,
+  ];
+  const set = new Set<string>();
+  for (const r of raw) {
+    const t = String(r ?? '').trim();
+    if (!t) continue;
+    set.add(t);
+    set.add(t.toLowerCase());
+    const canon = ALIAS_LOGIN_USUARIO[t.toLowerCase()] ?? t.toLowerCase();
+    set.add(canon);
+  }
+  return set;
+}
+
+function cobradorIdCoincideConSesion(
+  rawCobradorId: string | null | undefined,
+  authId: string | null,
+  username: string | null,
+  email: string | null,
+): boolean {
+  const cid = String(rawCobradorId ?? '').trim();
+  if (!cid) return false;
+  const set = idsEmparejamientoCobradorSesion(authId, username, email);
+  const variants = new Set<string>([
+    cid,
+    cid.toLowerCase(),
+    ALIAS_LOGIN_USUARIO[cid.toLowerCase()] ?? cid.toLowerCase(),
+  ]);
+  if (cid.includes('@')) variants.add(normalizarEmail(cid));
+  for (const v of variants) {
+    if (set.has(v) || set.has(v.toLowerCase())) return true;
+  }
+  return false;
+}
+
 function esRegistroDelCobrador(
   p: { cobradorId?: string | null; userId?: string | null },
   authId: string | null,
   username: string | null,
   email: string | null,
 ) {
-  const cid = String(p.cobradorId || p.userId || '').trim();
-  if (!cid) return false;
-  if (authId && cid === authId) return true;
-  if (username && cid === username) return true;
-  if (email && normalizarEmail(cid) === normalizarEmail(email)) return true;
-  return false;
+  return cobradorIdCoincideConSesion(p.cobradorId ?? p.userId, authId, username, email);
 }
 
 function esGastoDelCobrador(g: Gasto, authId: string | null, username: string | null, email: string | null) {
-  const gid = String(g.userId || '').trim();
-  if (authId && gid === authId) return true;
-  if (username && gid === username) return true;
-  if (email && normalizarEmail(gid) === normalizarEmail(email)) return true;
-  return false;
+  return cobradorIdCoincideConSesion(g.userId, authId, username, email);
+}
+
+/** ID estable para guardar en pagos/gastos (prioriza UUID de auth). */
+function cobradorIdCanonicoDesdeSesionActiva(
+  authUserId: string | null | undefined,
+  username: string | null | undefined,
+  loginEmail: string | null | undefined,
+): string {
+  const ids = cobradorIdsParaFiltroSesion({
+    user: { id: authUserId ?? undefined, email: loginEmail ?? undefined },
+  });
+  const uuid = ids.find(x => esUuidClienteId(x));
+  if (uuid) return String(uuid).trim();
+  const perfil = resolverPerfilDesdeAuthEmail(loginEmail) || resolverPerfilDesdeEntradaLogin(username);
+  if (perfil?.login) return perfil.login;
+  return String(username || loginEmail || authUserId || 'sin_usuario').trim();
+}
+
+/** Marcos / admin: no cuenta en recaudación en vivo de campo. */
+function esReferenciaMarcosOAdmin(rawId: string | null | undefined): boolean {
+  const cid = String(rawId ?? '').trim();
+  if (!cid) return false;
+  const lower = cid.toLowerCase();
+  if (['marcos', 'emamoreno7', 'marcosp', 'root', 'admin', 'prueba'].includes(lower)) return true;
+  const email = normalizarEmail(lower);
+  if (['emamoreno7@hotmail.com', 'root@emd.com', 'prueba@emd.com'].includes(email)) return true;
+  const mapped = MAPA_USUARIO_POR_ID[lower];
+  if (mapped) {
+    const r = (mapped.rol || '').toLowerCase();
+    if (r === 'admin' || r === 'root' || r === 'super') return true;
+  }
+  const canon = ALIAS_LOGIN_USUARIO[lower] ?? lower;
+  return canon === 'marcos' || canon === 'root';
+}
+
+/** Cobrador / vendedor en campo (recaudación visible para Marcos sin cierre de caja). */
+function esMovimientoUsuarioCampo(rawId: string | null | undefined): boolean {
+  const cid = String(rawId ?? '').trim();
+  if (!cid || cid === 'sin_usuario' || cid === 'sistema') return false;
+  if (esReferenciaMarcosOAdmin(cid)) return false;
+  const lower = cid.toLowerCase();
+  const canon = ALIAS_LOGIN_USUARIO[lower] ?? lower;
+  if (canon === 'matias' || canon === 'vendedor' || canon === 'cobrador1' || canon === 'cobrador2') return true;
+  const perfilEmail = resolverPerfilDesdeAuthEmail(cid);
+  const perfilLogin = resolverPerfilDesdeEntradaLogin(cid);
+  const perfil = perfilEmail || perfilLogin;
+  if (perfil && (perfil.rolDefecto === 'cobrador' || perfil.rolDefecto === 'vendedor')) return true;
+  const mapped = MAPA_USUARIO_POR_ID[lower];
+  if (mapped) {
+    const r = (mapped.rol || '').toLowerCase();
+    return r === 'cobrador' || r === 'vendedor';
+  }
+  if (esUuidReferenciaUsuario(lower)) return true;
+  if (lower.includes('@') && !lower.includes('marcos') && !lower.includes('emamoreno')) {
+    const pe = resolverPerfilDesdeAuthEmail(lower);
+    if (pe && (pe.rolDefecto === 'cobrador' || pe.rolDefecto === 'vendedor')) return true;
+  }
+  return !lower.includes('marcos') && !lower.includes('emamoreno');
 }
 
 function rendicionEsDelUsuarioActual(c: Cierre, authId: string | null, username: string | null) {
@@ -1522,6 +1786,26 @@ function isAdminOrRoot(rol: string | null | undefined) {
   const v = (rol || '').toLowerCase();
   return ['admin', 'root', 'super'].includes(v);
 }
+
+/** Solo admin/root puede modificar el % de interés al crear o simular créditos. */
+function puedeEditarInteresCredito(rol: string | null | undefined): boolean {
+  return isAdminOrRoot(rol);
+}
+
+function interesAplicadoOficialCredito(
+  tipo: 'M' | 'P',
+  rol: string | null | undefined,
+  config: { interesCreditoM?: number; interesCreditoP?: number },
+  plazoCantidad?: number,
+  configTasasMensual: ConfigTasasMensual = CONFIG_TASAS_MENSUAL_VACIO,
+): number {
+  if (esUsuarioMensualSesion(rol)) {
+    return tasaInteresMensualPorMeses(Math.max(1, Number(plazoCantidad) || 1), configTasasMensual);
+  }
+  if (String(rol || '').toLowerCase() === 'cobrador') return 30;
+  const base = tipo === 'M' ? Number(config.interesCreditoM) : Number(config.interesCreditoP);
+  return Number.isFinite(base) && base > 0 ? base : 30;
+}
 /** Root y super: auditoría y funciones de nivel superior. */
 function isRootLike(rol: string | null | undefined) {
   const v = (rol || '').toLowerCase();
@@ -1670,6 +1954,13 @@ async function incrementarComisionAcumuladaVendedor(vendedorAuthId: string, user
   const usr = await buscarUsuarioVendedorEnBd(vendedorAuthId, usernameHint);
   if (!usr) return;
   const nueva = redondearPesos(Number(usr.comision_acumulada) + monto);
+  await supabase.from('usuarios').update({ comision_acumulada: nueva }).eq('id', usr.id);
+}
+
+async function decrementarComisionAcumuladaVendedor(vendedorAuthId: string, usernameHint: string, monto: number) {
+  const usr = await buscarUsuarioVendedorEnBd(vendedorAuthId, usernameHint);
+  if (!usr) return;
+  const nueva = redondearPesos(Math.max(0, Number(usr.comision_acumulada) - monto));
   await supabase.from('usuarios').update({ comision_acumulada: nueva }).eq('id', usr.id);
 }
 function normalizarEmail(email: string | null | undefined) {
@@ -2233,16 +2524,17 @@ function diasTranscurridosDesdeInicioExclDomingos(fechaInicio: string, hRef: str
  */
 function cuotasDeAtrasoCredito(credito: Credito, pagos: PagoRegistro[], hRef: string): number {
   const planilla = generarPlanillaCredito(credito);
-  const pe = pagosEfectivosCredito(pagos, credito.id);
-  const pendientes = planilla.length - pe.length;
+  const ctx = contextoCobroCredito(credito, pagos);
+  const cuotasCompletas = ctx.cuotasCompletas;
+  const pendientes = planilla.length - cuotasCompletas;
   if (pendientes <= 0) return 0;
   const u = plazoUnidadPlanillaCredito(credito);
   if (u === 'Días') {
     const dias = diasTranscurridosDesdeInicioExclDomingos(fechaBasePlanCuotasCredito(credito), hRef);
-    return Math.max(0, Math.min(dias - pe.length, pendientes));
+    return Math.max(0, Math.min(dias - cuotasCompletas, pendientes));
   }
   let c = 0;
-  for (let i = pe.length; i < planilla.length; i++) {
+  for (let i = cuotasCompletas; i < planilla.length; i++) {
     const vto = String(planilla[i].vencimiento).slice(0, 10);
     if (vto < hRef) c++;
     else break;
@@ -2312,6 +2604,38 @@ function mapSolicitudFondoCredito(row: Record<string, unknown>): SolicitudFondoC
     estado: est === 'fondado' || est === 'cancelado' ? est : 'pendiente',
     fondado_at: row.fondado_at != null ? String(row.fondado_at) : null,
   };
+}
+
+function creditoEstadoPendienteAprobacion(estado: string | null | undefined): boolean {
+  const u = String(estado || '').trim().toUpperCase();
+  return u === 'PENDIENTE' || u === 'PENDIENTE_APROBACION';
+}
+
+/** Solicitud de fondo solo si el crédito sigue pendiente de aprobación (no ACTIVO/FINALIZADO/etc.). */
+function solicitudFondoCreditoVigente(
+  sol: SolicitudFondoCredito,
+  creditos: Credito[],
+): boolean {
+  if (sol.estado !== 'pendiente') return false;
+  const cred = creditos.find(c => fichaIdUuid(c.id) === fichaIdUuid(sol.credito_id));
+  if (!cred) return false;
+  return creditoEstadoPendienteAprobacion(cred.estado);
+}
+
+/** Solo fondos ligados a créditos aún sin aprobar/rechazar (evita solicitudes huérfanas en Caja). */
+function solicitudFondoCreditoVigenteParaAdmin(
+  sol: SolicitudFondoCredito,
+  creditos: Credito[],
+  idsConEgresoPropia: Set<string>,
+): boolean {
+  if (idsConEgresoPropia.has(sol.id)) return false;
+  return solicitudFondoCreditoVigente(sol, creditos);
+}
+
+function solicitudFondoCreditoEsHuerfana(sol: SolicitudFondoCredito, creditos: Credito[]): boolean {
+  if (sol.estado !== 'pendiente') return false;
+  const cred = creditos.find(c => fichaIdUuid(c.id) === fichaIdUuid(sol.credito_id));
+  return !cred || !creditoEstadoPendienteAprobacion(cred.estado);
 }
 
 /** Sin cobranzas ni ingresos previos en caja del cobrador que crea el crédito. */
@@ -2417,15 +2741,15 @@ function resumenCuotasRutaCredito(credito: Credito, pagos: PagoRegistro[]): {
     return { enRuta: false, montoPendienteVtoHastaHoy: 0, tieneAtraso: false, siguienteCuotaNro: null, vencimientoSiguiente: null, cuotasDeAtraso: 0 };
   }
   const planilla = generarPlanillaCredito(credito);
-  const pagosEf = pagosEfectivosCredito(pagos, credito.id);
+  const ctx = contextoCobroCredito(credito, pagos);
   const cuotasTotales = Math.max(1, planilla.length);
-  if (pagosEf.length >= cuotasTotales) {
+  if (ctx.creditoFinalizado || ctx.cuotasCompletas >= cuotasTotales) {
     return { enRuta: false, montoPendienteVtoHastaHoy: 0, tieneAtraso: false, siguienteCuotaNro: null, vencimientoSiguiente: null, cuotasDeAtraso: 0 };
   }
   let monto = 0;
   let tieneAtraso = false;
   let pendientesConVtoHastaHoy = 0;
-  for (let idx = pagosEf.length; idx < planilla.length; idx++) {
+  for (let idx = ctx.cuotasCompletas; idx < planilla.length; idx++) {
     const cuo = planilla[idx];
     const vto = String(cuo.vencimiento).slice(0, 10);
     if (vto <= h) {
@@ -2434,8 +2758,8 @@ function resumenCuotasRutaCredito(credito: Credito, pagos: PagoRegistro[]): {
     }
     if (vto < h) tieneAtraso = true;
   }
-  const next = planilla[pagosEf.length];
-  const siguienteCuotaNro = next != null ? Number(next.nro) : null;
+  const next = planilla[ctx.cuotasCompletas];
+  const siguienteCuotaNro = ctx.cuotaActualNro ?? (next != null ? Number(next.nro) : null);
   const vencimientoSiguiente = next != null ? String(next.vencimiento).slice(0, 10) : null;
   const cuotasDeAtraso = cuotasDeAtrasoCredito(credito, pagos, h);
   return {
@@ -2700,9 +3024,7 @@ function filasHistorialCartonResumen(
 function construirFichaRutaDesdeCredito(credito: Credito, pagos: PagoRegistro[]): Ficha {
   const cuotas = Math.max(1, Number(credito.cuotas ?? credito.plazo_cantidad) || 1);
   const montoTotal = redondearPesos(Number(credito.monto_total ?? credito.total_con_interes) || 0);
-  const pe = pagosEfectivosCredito(pagos, credito.id);
-  const totalPagado = redondearPesos(pe.reduce((s, p) => s + (Number(p.monto) || 0), 0));
-  const saldo = redondearPesos(Math.max(0, montoTotal - totalPagado));
+  const ctx = contextoCobroCredito(credito, pagos);
   const u = plazoUnidadPlanillaCredito(credito);
   const plan_pago: PlanPago = u === 'Días' ? 'Diario' : u === 'Meses' ? 'Mensual' : 'Quincenal';
   return {
@@ -2713,11 +3035,11 @@ function construirFichaRutaDesdeCredito(credito: Credito, pagos: PagoRegistro[])
     precioVenta: montoTotal,
     costo: redondearPesos(Number(credito.monto_solicitado) || 0),
     ganancia: Math.max(0, montoTotal - redondearPesos(Number(credito.monto_solicitado) || 0)),
-    saldo,
+    saldo: ctx.saldoCredito,
     cuotas,
-    cuotasPagas: pe.length,
-    cuotaMonto: montoCuotaCreditoDesdeTotal(montoTotal, cuotas),
-    total_pagado: totalPagado,
+    cuotasPagas: ctx.cuotasCompletas,
+    cuotaMonto: ctx.montoFaltanteCuotaActual > 0 ? ctx.montoFaltanteCuotaActual : ctx.montoCuotaActual,
+    total_pagado: ctx.totalPagado,
     producto: credito.detalle_mercaderia ?? '',
     fecha_inicio: String(credito.fecha_inicio || hoy()),
     fecha: String(credito.fecha_inicio || hoy()),
@@ -3132,6 +3454,7 @@ export default function App() {
   const [subTabRendicion, setSubTabRendicion] = useState<'pendientes' | 'historial'>('pendientes');
   const [sessionReady, setSessionReady] = useState(() => typeof window === 'undefined' || !window.localStorage.getItem('cp_session'));
   const [loading, setLoading] = useState(false);
+  const fetchSeqRef = useRef(0);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [showSplash, setShowSplash] = useState(true);
   const [splashMs, setSplashMs] = useState(0);
@@ -3212,6 +3535,8 @@ export default function App() {
   const [marcosConfigTab, setMarcosConfigTab] = useState<'ajustes' | 'comisiones'>('ajustes');
   const [guardandoPctComisionId, setGuardandoPctComisionId] = useState<string | null>(null);
   const [aprobandoComisionCreditoId, setAprobandoComisionCreditoId] = useState<string | null>(null);
+  const [eliminandoComisionCreditoId, setEliminandoComisionCreditoId] = useState<string | null>(null);
+  const [eliminandoCreditoId, setEliminandoCreditoId] = useState<string | null>(null);
   const [mPlanilla, setMPlanilla] = useState<{ tipo: 'ficha'; ficha: Ficha; cliente: Cliente } | { tipo: 'credito'; credito: Credito; cliente: Cliente | null } | null>(null);
   const [cartonSharePayload, setCartonSharePayload] = useState<CartonSharePayload | null>(null);
   const cartonShareRef = useRef<HTMLDivElement | null>(null);
@@ -3389,8 +3714,10 @@ export default function App() {
     await supabase.from('audit_logs').insert([{ actor: actor || 'sistema', accion, detalle }]);
   }, [user, loginEmail, authUserMeta]);
 
-  const fetchData = useCallback(async (): Promise<{ clientes: Cliente[] } | undefined> => {
-    setLoading(true);
+  const fetchData = useCallback(async (opts?: { silencioso?: boolean }): Promise<{ clientes: Cliente[] } | undefined> => {
+    const seq = ++fetchSeqRef.current;
+    const silencioso = Boolean(opts?.silencioso);
+    if (!silencioso) setLoading(true);
     try {
       const provToken = typeof localStorage !== 'undefined' ? localStorage.getItem(CP_PROVEEDOR_TOKEN_KEY) : null;
       let sesionLocalProveedor = false;
@@ -3481,6 +3808,7 @@ export default function App() {
         setGastos(prev => (Array.isArray(prev) ? prev.filter(g => g && !g.sync) : []));
       }
       if (configErr) console.error('Supabase fetch configuracion error:', configErr);
+      if (seq !== fetchSeqRef.current) return undefined;
       const mappedClientes = Array.isArray(clientesDb)
         ? (clientesDb as Record<string, unknown>[]).map(c => mapClienteFilaSupabase(c))
         : [];
@@ -3526,7 +3854,18 @@ export default function App() {
         .map(c => {
           const pagosCredito = pagosRaw.filter(p => fichaIdUuid(p?.ficha_id ?? p?.fichaId) === fichaIdUuid(c.id));
           const pagosEfectivos = pagosCredito.filter(p => !p?.es_registro_no_pago && redondearPesos(Number(p?.monto) || 0) > 0);
-          const totalPagado = redondearPesos(pagosEfectivos.reduce((s, p) => s + redondearPesos(Number(p?.monto) || 0), 0));
+          const pagosParaCtx: PagoRegistro[] = pagosEfectivos.map(p => ({
+            id: String(p?.id ?? ''),
+            clienteId: String(c.cliente_id ?? ''),
+            fichaId: fichaIdUuid(c.id),
+            fecha: String(p?.fecha_pago ?? p?.fecha ?? hoy()).slice(0, 10),
+            monto: redondearPesos(Number(p?.monto) || 0),
+            dia: 0,
+            tipo: 'completo',
+            fechaPago: p?.fecha_pago ?? p?.fecha,
+            esRegistroNoPago: false,
+          }));
+          const ctxFicha = contextoCobroCredito(c, pagosParaCtx);
           const montoTotal = redondearPesos(Number(c.monto_total ?? c.total_con_interes ?? 0));
           const cuotas = Math.max(1, Number(c.cuotas ?? c.plazo_cantidad) || 1);
           const costoSol = redondearPesos(Number(c.monto_solicitado ?? 0));
@@ -3539,11 +3878,13 @@ export default function App() {
             precioVenta: montoTotal,
             costo: costoSol,
             ganancia: Math.max(0, montoTotal - costoSol),
-            saldo: redondearPesos(Math.max(0, montoTotal - totalPagado)),
+            saldo: ctxFicha.saldoCredito,
             cuotas,
-            cuotasPagas: pagosEfectivos.length,
-            cuotaMonto: cuotas > 0 ? montoCuotaCreditoDesdeTotal(montoTotal, cuotas) : montoTotal,
-            total_pagado: totalPagado,
+            cuotasPagas: ctxFicha.cuotasCompletas,
+            cuotaMonto: ctxFicha.montoFaltanteCuotaActual > 0
+              ? ctxFicha.montoFaltanteCuotaActual
+              : (cuotas > 0 ? montoCuotaCreditoDesdeTotal(montoTotal, cuotas) : montoTotal),
+            total_pagado: ctxFicha.totalPagado,
             producto: c.detalle_mercaderia || `Crédito ${c.plan || ''}`.trim(),
             fecha_inicio: c.fecha_inicio || hoy(),
             fecha: c.fecha_inicio || hoy(),
@@ -3633,8 +3974,21 @@ export default function App() {
         devWarn('Supabase fetch solicitudes_fondo_credito (¿migración 038?):', solFondoErr);
         setSolicitudesFondoCredito([]);
       } else {
+        const mappedSolFondo = (Array.isArray(solFondoDb) ? solFondoDb : []).map(r =>
+          mapSolicitudFondoCredito(r as Record<string, unknown>),
+        );
+        const staleSolIds = mappedSolFondo
+          .filter(s => solicitudFondoCreditoEsHuerfana(s, creditosNormalizados))
+          .map(s => s.id);
+        if (staleSolIds.length > 0) {
+          void supabase
+            .from('solicitudes_fondo_credito')
+            .update({ estado: 'cancelado' })
+            .in('id', staleSolIds)
+            .eq('estado', 'pendiente');
+        }
         setSolicitudesFondoCredito(
-          (Array.isArray(solFondoDb) ? solFondoDb : []).map(r => mapSolicitudFondoCredito(r as Record<string, unknown>)),
+          mappedSolFondo.map(s => (staleSolIds.includes(s.id) ? { ...s, estado: 'cancelado' as const } : s)),
         );
       }
 
@@ -3705,9 +4059,12 @@ export default function App() {
       console.error('fetchData error:', error);
       return undefined;
     } finally {
-      setLoading(false);
+      if (seq === fetchSeqRef.current && !silencioso) setLoading(false);
     }
   }, [rol]);
+
+  /** Refresco en segundo plano (sin pantalla de carga) tras acciones o cambio de pestaña. */
+  const refrescarDatosApp = useCallback(() => fetchData({ silencioso: true }), [fetchData]);
 
   /** Solo tabla `clientes` (sin `setLoading`): refresco inmediato tras un insert; opcionalmente reinyerta la fila del `.single()` si falta en la respuesta. */
   const refetchClientesSupabase = useCallback(async (asegurarIncluido?: Cliente | null): Promise<Cliente[] | undefined> => {
@@ -3761,15 +4118,15 @@ export default function App() {
     for (const credito of creditosOrEmpty) {
       if (!esCreditoActivo(credito)) continue;
       const planilla = generarPlanillaCredito(credito);
-      const pe = pagosEfectivosCredito(pagosOrEmpty, credito.id);
       const tieneNo = new Set(
         pagosOrEmpty
           .filter(p => fichaIdUuid(p.fichaId) === fichaIdUuid(credito.id) && p.esRegistroNoPago && p.cuotaNumero != null)
           .map(p => String(p.cuotaNumero)),
       );
+      const cuotasCompletas = contextoCobroCredito(credito, pagosOrEmpty).cuotasCompletas;
       for (const cuota of planilla) {
         const k = cuota.nro;
-        if (pe.length >= k) continue;
+        if (cuotasCompletas >= k) continue;
         const vto = String(cuota.vencimiento).slice(0, 10);
         if (vto >= hRef) continue;
         if (tieneNo.has(String(k))) continue;
@@ -3792,14 +4149,14 @@ export default function App() {
       if (error) {
         const code = (error as { code?: string }).code;
         if (code === '23505') {
-          await fetchData();
+          await fetchData({ silencioso: true });
           return true;
         }
         devWarn('Sincronizar no_pago automático:', error);
         return false;
       }
     }
-    await fetchData();
+    await fetchData({ silencioso: true });
     return true;
   }, [user, creditosOrEmpty, pagosOrEmpty, fetchData, supabase]);
 
@@ -3836,7 +4193,7 @@ export default function App() {
       alert('Configuración guardada localmente, pero no se pudo guardar en Supabase. ' + (error.message || ''));
       return;
     }
-    await fetchData();
+    await fetchData({ silencioso: true });
   }, [save, audit, fetchData, sistemaBloqueadoTrial]);
 
   useEffect(() => {
@@ -4258,7 +4615,7 @@ export default function App() {
       } catch {
         /* aviso opcional */
       }
-      await fetchData();
+      await fetchData({ silencioso: true });
       await fetchVendedoresComisionAdmin();
       audit('CONFIG_CAMBIO', `Comisión liquidada a ${v.username}: ${fmt(montoTotal)} (corte ${semanaCorte})`);
       alert(`Comisión liquidada: ${fmt(montoTotal)}. El acumulado del vendedor fue reiniciado.`);
@@ -4340,7 +4697,7 @@ export default function App() {
         }]);
       } catch { /* opcional */ }
       audit('CONFIG_CAMBIO', `Comisión aprobada crédito ${cid} — ${fmt(monto)} — ${vendedor.username}`);
-      await fetchData();
+      await fetchData({ silencioso: true });
       await fetchVendedoresComisionAdmin();
     } catch (e) {
       console.error('handleAprobarComisionCredito:', e);
@@ -4350,6 +4707,236 @@ export default function App() {
     }
   }, [
     esMarcosPUsuario, fetchData, fetchVendedoresComisionAdmin, audit,
+  ]);
+
+  const handleEliminarComisionCredito = useCallback(async (credito: Credito, vendedor: VendedorComisionResumen) => {
+    if (!esMarcosPUsuario) return;
+    const cid = fichaIdUuid(credito.id);
+    if (!cid) return;
+    const monto = redondearPesos(Number(credito.comision_vendedor) || 0);
+    if (monto <= 0) {
+      alert('Esta venta no tiene comisión pendiente.');
+      return;
+    }
+    const carton = String(credito.nro_carton || '').trim() || cid.slice(0, 8);
+    const eraAprobada = Boolean(credito.comision_aprobada_admin) && !Boolean(credito.comision_liquidada);
+    const ok = window.confirm(
+      eraAprobada
+        ? `¿Eliminar la comisión de ${fmt(monto)} (${carton}) de ${etiquetaCobradorMovimiento(vendedor.username)}?\n`
+          + 'Se quitará del acumulado a cobrar del vendedor.'
+        : `¿Eliminar la comisión de ${fmt(monto)} (${carton}) de ${etiquetaCobradorMovimiento(vendedor.username)}?\n`
+          + 'El vendedor dejará de verla en «Pendientes de aprobación».',
+    );
+    if (!ok) return;
+    setEliminandoComisionCreditoId(credito.id);
+    try {
+      const { error } = await supabase.from('creditos').update({
+        comision_vendedor: 0,
+        comision_aprobada_admin: false,
+        porcentaje_comision_credito: 0,
+      }).eq('id', cid);
+      if (error) throw error;
+      if (eraAprobada) {
+        await decrementarComisionAcumuladaVendedor(vendedor.id, vendedor.username, monto);
+      }
+      setCreditos(prev => prev.map(c => fichaIdUuid(c.id) === cid
+        ? { ...c, comision_vendedor: 0, comision_aprobada_admin: false, porcentaje_comision_credito: 0 }
+        : c));
+      const emailVendedor = resolverPerfilDesdeEntradaLogin(vendedor.username)?.authEmail
+        ?? `${String(vendedor.username).trim().toLowerCase()}@emd.com`;
+      try {
+        await supabase.from('notificaciones').insert([{
+          titulo: 'Comisión eliminada',
+          mensaje: eraAprobada
+            ? `Marcos eliminó la comisión de ${fmt(monto)} por la venta ${carton}. Ya no figura en tu monto a cobrar.`
+            : `Marcos eliminó la comisión de ${fmt(monto)} por la venta ${carton}. Ya no está pendiente de aprobación.`,
+          destinatario_rol: 'vendedor',
+          destinatario_usuario: normalizarEmail(emailVendedor),
+          leido: false,
+        }]);
+      } catch { /* opcional */ }
+      audit('CONFIG_CAMBIO', `Comisión eliminada crédito ${cid} — ${fmt(monto)} — ${vendedor.username}`);
+      await fetchData({ silencioso: true });
+      await fetchVendedoresComisionAdmin();
+    } catch (e) {
+      console.error('handleEliminarComisionCredito:', e);
+      alert('No se pudo eliminar la comisión. Revisá la conexión o permisos en Supabase.');
+    } finally {
+      setEliminandoComisionCreditoId(null);
+    }
+  }, [
+    esMarcosPUsuario, fetchData, fetchVendedoresComisionAdmin, audit,
+  ]);
+
+  const handleEliminarCreditoCompleto = useCallback(async (credito: Credito) => {
+    if (!esMarcosPUsuario) {
+      alert('Solo el administrador puede eliminar créditos.');
+      return;
+    }
+    const creditoUuid = fichaIdUuid(credito.id);
+    if (!creditoUuid) {
+      alert('Crédito sin identificador válido.');
+      return;
+    }
+    const clienteUuid = normalizarUuidPostgrest(String(credito.cliente_id ?? ''));
+    const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(String(credito.cliente_id ?? '')));
+    const nombreCli = nombreCompletoCliente(cli) || String(credito.cliente_id ?? '').slice(0, 8);
+    const carton = String(credito.nro_carton || '').trim() || creditoUuid.slice(0, 8);
+    const pagosCred = pagosEfectivosCredito(pagosOrEmpty, credito.id);
+    const totalCobrado = redondearPesos(pagosCred.reduce((s, p) => s + (Number(p.monto) || 0), 0));
+    const comision = redondearPesos(Number(credito.comision_vendedor) || 0);
+    const ok = window.confirm(
+      `¿Eliminar el crédito ${carton} de ${nombreCli}?\n\n`
+      + `• Se borrarán cobros (${fmt(totalCobrado)}), cuotas y movimientos de caja vinculados.\n`
+      + `• Se revertirá el saldo del cliente y las comisiones del vendedor si aplican.\n`
+      + `• Si hubo habilitación desde caja propia, se registrará la reversión.\n\n`
+      + 'Esta acción no se puede deshacer.',
+    );
+    if (!ok) return;
+    setEliminandoCreditoId(credito.id);
+    const actor = nombreParaMostrarSesion({
+      loginEmail,
+      usernameState: user,
+      authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+    });
+    try {
+      const { data: pagosDb, error: ePagosSel } = await supabase
+        .from('pagos')
+        .select('id, monto, es_registro_no_pago')
+        .eq('ficha_id', creditoUuid);
+      if (ePagosSel) throw ePagosSel;
+      const totalRevertir = redondearPesos(
+        (pagosDb ?? [])
+          .filter(p => !Boolean((p as { es_registro_no_pago?: boolean }).es_registro_no_pago)
+            && redondearPesos(Number((p as { monto?: number }).monto) || 0) > 0)
+          .reduce((s, p) => s + redondearPesos(Number((p as { monto?: number }).monto) || 0), 0),
+      );
+
+      if (comision > 0 && Boolean(credito.comision_aprobada_admin) && !Boolean(credito.comision_liquidada)) {
+        const vid = String(credito.vendedor_id ?? '').trim();
+        if (vid) await decrementarComisionAcumuladaVendedor(vid, vid.split('@')[0] || vid, comision);
+      }
+
+      const { data: solFondo } = await supabase
+        .from('solicitudes_fondo_credito')
+        .select('id, estado, monto, cobrador_id')
+        .eq('credito_id', creditoUuid)
+        .maybeSingle();
+      if (solFondo && String((solFondo as { estado?: string }).estado ?? '') === 'fondado') {
+        const solId = String((solFondo as { id?: string }).id ?? '');
+        const montoFondo = redondearPesos(Number((solFondo as { monto?: number }).monto) || 0);
+        const { data: propMovs } = await supabase
+          .from('caja_propia_movimientos')
+          .select('id, tipo, monto')
+          .eq('solicitud_fondo_id', solId);
+        for (const m of propMovs ?? []) {
+          const row = m as { id?: string; tipo?: string; monto?: number };
+          if (String(row.tipo) === 'salida' && redondearPesos(Number(row.monto) || 0) > 0) {
+            await supabase.from('caja_propia_movimientos').insert([{
+              tipo: 'entrada',
+              monto: redondearPesos(Number(row.monto) || 0),
+              descripcion: `Reversión eliminación crédito — ${nombreCli}`,
+              nota: `Crédito ${carton} eliminado por admin`,
+              registrado_por: actor || 'Marcos',
+              fecha: hoy(),
+            }]);
+          }
+          if (row.id) {
+            await supabase.from('caja_propia_movimientos').delete().eq('id', row.id);
+          }
+        }
+        if (montoFondo > 0) {
+          devWarn('Eliminar crédito: fondo habilitado revertido en caja propia', { solId, montoFondo });
+        }
+      }
+
+      for (const p of pagosDb ?? []) {
+        const pid = normalizarUuidPostgrest(String((p as { id?: string }).id ?? ''));
+        if (pid) {
+          const { error: eCajaP } = await supabase.from('caja').delete().eq('pago_id', pid);
+          if (eCajaP) devWarn('Eliminar crédito: caja por pago', eCajaP);
+        }
+      }
+      const { error: eCajaF } = await supabase.from('caja').delete().eq('ficha_id', creditoUuid);
+      if (eCajaF) devWarn('Eliminar crédito: caja por ficha', eCajaF);
+
+      const { error: eDelPagos } = await supabase.from('pagos').delete().eq('ficha_id', creditoUuid);
+      if (eDelPagos) throw eDelPagos;
+
+      const { error: eCuotas } = await supabase.from('cuotas').delete().eq('credito_id', creditoUuid);
+      if (eCuotas) devWarn('Eliminar crédito: cuotas', eCuotas);
+
+      if (clienteUuid && totalRevertir > 0) {
+        const { data: cliDb } = await supabase
+          .from('clientes')
+          .select('saldo_pendiente, saldo_debitado, saldo')
+          .eq('id', clienteUuid)
+          .maybeSingle();
+        if (cliDb && typeof cliDb === 'object') {
+          const c = cliDb as Record<string, unknown>;
+          const sp = intPgSaldo(redondearPesos(Number(c.saldo_pendiente ?? 0)) + totalRevertir);
+          const sd = intPgSaldo(Math.max(0, redondearPesos(Number(c.saldo_debitado ?? 0)) - totalRevertir));
+          const sal = intPgSaldo(redondearPesos(Number(c.saldo ?? 0)) + totalRevertir);
+          await supabase.from('clientes').update({
+            saldo_pendiente: sp,
+            saldo_debitado: sd,
+            saldo: sal,
+          } as any).eq('id', clienteUuid);
+        }
+      }
+
+      await supabase.from('solicitudes_fondo_credito').delete().eq('credito_id', creditoUuid);
+
+      const { error: eCred } = await supabase.from('creditos').delete().eq('id', creditoUuid);
+      if (eCred) throw eCred;
+
+      setCreditos(prev => (Array.isArray(prev) ? prev.filter(c => fichaIdUuid(c.id) !== creditoUuid) : prev));
+      setPagos(prev => (Array.isArray(prev)
+        ? prev.filter(p => fichaIdUuid(p.fichaId ?? '') !== creditoUuid)
+        : prev));
+      save({ fichas: fichasOrEmpty.filter(f => fichaIdUuid(f.id) !== creditoUuid) });
+
+      const cobradorEmail = normalizarEmail(String(credito.cobrador_notif_email ?? ''));
+      if (cobradorEmail) {
+        try {
+          await supabase.from('notificaciones').insert([{
+            titulo: 'Crédito eliminado',
+            mensaje: `Marcos eliminó el crédito ${carton} de ${nombreCli}. Los cobros y movimientos de caja de ese crédito fueron revertidos.`,
+            destinatario_rol: 'cobrador',
+            destinatario_usuario: cobradorEmail,
+            leido: false,
+          }]);
+        } catch { /* opcional */ }
+      }
+      const vid = String(credito.vendedor_id ?? '').trim();
+      if (vid) {
+        const perfilV = resolverPerfilDesdeEntradaLogin(vid) || resolverPerfilDesdeAuthEmail(vid);
+        const emailV = perfilV?.authEmail ?? (vid.includes('@') ? vid : `${vid.toLowerCase()}@emd.com`);
+        try {
+          await supabase.from('notificaciones').insert([{
+            titulo: 'Crédito eliminado',
+            mensaje: `Marcos eliminó el crédito ${carton} de ${nombreCli}.${comision > 0 ? ` La comisión asociada (${fmt(comision)}) ya no aplica.` : ''}`,
+            destinatario_rol: 'vendedor',
+            destinatario_usuario: normalizarEmail(emailV),
+            leido: false,
+          }]);
+        } catch { /* opcional */ }
+      }
+
+      audit('CONFIG_CAMBIO', `Crédito eliminado ${creditoUuid} (${carton}) — cobros revertidos ${fmt(totalRevertir)}`);
+      if (mCreditoRevision && fichaIdUuid(mCreditoRevision.id) === creditoUuid) setMCreditoRevision(null);
+      await fetchData({ silencioso: true });
+      if (esMarcosPUsuario) await fetchVendedoresComisionAdmin();
+      alert(`Crédito ${carton} eliminado. Movimientos revertidos.`);
+    } catch (e) {
+      console.error('handleEliminarCreditoCompleto:', e);
+      alert('No se pudo eliminar el crédito. Ejecutá la migración 045 en Supabase si falta permiso de borrado.');
+    } finally {
+      setEliminandoCreditoId(null);
+    }
+  }, [
+    esMarcosPUsuario, clientesOrEmpty, pagosOrEmpty, fichasOrEmpty, loginEmail, user, authUserMeta,
+    mCreditoRevision, fetchData, fetchVendedoresComisionAdmin, audit, save,
   ]);
 
   /** Una vez al día: inserta en Supabase registros $0 de no pago para cuotas vencidas sin cobro efectivo (idempotente con índice único). */
@@ -4365,16 +4952,20 @@ export default function App() {
     return () => clearTimeout(t);
   }, [user, loading, creditosOrEmpty.length, sincronizarNoPagosAutomaticos]);
 
-  /** Al abrir la pestaña Ruta, datos frescos desde Supabase (evita lista obsoleta tras cargas retroactivas / sync). */
+  /** Al cambiar de pestaña, datos frescos sin recargar la página manualmente. */
   useEffect(() => {
-    if (page !== 'ruta' || !user) return;
-    void fetchData();
+    if (!user || page === 'login' || page === 'root_console') return;
+    void fetchData({ silencioso: true });
   }, [page, user, fetchData]);
 
+  /** Marcos: refresco periódico en Caja, inicio y panel (recaudación en vivo). */
   useEffect(() => {
-    if (!user || !esMarcosPUsuario) return;
-    if (page === 'panel_control' || page === 'dashboard') void fetchData();
-  }, [page, user, esMarcosPUsuario, fetchData]);
+    if (!esMarcosPUsuario || !user) return;
+    if (page !== 'cierre_caja' && page !== 'dashboard' && page !== 'panel_control') return;
+    void refrescarDatosApp();
+    const t = window.setInterval(() => { void refrescarDatosApp(); }, 10000);
+    return () => clearInterval(t);
+  }, [esMarcosPUsuario, page, user, refrescarDatosApp]);
 
   /** En Ruta (una vez por visita): insertar no pagos $0 acumulados; índice único evita duplicados. */
   const rutaNoPagoSyncRef = useRef(false);
@@ -4394,15 +4985,18 @@ export default function App() {
     if (!user) return;
     const channel = supabase
       .channel('cp-live-sync')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'pagos' }, () => { void fetchData(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'pagos' }, () => { void fetchData({ silencioso: true }); })
       /** Supabase Realtime: al aprobar/editar créditos el cobrador ve el cambio sin recargar (p. ej. PENDIENTE / PENDIENTE_APROBACION → ACTIVO). */
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'creditos' }, () => { void fetchData(); })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'notificaciones' }, () => { void fetchData(); })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'rendiciones' }, () => { void fetchData(); })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'gastos' }, () => { void fetchData(); })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'caja' }, () => { void fetchData(); })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_fondo_credito' }, () => { void fetchData(); })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'caja_propia_movimientos' }, () => { void fetchData(); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'creditos' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'notificaciones' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'rendiciones' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gastos' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'caja' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_fondo_credito' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'caja_propia_movimientos' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'clientes' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'cheques' }, () => { void fetchData({ silencioso: true }); })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'configuracion' }, () => { void fetchData({ silencioso: true }); })
       .subscribe();
     return () => {
       void supabase.removeChannel(channel);
@@ -4659,13 +5253,19 @@ export default function App() {
         return !usuarioActual || cobrador === usuarioActual;
       });
     const pagosBase = isAdminOrRoot(rol) ? pagosHoyGlobal : pagosHoyUsuario;
-    const totalCobradoHoy = pagosBase
-      .reduce((s: number, p: any) => s + (Number(p?.monto) || 0), 0);
-    const cuotasCobradasHoy = pagosBase.length;
-
     const gastosList = Array.isArray(gastos) ? gastos : [];
+    const recaudacionCampo = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, h);
+    const totalCobradoHoy = isAdminOrRoot(rol)
+      ? recaudacionCampo.ingresosCampoHoy
+      : pagosBase.reduce((s: number, p: any) => s + (Number(p?.monto) || 0), 0);
+    const cuotasCobradasHoy = isAdminOrRoot(rol)
+      ? recaudacionCampo.porUsuarioCampo.reduce((s, u) => s + u.cantCobros, 0)
+      : pagosBase.length;
+
     const gastosHoy = gastosList.filter(g => g && String(g.fecha || '').slice(0, 10) === h);
-    const totalGastosHoy = gastosHoy.reduce((s, g) => s + (Number(g?.monto) || 0), 0);
+    const totalGastosHoy = isAdminOrRoot(rol)
+      ? recaudacionCampo.egresosCampoHoy
+      : gastosHoy.reduce((s, g) => s + (Number(g?.monto) || 0), 0);
 
     const totalACobrarHoy = isAdminOrRoot(rol)
       ? totalACobrarHoyDesdeCreditos(creditosOrEmpty, h)
@@ -4679,7 +5279,9 @@ export default function App() {
       );
 
     const efectividad = efectividadCobroPorMonto(totalCobradoHoy, totalACobrarHoy);
-    const gananciaNeta = totalCobradoHoy - totalGastosHoy;
+    const gananciaNeta = isAdminOrRoot(rol)
+      ? recaudacionCampo.cobradoAcumuladoCampo
+      : totalCobradoHoy - totalGastosHoy;
 
     const promesasCount = clientesOrEmpty.filter(c => c?.promesaFecha === h).length;
 
@@ -4694,6 +5296,7 @@ export default function App() {
       promesasCount,
       clientesConDeuda: clientesConDeuda.length,
       cuotasCobradasHoy,
+      recaudacionCampo: isAdminOrRoot(rol) ? recaudacionCampo : null,
     };
   }, [clientesOrEmpty, gastos, pagosOrEmpty, user, loginEmail, rol, creditosOrEmpty, authUserId]);
   const resumenCobrador = useMemo(() => {
@@ -4733,22 +5336,6 @@ export default function App() {
 
   const cajaCobradorDia = useMemo(() => {
     const h = hoy();
-    if (miRendicionHoy) {
-      const totalCobrado = redondearPesos(Number(miRendicionHoy.totalSistema) || 0);
-      const totalGastos = redondearPesos(Number(miRendicionHoy.totalGastos) || 0);
-      const neto = redondearPesos(
-        Number(miRendicionHoy.netoEntregar) || totalCobrado - totalGastos,
-      );
-      return {
-        totalCobrado,
-        totalGastos,
-        ingresosCaja: 0,
-        salidasCaja: 0,
-        efectivoEnMano: neto,
-        cantGastos: 0,
-        congeladoRendicion: true as const,
-      };
-    }
     const gList = Array.isArray(gastos) ? gastos : [];
     const pagosH = pagosOrEmpty.filter(p => {
       const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
@@ -4767,13 +5354,33 @@ export default function App() {
     const salidasCaja = redondearPesos(
       movsHoy.filter(m => m.tipo === 'salida').reduce((s, m) => s + m.monto, 0),
     );
-    return {
+    const live = {
       totalCobrado,
       totalGastos,
       ingresosCaja,
       salidasCaja,
       efectivoEnMano: redondearPesos(totalCobrado + ingresosCaja - totalGastos - salidasCaja),
       cantGastos: gastosH.length,
+    };
+    /** Solo congelar mientras espera validación de Marcos; si ya fue aceptada, seguir sumando cobros en vivo. */
+    if (miRendicionHoy && !miRendicionHoy.validado) {
+      const totalCobradoCong = redondearPesos(Number(miRendicionHoy.totalSistema) || 0);
+      const totalGastosCong = redondearPesos(Number(miRendicionHoy.totalGastos) || 0);
+      const netoCong = redondearPesos(
+        Number(miRendicionHoy.netoEntregar) || totalCobradoCong - totalGastosCong,
+      );
+      return {
+        totalCobrado: totalCobradoCong,
+        totalGastos: totalGastosCong,
+        ingresosCaja: 0,
+        salidasCaja: 0,
+        efectivoEnMano: netoCong,
+        cantGastos: 0,
+        congeladoRendicion: true as const,
+      };
+    }
+    return {
+      ...live,
       congeladoRendicion: false as const,
     };
   }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy]);
@@ -4842,11 +5449,11 @@ export default function App() {
   const solicitudesFondoPendientesAdmin = useMemo(
     () =>
       esMarcosPUsuario
-        ? solicitudesFondoCredito.filter(
-            s => s.estado === 'pendiente' && !solicitudesFondoIdsConEgresoPropia.has(s.id),
+        ? solicitudesFondoCredito.filter(s =>
+            solicitudFondoCreditoVigenteParaAdmin(s, creditosOrEmpty, solicitudesFondoIdsConEgresoPropia),
           )
         : [],
-    [esMarcosPUsuario, solicitudesFondoCredito, solicitudesFondoIdsConEgresoPropia],
+    [esMarcosPUsuario, solicitudesFondoCredito, solicitudesFondoIdsConEgresoPropia, creditosOrEmpty],
   );
 
   const misSolicitudesFondoCredito = useMemo(() => {
@@ -4862,6 +5469,12 @@ export default function App() {
       );
     });
   }, [solicitudesFondoCredito, loginEmail, authUserId, user]);
+
+  /** Solo solicitudes con crédito aún pendiente de aprobación (oculta huérfanas de $100k, etc.). */
+  const misSolicitudesFondoCreditoVigentes = useMemo(
+    () => misSolicitudesFondoCredito.filter(s => solicitudFondoCreditoVigente(s, creditosOrEmpty)),
+    [misSolicitudesFondoCredito, creditosOrEmpty],
+  );
 
   const cumpleañosHoy = useMemo(() => {
     const ahora = new Date();
@@ -4879,6 +5492,15 @@ export default function App() {
   const resumenCajaMarcosDia = useMemo(() => {
     const h = hoy();
     const corte = cierreCajaMarcosAt;
+    const gastosList = Array.isArray(gastos) ? gastos : [];
+    /** Recaudación en vivo de cobradores/vendedores (hoy, sin esperar cierre de caja). */
+    const {
+      ingresosCampoHoy,
+      egresosCampoHoy,
+      cobradoAcumuladoCampo,
+      porUsuarioCampo,
+    } = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, h);
+
     const pagosH = pagosOrEmpty.filter(p => {
       const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
       return (
@@ -4961,12 +5583,16 @@ export default function App() {
     });
 
     return {
+      ingresosCampoHoy,
+      egresosCampoHoy,
+      cobradoAcumuladoCampo,
       totalCobradoHoy,
       totalGastosHoy,
       totalIngresosCajaHoy,
       totalSalidasCajaHoy,
       totalCajaHoy,
       netoCampoHoy: redondearPesos(totalCobradoHoy - totalGastosHoy),
+      porUsuarioCampo,
       porUsuario: Array.from(porUsuario.values()).sort((a, b) => b.enMano - a.enMano),
       corteActivo: corte,
     };
@@ -5210,7 +5836,7 @@ export default function App() {
         rolUsuario,
       );
       if (!esUsuarioRootOperador(usernameSesion, authUserEmail)) {
-        await fetchData();
+        await fetchData({ silencioso: true });
       }
       audit('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
       await logAuditDb('LOGIN_SUCCESS', `Login exitoso: ${usernameTrim}`);
@@ -5506,7 +6132,7 @@ export default function App() {
       save({ clientes: clientesOrEmpty.map(c => (c.id === cliIdContacto ? merged : c)) });
       audit('CLIENTE_EDITADO', `Cliente contacto actualizado: ${merged.nombre}`, gpsPos || undefined);
       void logAuditDb('CLIENTE_EDITADO', `Cliente contacto actualizado: ${merged.nombre}`);
-      await fetchData();
+      await fetchData({ silencioso: true });
       setMCliente(null);
       return;
     }
@@ -5607,7 +6233,7 @@ export default function App() {
           );
         }
       }
-      await fetchData();
+      await fetchData({ silencioso: true });
       cerrarModalPostGuardado = true;
     } else {
       try {
@@ -5737,7 +6363,7 @@ export default function App() {
             );
           }
         }
-        await fetchData();
+        await fetchData({ silencioso: true });
         setClientes(prev => mergeClienteAlInicioSiFalta(Array.isArray(prev) ? prev : [], nuevoDesdeSupabase));
 
         audit('CLIENTE_CREADO', `Cliente creado: ${nuevo.nombre} (id ${idReal})`, gpsPos || undefined);
@@ -5763,6 +6389,7 @@ export default function App() {
       save({ clientes: clientesOrEmpty.filter(c => c.id !== id), fichas: fichasOrEmpty.filter(f => f.clienteId !== id) });
       audit('CLIENTE_ELIMINADO', `Cliente eliminado ID: ${id}`);
       void logAuditDb('CLIENTE_ELIMINADO', `Cliente eliminado ID: ${id}`);
+      void refrescarDatosApp();
     }
   };
 
@@ -5911,7 +6538,7 @@ export default function App() {
     }
     const saldoAntes = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
     audit('CONFIG_CAMBIO', `Cierre de día Marcos — contadores reiniciados · caja propia ${fmt(saldoAntes)}`);
-    await fetchData();
+    await fetchData({ silencioso: true });
     const saldo = await obtenerSaldoCajaPropiaDesdeDb();
     alert(`Día cerrado. Contadores en $0. Saldo caja propia (acumulado): ${fmt(saldo)}.`);
   }, [esMarcosPUsuario, rendicionesPendientesAdmin, data.config, movimientosCajaPropia, audit, fetchData]);
@@ -5957,7 +6584,7 @@ export default function App() {
           return;
         }
         alert('Ficha actualizada con éxito');
-        await fetchData();
+        await fetchData({ silencioso: true });
       }
     } else {
       // ========== INSERT ==========
@@ -6006,7 +6633,7 @@ export default function App() {
       }
       alert('Ficha creada con éxito');
       audit('FICHA_CREADA', `Ficha creada para ${cli.nombre}: ${fmt(montoTotal)}`, gpsPos || undefined);
-      await fetchData();
+      await fetchData({ silencioso: true });
     }
     // ========== CIERRE DE MODAL (aplica para ambos: INSERT y UPDATE) ==========
     setMFicha(null);
@@ -6019,6 +6646,7 @@ export default function App() {
     }
     if (confirm('Eliminar esta ficha?')) {
       save({ fichas: fichasOrEmpty.filter(f => f.id !== id) });
+      void refrescarDatosApp();
     }
   };
 
@@ -6140,20 +6768,18 @@ export default function App() {
       | { fichaActualizada: Ficha; cuotaNumeroPago: number; pagoDb: Record<string, unknown> }
       | undefined;
     try {
-    const tipo: 'completo' | 'parcial' = montoPago >= redondearPesos(ficha.cuotaMonto) ? 'completo' : 'parcial';
+    const creditoCobroCtx = creditosOrEmpty.find(c => fichaIdUuid(c.id) === fichaIdUuid(ficha.id));
+    const ctxCobro = creditoCobroCtx
+      ? contextoCobroCredito(creditoCobroCtx, pagosOrEmpty)
+      : null;
+    const montoCuotaRef = ctxCobro
+      ? (ctxCobro.montoFaltanteCuotaActual > 0 ? ctxCobro.montoFaltanteCuotaActual : redondearPesos(ficha.cuotaMonto))
+      : redondearPesos(ficha.cuotaMonto);
+    const tipo: 'completo' | 'parcial' = montoPago >= montoCuotaRef ? 'completo' : 'parcial';
     const moraCalc = ficha.Mora;
 
     const fechaPago = new Date().toISOString();
-    const cobradorId = (() => {
-      const raw = localStorage.getItem('cp_session');
-      if (!raw) return user || loginEmail || 'sin_usuario';
-      try {
-        const sesion = JSON.parse(raw) as { id?: string; username?: string; nombre?: string; email?: string };
-        return String(sesion.id || sesion.username || sesion.nombre || sesion.email || user || loginEmail || 'sin_usuario');
-      } catch {
-        return user || loginEmail || 'sin_usuario';
-      }
-    })();
+    const cobradorId = cobradorIdCanonicoDesdeSesionActiva(authUserId, user, loginEmail);
     const nuevoPago = { fecha: fechaPago.slice(0, 10), monto: montoPago, dia: diffDias(hoy(), ficha.fecha), tipo, observaciones, gps };
     const pagosActualizados = [...ficha.pagos, nuevoPago];
     const totalPagado = redondearPesos(Number(ficha.total_pagado ?? 0) + montoPago);
@@ -6165,16 +6791,42 @@ export default function App() {
       MoraActualizada += faltante;
     }
 
-    const cuotasPagas = tipo === 'completo' ? ficha.cuotasPagas + 1 : ficha.cuotasPagas;
+    const cuotasPagasBase = ctxCobro?.cuotasCompletas ?? (ficha.cuotasPagas ?? 0);
+    const cuotasPagas = creditoCobroCtx
+      ? contextoCobroCredito(creditoCobroCtx, [
+        ...pagosEfectivosCredito(pagosOrEmpty, ficha.id),
+        {
+          id: 'sim',
+          clienteId: String(cliente.id ?? ''),
+          fichaId: fichaIdUuid(ficha.id),
+          fecha: fechaPago.slice(0, 10),
+          monto: montoPago,
+          dia: 0,
+          tipo,
+          esRegistroNoPago: false,
+        },
+      ]).cuotasCompletas
+      : (tipo === 'completo' ? cuotasPagasBase + 1 : cuotasPagasBase);
 
     const fichaActualizada: Ficha = {
-      ...ficha, saldo: nuevoSaldo, Mora: MoraActualizada, pagos: pagosActualizados, cuotasPagas, total_pagado: totalPagado,
+      ...ficha,
+      saldo: nuevoSaldo,
+      Mora: MoraActualizada,
+      pagos: pagosActualizados,
+      cuotasPagas,
+      total_pagado: totalPagado,
+      cuotaMonto: ctxCobro && tipo === 'parcial'
+        ? redondearPesos(montoCuotaRef - montoPago)
+        : (ctxCobro?.montoCuotaActual ?? ficha.cuotaMonto),
       estado: nuevoSaldo === 0 ? 'cancelada' : 'activa',
     };
 
     const cobradorTxt = String(cobradorId).trim();
     const cuotasMax = Math.max(1, Number(ficha.cuotas) || 1);
-    const cuotaNumeroPago = Math.min(Math.max(1, (ficha.cuotasPagas ?? 0) + 1), cuotasMax);
+    const cuotaNumeroPago = Math.min(
+      Math.max(1, ctxCobro?.cuotaActualNro ?? (cuotasPagasBase + 1)),
+      cuotasMax,
+    );
     const pagoDb: Record<string, unknown> = {
       ficha_id: fichaIdUuid(ficha.id),
       cliente_id: String(cliente.id ?? '').trim(),
@@ -6189,7 +6841,7 @@ export default function App() {
       cuotaNumeroPago,
       pagoDb: { ...pagoDb, observaciones_local: String(observaciones ?? '').slice(0, 2000) },
     };
-    const creditoCobro = creditosOrEmpty.find(c => fichaIdUuid(c.id) === fichaIdUuid(ficha.id));
+    const creditoCobro = creditoCobroCtx ?? creditosOrEmpty.find(c => fichaIdUuid(c.id) === fichaIdUuid(ficha.id));
     if (creditoCobro) await sincronizarCuotasCreditoSupabase(creditoCobro);
     const insPago = await registrarCobranzaDirectaConReintentos({
       ficha_id: fichaIdUuid(ficha.id),
@@ -6324,7 +6976,7 @@ export default function App() {
       const { error: creditoUpdateError } = await supabase.from('creditos').update({ estado: 'FINALIZADO' } as any).eq('id', fichaIdUuid(ficha.id));
       if (creditoUpdateError) devWarn('No se pudo marcar crédito como FINALIZADO:', creditoUpdateError);
     }
-    await fetchData();
+    await fetchData({ silencioso: true });
     setPagos(prev => {
       const list = Array.isArray(prev) ? prev : [];
       const pid = String(pagoRow.id || '').trim();
@@ -6408,17 +7060,82 @@ export default function App() {
       setRegistrandoPago(false);
     }
   };
-  const handleEliminarPago = ( ficha: Ficha, idx: number ) => {
+  const handleEliminarPago = async (ficha: Ficha, idx: number) => {
     if (!esMarcosPUsuario) {
       alert('Solo el administrador puede eliminar pagos registrados.');
       return;
     }
-    if (!confirm('Eliminar este pago?')) return;
-    const pagosActualizados = ficha.pagos.filter((_, i) => i !== idx);
-    const totalPagado = redondearPesos(pagosActualizados.reduce((s, p) => s + redondearPesos(p.monto), 0));
-    const nuevoSaldo = redondearPesos(Math.max(0, Number(ficha.precioVenta) - totalPagado));
-    save({ fichas: fichasOrEmpty.map(f => f.id === ficha.id ? { ...f, pagos: pagosActualizados, saldo: nuevoSaldo, cuotasPagas: pagosActualizados.filter(p => p.tipo === 'completo').length } : f) });
-    audit('PAGO_ELIMINADO', `Pago eliminado - Ficha ID: ${ficha.id}`);
+    const pagosCred = pagosEfectivosCredito(pagosOrEmpty, ficha.id);
+    const pagoTarget = pagosCred[idx];
+    if (!pagoTarget?.id) {
+      alert('No se encontró el pago en el servidor. Actualizá la pantalla e intentá de nuevo.');
+      return;
+    }
+    const montoElim = redondearPesos(Number(pagoTarget.monto) || 0);
+    if (!confirm(`¿Eliminar este cobro de ${fmt(montoElim)}? Solo el administrador puede revertir cargas sobre créditos.`)) return;
+    const creditoUuid = fichaIdUuid(ficha.id);
+    const clienteUuid = normalizarUuidPostgrest(ficha.clienteId);
+    const pagoId = normalizarUuidPostgrest(pagoTarget.id);
+    if (!creditoUuid || !pagoId) {
+      alert('Datos del pago incompletos para eliminar en servidor.');
+      return;
+    }
+    try {
+      const { error: eCaja } = await supabase.from('caja').delete().eq('pago_id', pagoId);
+      if (eCaja) devWarn('Eliminar pago: caja', eCaja);
+      const { error: ePago } = await supabase.from('pagos').delete().eq('id', pagoId);
+      if (ePago) {
+        alert('No se pudo eliminar el pago en el servidor.');
+        return;
+      }
+      await aplicarEstadoCuotasSegunPagosCredito(creditoUuid);
+      if (clienteUuid) {
+        const { data: cli } = await supabase
+          .from('clientes')
+          .select('saldo_pendiente, saldo_debitado, saldo')
+          .eq('id', clienteUuid)
+          .maybeSingle();
+        if (cli && typeof cli === 'object') {
+          const c = cli as Record<string, unknown>;
+          const sp = intPgSaldo(redondearPesos(Number(c.saldo_pendiente ?? 0)) + montoElim);
+          const sd = intPgSaldo(Math.max(0, redondearPesos(Number(c.saldo_debitado ?? 0)) - montoElim));
+          const sal = intPgSaldo(redondearPesos(Number(c.saldo ?? 0)) + montoElim);
+          await supabase.from('clientes').update({
+            saldo_pendiente: sp,
+            saldo_debitado: sd,
+            saldo: sal,
+          } as any).eq('id', clienteUuid);
+        }
+      }
+      const creditoRef = creditosOrEmpty.find(c => fichaIdUuid(c.id) === creditoUuid);
+      const pagosRestantes = pagosCred.filter((_, i) => i !== idx);
+      const ctxPost = creditoRef
+        ? contextoCobroCredito(creditoRef, pagosRestantes)
+        : null;
+      const pagosActualizados = ficha.pagos.filter((_, i) => i !== idx);
+      const totalPagado = ctxPost?.totalPagado
+        ?? redondearPesos(pagosActualizados.reduce((s, p) => s + redondearPesos(p.monto), 0));
+      const nuevoSaldo = ctxPost?.saldoCredito
+        ?? redondearPesos(Math.max(0, Number(ficha.precioVenta) - totalPagado));
+      save({
+        fichas: fichasOrEmpty.map(f => (f.id === ficha.id
+          ? {
+            ...f,
+            pagos: pagosActualizados,
+            saldo: nuevoSaldo,
+            total_pagado: totalPagado,
+            cuotasPagas: ctxPost?.cuotasCompletas ?? pagosActualizados.filter(p => p.tipo === 'completo').length,
+            cuotaMonto: ctxPost?.montoFaltanteCuotaActual ?? f.cuotaMonto,
+          }
+          : f)),
+      });
+      setPagos(prev => (Array.isArray(prev) ? prev.filter(p => String(p.id) !== String(pagoTarget.id)) : prev));
+      await fetchData({ silencioso: true });
+      audit('PAGO_ELIMINADO', `Pago eliminado (${fmt(montoElim)}) - Crédito: ${ficha.id}`);
+    } catch (err) {
+      devWarn('handleEliminarPago:', err);
+      alert('Error al eliminar el pago. Intentá de nuevo.');
+    }
   };
 
   // ==========================================
@@ -6470,6 +7187,7 @@ export default function App() {
     save({ gastos: [...(Array.isArray(gastos) ? gastos : []), nuevo] });
     audit('GASTO_CREADO', `Gasto registrado: ${fmt(montoG)} - ${g.categoria}`);
     setMGasto(null);
+    void refrescarDatosApp();
   };
 
   const handleDeleteGasto = (id: string) => {
@@ -6477,7 +7195,11 @@ export default function App() {
       alert('Solo el administrador puede eliminar gastos.');
       return;
     }
-    if (confirm('Eliminar gasto?')) { save({ gastos: gastos.filter(g => g.id !== id) }); audit('GASTO_ELIMINADO', `Gasto eliminado ID: ${id}`); }
+    if (confirm('Eliminar gasto?')) {
+      save({ gastos: gastos.filter(g => g.id !== id) });
+      audit('GASTO_ELIMINADO', `Gasto eliminado ID: ${id}`);
+      void refrescarDatosApp();
+    }
   };
 
   const handleCrearProveedor = async () => {
@@ -6672,7 +7394,7 @@ export default function App() {
       setFormMovCajaPropia({ tipo, monto: '', nota: '', fecha: hoy() });
       audit('CONFIG_CAMBIO', `${tipo === 'entrada' ? 'Ingreso' : 'Egreso'} propio caja ${fmt(monto)}`);
       const nuevoSaldo = await obtenerSaldoCajaPropiaDesdeDb();
-      await fetchData();
+      await fetchData({ silencioso: true });
       alert(
         tipo === 'entrada'
           ? `Ingreso propio registrado: ${fmt(monto)}. Saldo caja propia: ${fmt(nuevoSaldo)}.`
@@ -6727,7 +7449,7 @@ export default function App() {
       }]);
       if (error) throw error;
       audit('CONFIG_CAMBIO', `Caja propia en cero — egreso ${fmt(saldoConfirmado)}`);
-      await fetchData();
+      await fetchData({ silencioso: true });
       const saldoFinal = await obtenerSaldoCajaPropiaDesdeDb();
       alert(`Caja propia en $0. Último ajuste: ${fmt(saldoConfirmado)}. Saldo actual: ${fmt(saldoFinal)}.`);
     } catch (e: unknown) {
@@ -6774,7 +7496,7 @@ export default function App() {
         .maybeSingle();
       if (egresoPrevio) {
         alert('Esta solicitud ya tiene un egreso en caja propia. No se duplicó el movimiento.');
-        await fetchData();
+        await fetchData({ silencioso: true });
         return;
       }
 
@@ -6796,7 +7518,7 @@ export default function App() {
       if (claimErr) throw claimErr;
       if (!claimed) {
         alert('Esta solicitud ya fue procesada por otro intento. No se duplicó el egreso.');
-        await fetchData();
+        await fetchData({ silencioso: true });
         return;
       }
 
@@ -6852,7 +7574,7 @@ export default function App() {
         const code = (propErr as { code?: string }).code;
         if (code === '23505') {
           alert('El egreso ya estaba registrado. No se duplicó.');
-          await fetchData();
+          await fetchData({ silencioso: true });
           return;
         }
         throw propErr;
@@ -6868,7 +7590,7 @@ export default function App() {
         });
       }
       audit('CONFIG_CAMBIO', `Egreso caja propia + ingreso cobrador ${fmt(sol.monto)} — ${nombreCli}`);
-      await fetchData();
+      await fetchData({ silencioso: true });
       const saldoFinal = await obtenerSaldoCajaPropiaDesdeDb();
       alert(`Habilitado: ${fmt(sol.monto)} al cobrador para ${nombreCli}. Saldo caja propia: ${fmt(saldoFinal)}.`);
     } catch (e: unknown) {
@@ -6925,19 +7647,29 @@ export default function App() {
     const clienteIdNorm = fichaIdUuid(idClientePlanoStr);
     const cobradorCreditoNorm = String(cobradorId).trim();
     const ambitoCred = ambitoDatosSesion(rol);
-    const totalCred = redondearPesos(Number(payload.total_con_interes));
     const cuotasCred = Math.max(1, Number(payload.plazo_cantidad));
+    const montoSol = redondearPesos(Number(payload.monto_solicitado));
+    const interesOficial = puedeEditarInteresCredito(rol)
+      ? (Number(payload.interes_aplicado) || 30)
+      : interesAplicadoOficialCredito(
+        payload.tipo,
+        rol,
+        data.config,
+        cuotasCred,
+        configTasasMensual,
+      );
+    const totalCred = redondearPesos(montoSol + (montoSol * interesOficial / 100));
     rowCredito = {
       cliente_id: clienteIdNorm,
       tipo: payload.tipo,
-      monto_solicitado: redondearPesos(Number(payload.monto_solicitado)),
+      monto_solicitado: montoSol,
       monto_total: totalCred,
       total_con_interes: totalCred,
       cuotas: cuotasCred,
       plazo_cantidad: cuotasCred,
       plazo_unidad: plazoUnidadSol,
       plan: planEtiquetaSol,
-      interes_aplicado: Number(payload.interes_aplicado) || 30,
+      interes_aplicado: interesOficial,
       detalle_mercaderia: payload.detalle_mercaderia,
       fecha_inicio: fechaInicioNorm,
       cobrador_id: cobradorCreditoNorm ? (fichaIdUuid(cobradorCreditoNorm) || cobradorCreditoNorm) : cobradorCreditoNorm,
@@ -6984,7 +7716,7 @@ export default function App() {
         await sincronizarCuotasCreditoSupabase(creditoCreado, { fechaActivacion: hoy() });
       }
     }
-    const refreshedCred = await fetchData();
+    const refreshedCred = await fetchData({ silencioso: true });
     const listaPostCredito = refreshedCred?.clientes ?? clientesOrEmpty;
     setMCreditoTipo(null);
     const idPlanoCred = String(clienteIdPlano ?? '').trim();
@@ -7107,7 +7839,9 @@ export default function App() {
     const idCredito = fichaIdUuid(credito.id);
     if (estado === 'APROBADO') {
       const solPend = solicitudesFondoCredito.find(
-        s => fichaIdUuid(s.credito_id) === idCredito && s.estado === 'pendiente',
+        s =>
+          fichaIdUuid(s.credito_id) === idCredito
+          && solicitudFondoCreditoVigenteParaAdmin(s, creditosOrEmpty, solicitudesFondoIdsConEgresoPropia),
       );
       if (solPend) {
         alert(
@@ -7149,6 +7883,14 @@ export default function App() {
       void insertarDebugErrorSupabase('handleActualizarEstadoCredito', { idCredito, cambios, credito, error: updCred.error });
       alert('No se pudo actualizar el estado tras varios intentos. El equipo fue notificado para revisión.');
       return;
+    }
+    if (estadoDb === 'RECHAZADO' && idCredito) {
+      const { error: cancelSolErr } = await supabase
+        .from('solicitudes_fondo_credito')
+        .update({ estado: 'cancelado' })
+        .eq('credito_id', idCredito)
+        .eq('estado', 'pendiente');
+      if (cancelSolErr) devWarn('No se pudo cancelar solicitud de fondo al rechazar crédito:', cancelSolErr);
     }
     const updated = updCred.data;
     const notas = String(review?.notas_admin || '').trim();
@@ -7231,7 +7973,7 @@ export default function App() {
         }
       }
     }
-    await fetchData();
+    await fetchData({ silencioso: true });
     if (esMarcosPUsuario) void fetchVendedoresComisionAdmin();
     const emailCobrador = String(credito.cobrador_notif_email ?? '').trim().toLowerCase();
     try {
@@ -7284,17 +8026,11 @@ export default function App() {
   }, []);
   const panelControlStats = useMemo(() => {
     const hoyIso = hoy();
-    const corte = cierreCajaMarcosAt;
-    const pagosHoyEfectivos = pagosOrEmpty.filter(p => {
-      const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
-      return (
-        fd === hoyIso
-        && esPagoEfectivo(p)
-        && perteneceContadorMarcosActivo(fd, p.fechaPago ?? (p as { timestamp?: number }).timestamp, corte)
-      );
-    });
-    const cobradoHoy = pagosHoyEfectivos
-      .reduce((acc, p) => acc + (Number(p.monto) || 0), 0);
+    const gastosList = Array.isArray(gastos) ? gastos : [];
+    const recaudacionCampo = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, hoyIso);
+    const cobradoHoy = recaudacionCampo.ingresosCampoHoy;
+    const gastosCampoHoy = recaudacionCampo.egresosCampoHoy;
+    const netoCampoHoy = recaudacionCampo.cobradoAcumuladoCampo;
     const capitalCalle = clientesOrEmpty.reduce((acc, c) => acc + Math.max(0, Number(c.saldo) || 0), 0);
     const totalClientes = clientesOrEmpty.filter(c => c.activo !== false).length || 1;
     const clientesRojo = creditosOrEmpty.filter(c => getDiasAtrasoCredito(c) > 5).length;
@@ -7321,19 +8057,11 @@ export default function App() {
       cobradores.set(cobrador, actual);
       return actual;
     };
-    pagosHoyEfectivos.forEach(p => {
-      const item = ensure(String(p.cobradorId ?? p.userId ?? 'sin_usuario').trim());
-      item.totalCobrado += Number(p.monto) || 0;
+    recaudacionCampo.porUsuarioCampo.forEach(u => {
+      const item = ensure(u.cobrador);
+      item.totalCobrado = u.cobrado;
+      item.gastos = u.gastos;
     });
-    (Array.isArray(gastos) ? gastos : [])
-      .filter(g => {
-        const fd = String(g?.fecha || '').slice(0, 10);
-        return g && fd === hoyIso && perteneceContadorMarcosActivo(fd, g.timestamp, corte);
-      })
-      .forEach(g => {
-        const item = ensure(String(g?.userId || 'sin_usuario').trim());
-        item.gastos += Number(g?.monto) || 0;
-      });
     creditosOrEmpty
       .filter(c => esCreditoActivo(c))
       .forEach(c => {
@@ -7349,8 +8077,18 @@ export default function App() {
       }))
       .sort((a, b) => b.totalCobrado - a.totalCobrado);
 
-    return { cobradoHoy, capitalCalle, indiceMora, totalACobrarHoy, efectividad, porCobrador };
-  }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito, cierreCajaMarcosAt]);
+    return {
+      cobradoHoy,
+      gastosCampoHoy,
+      netoCampoHoy,
+      capitalCalle,
+      indiceMora,
+      totalACobrarHoy,
+      efectividad,
+      porCobrador,
+      porUsuarioCampo: recaudacionCampo.porUsuarioCampo,
+    };
+  }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito]);
 
   const feedMovimientosControl = useMemo((): FilaMovimientoControl[] => {
     const filas: FilaMovimientoControl[] = [];
@@ -7625,7 +8363,7 @@ export default function App() {
       alert('No se pudo guardar en el servidor. Cierre guardado solo en este dispositivo; sincronizá cuando la tabla rendiciones esté disponible.');
     } else {
       cierre = mapRowRendicionDb(inserted as Record<string, unknown>);
-      await fetchData();
+      await fetchData({ silencioso: true });
     }
 
     audit(
@@ -7704,7 +8442,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         .maybeSingle();
       if (propiaPrev) {
         alert('Esta rendición ya fue recepcionada en caja propia.');
-        await fetchData();
+        await fetchData({ silencioso: true });
         return;
       }
 
@@ -7723,7 +8461,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
       if (claimErr) throw claimErr;
       if (!claimed) {
         alert('La rendición ya fue procesada por otro intento.');
-        await fetchData();
+        await fetchData({ silencioso: true });
         return;
       }
 
@@ -7755,7 +8493,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         'RENDICION_ACEPTADA',
         `Rendición ${c.id} — ${etiquetaCob} — ${fmt(neto)} ingresa a caja propia`,
       );
-      await fetchData();
+      await fetchData({ silencioso: true });
       alert(`Rendición aceptada. ${fmt(neto)} ingresó a caja propia. ${etiquetaCob} queda liberado tras las 00:00.`);
     } catch (e: unknown) {
       console.error('handleAceptarRendicion:', e);
@@ -8228,6 +8966,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
     if (esUsuarioMensualUsuario && !PAGINAS_MODULO_MENSUAL.has(p)) return;
     if (p !== 'creditos') limpiarDeepLinkCredito();
     setPage(p); setSwiped(null); setSearch(''); setFilterStatus('all');
+    if (user && p !== 'login' && p !== 'root_console') void refrescarDatosApp();
   };
   const irAClientesParaCobro = () => {
     limpiarDeepLinkCredito();
@@ -8422,11 +9161,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             </button>
           </div>
         )}
-        {misSolicitudesFondoCredito.some(s => s.estado === 'pendiente') && (
+        {misSolicitudesFondoCreditoVigentes.length > 0 && (
           <div className="mb-4 rounded-2xl border border-amber-500/35 bg-amber-950/40 px-4 py-3 text-sm text-amber-100">
             <p className="font-semibold text-amber-200">Solicitud de fondo en caja</p>
             <p className="mt-1 text-xs leading-relaxed">
-              {misSolicitudesFondoCredito.filter(s => s.estado === 'pendiente').map(s => {
+              {misSolicitudesFondoCreditoVigentes.map(s => {
                 const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(s.cliente_id));
                 return `Esperando que Marcos ingrese ${fmt(s.monto)} para el crédito de ${nombreCompletoCliente(cli) || 'cliente'}.`;
               }).join(' ')}
@@ -8517,9 +9256,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 <div className="grid grid-cols-2 gap-3">
                   {[
                     { label: 'En Mora', valor: kpis.moraClientes, icon: '🚩', color: 'from-red-500/20 to-red-600/10 border-red-500/30', textColor: 'text-red-400', onClick: () => { setFilterStatus('mora'); go('clientes'); } },
-                    { label: 'Cobrado Hoy', valor: fmt(kpis.totalCobradoHoy), icon: '💵', color: 'from-green-500/20 to-green-600/10 border-green-500/30', textColor: 'text-green-400', onClick: () => {} },
-                    { label: 'Total a cobrar hoy', valor: fmt(kpis.totalACobrarHoy), icon: '📋', color: 'from-orange-500/20 to-orange-600/10 border-orange-500/30', textColor: 'text-orange-400', onClick: () => go('panel_control') },
-                    { label: 'Efectividad', valor: `${kpis.efectividad.toFixed(0)}%`, icon: '📊', color: 'from-blue-500/20 to-blue-600/10 border-blue-500/30', textColor: 'text-blue-400', onClick: () => {} },
+                    { label: 'Ingresos campo', valor: fmt(kpis.totalCobradoHoy), icon: '💵', color: 'from-green-500/20 to-green-600/10 border-green-500/30', textColor: 'text-green-400', onClick: () => go('panel_control') },
+                    { label: 'Egresos campo', valor: fmt(kpis.totalGastosHoy), icon: '📤', color: 'from-orange-500/20 to-orange-600/10 border-orange-500/30', textColor: 'text-orange-400', onClick: () => go('panel_control') },
+                    { label: 'Cobrado acumulado', valor: fmt(kpis.gananciaNeta), icon: '📊', color: 'from-amber-500/20 to-amber-600/10 border-amber-500/30', textColor: 'text-amber-300', onClick: () => go('cierre_caja') },
+                    { label: 'Total a cobrar hoy', valor: fmt(kpis.totalACobrarHoy), icon: '📋', color: 'from-indigo-500/20 to-indigo-600/10 border-indigo-500/30', textColor: 'text-indigo-300', onClick: () => go('panel_control') },
+                    { label: 'Efectividad', valor: `${kpis.efectividad.toFixed(0)}%`, icon: '🎯', color: 'from-blue-500/20 to-blue-600/10 border-blue-500/30', textColor: 'text-blue-400', onClick: () => {} },
                   ].map((k, i) => (
                     <button key={i} onClick={k.onClick} className={`bg-gradient-to-br ${k.color} border rounded-2xl p-4 text-left active:scale-95 transition-all`}>
                       <div className="flex items-start justify-between">
@@ -8530,6 +9271,19 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     </button>
                   ))}
                 </div>
+                {kpis.recaudacionCampo && kpis.recaudacionCampo.porUsuarioCampo.length > 0 && (
+                  <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-2">
+                    <p className="text-xs font-semibold text-gray-300">Recaudación en vivo por usuario (campo)</p>
+                    {kpis.recaudacionCampo.porUsuarioCampo.map(u => (
+                      <div key={u.cobrador} className="flex items-center justify-between gap-2 rounded-xl bg-gray-800/50 px-3 py-2 text-xs">
+                        <span className="text-gray-300 truncate">{etiquetaCobradorMovimiento(u.cobrador)}</span>
+                        <span className="shrink-0 text-emerald-400 font-semibold">+{fmt(u.cobrado)}</span>
+                        <span className="shrink-0 text-orange-400">−{fmt(u.gastos)}</span>
+                        <span className={`shrink-0 font-bold ${u.neto < 0 ? 'text-red-400' : 'text-amber-300'}`}>{fmt(u.neto)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </SectionErrorBoundary>
             )}
 
@@ -8565,7 +9319,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               </div>
             </div>
 
-            <CalculadoraPlanesCredito />
+            <CalculadoraPlanesCredito puedeEditarTasa={puedeEditarInteresCredito(rol)} tasaFija={data.config.interesCreditoP ?? 30} />
 
             {/* Quick Actions */}
             <div className="grid grid-cols-2 gap-3">
@@ -8610,7 +9364,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 </div>
                 <button
                   type="button"
-                  onClick={() => { setFiltroPendientesCredito('pendientes'); go('creditos'); void fetchData(); }}
+                  onClick={() => { setFiltroPendientesCredito('pendientes'); go('creditos'); }}
                   className="mt-3 w-full bg-violet-600/40 border border-violet-400/30 text-violet-100 rounded-xl py-2 text-sm font-semibold active:scale-95 transition"
                 >
                   Ver solicitudes
@@ -8691,8 +9445,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     {esperandoValidacionRendicion && (
                       <p className="font-semibold">⏳ Esperando validación del administrador. No podés registrar cobros hasta que acepte la rendición.</p>
                     )}
-                    {jornadaCerradaValidadaHoy && (
+                    {jornadaCerradaValidadaHoy && cobradorBloqueadoCobros && (
                       <p className="font-semibold">✅ Rendición aceptada. Nueva jornada a partir de las 00:00. No podés registrar cobros hasta entonces.</p>
+                    )}
+                    {jornadaCerradaValidadaHoy && esUsuarioVendedorSesion && (
+                      <p className="font-semibold">✅ Rendición aceptada. Como vendedor podés seguir cobrando hoy; los montos se suman en «Efectivo en mano».</p>
                     )}
                   </div>
                 )}
@@ -8743,16 +9500,21 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     <p className="text-amber-100/60 text-xs mt-1">El administrador debe aceptarla para liberar tu próxima jornada.</p>
                   </div>
                 )}
-                {jornadaCerradaValidadaHoy && (
+                {jornadaCerradaValidadaHoy && cobradorBloqueadoCobros && (
                   <div className="bg-sky-500/10 border border-sky-500/35 rounded-2xl p-4 text-center">
                     <p className="text-sky-200 font-semibold text-sm">Jornada cerrada y rendición aceptada</p>
                     <p className="text-sky-100/60 text-xs mt-1">Mañana a las 00:00 podés volver a cobrar.</p>
                   </div>
                 )}
+                {jornadaCerradaValidadaHoy && esUsuarioVendedorSesion && (
+                  <div className="bg-sky-500/10 border border-sky-500/35 rounded-2xl p-4 text-center">
+                    <p className="text-sky-200 font-semibold text-sm">Rendición de cobrador cerrada hoy</p>
+                    <p className="text-sky-100/60 text-xs mt-1">Tus cobros de vendedor siguen acumulándose en efectivo en mano.</p>
+                  </div>
+                )}
               </div>
             )}
 
-            <DashboardLogsSistema esMarcosP={esMarcosPUsuario} />
             {esMarcosPUsuario && (
               <div className="rounded-2xl border border-amber-500/40 bg-amber-950/40 p-4 space-y-2">
                 <p className="text-sm font-bold text-amber-100">Limpiar cola offline de cobros</p>
@@ -8776,7 +9538,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     setForzandoSubidaCobrosLocales(true);
                     try {
                       const r = await ejecutarSubidaManualCobrosLocalesDesdeLs();
-                      await fetchData();
+                      await fetchData({ silencioso: true });
                       setBannerCobroRed(siguienteMensajeBannerColaCobrosPendientes());
                       const muestraErrores = r.erroresDetalle.slice(0, 5).join('\n');
                       alert(
@@ -9031,8 +9793,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <h2 className="text-lg font-bold">🧾 Caja y movimientos</h2>
-                <p className="text-xs text-gray-400">Recaudación del día, gastos de campo y caja propia para habilitar créditos.</p>
+                <h2 className="text-lg font-bold">🧾 Caja</h2>
+                <p className="text-xs text-gray-400">Recaudación en vivo de cobradores/vendedores (sin esperar cierre de caja).</p>
               </div>
               <button
                 type="button"
@@ -9045,113 +9807,100 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
 
             <div className="grid grid-cols-3 gap-2">
               <div className="bg-gray-900/60 border border-emerald-500/35 rounded-2xl p-3">
-                <p className="text-[10px] text-gray-400 leading-tight">Total cobrado hoy</p>
-                <p className="text-lg font-black text-emerald-400 mt-1">{fmt(resumenCajaMarcosDia.totalCobradoHoy)}</p>
+                <p className="text-[10px] text-gray-400 leading-tight">Ingresos (cobros campo)</p>
+                <p className="text-lg font-black text-emerald-400 mt-1">{fmt(resumenCajaMarcosDia.ingresosCampoHoy)}</p>
               </div>
               <div className="bg-gray-900/60 border border-orange-500/35 rounded-2xl p-3">
-                <p className="text-[10px] text-gray-400 leading-tight">Total gastos hoy</p>
-                <p className="text-lg font-black text-orange-400 mt-1">{fmt(resumenCajaMarcosDia.totalGastosHoy)}</p>
+                <p className="text-[10px] text-gray-400 leading-tight">Egresos (gastos campo)</p>
+                <p className="text-lg font-black text-orange-400 mt-1">{fmt(resumenCajaMarcosDia.egresosCampoHoy)}</p>
               </div>
-              <div className="bg-gray-900/60 border border-sky-500/35 rounded-2xl p-3">
-                <p className="text-[10px] text-gray-400 leading-tight">Total Caja</p>
-                <p className="text-lg font-black text-sky-300 mt-1">{fmt(resumenCajaMarcosDia.totalCajaHoy)}</p>
+              <div className="bg-gray-900/60 border border-amber-500/35 rounded-2xl p-3">
+                <p className="text-[10px] text-gray-400 leading-tight">Cobrado acumulado</p>
+                <p className={`text-lg font-black mt-1 ${resumenCajaMarcosDia.cobradoAcumuladoCampo < 0 ? 'text-red-400' : 'text-amber-300'}`}>
+                  {fmt(resumenCajaMarcosDia.cobradoAcumuladoCampo)}
+                </p>
               </div>
             </div>
             <p className="text-[11px] text-gray-500 text-center">
-              Efectivo líquido en campo (cobrado + ingresos caja − gastos − salidas caja).
-              {resumenCajaMarcosDia.corteActivo && (
-                <span className="block mt-1 text-violet-300/80">
-                  Último cierre de día: {new Date(resumenCajaMarcosDia.corteActivo).toLocaleString('es-AR')}
-                </span>
-              )}
+              Actualización automática cada 10 s y al registrar cobros/gastos en ruta.
             </p>
 
             <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-3">
-              <h3 className="font-bold text-sm text-gray-300">Movimientos por usuario (hoy)</h3>
-              {resumenCajaMarcosDia.porUsuario.length === 0 && (
-                <p className="text-sm text-gray-500">Sin cobros ni gastos registrados hoy.</p>
+              <h3 className="font-bold text-sm text-gray-300">Recaudación por usuario (hoy, en vivo)</h3>
+              {resumenCajaMarcosDia.porUsuarioCampo.length === 0 && (
+                <p className="text-sm text-gray-500">Sin cobros ni gastos de cobradores/vendedores hoy.</p>
               )}
-              {resumenCajaMarcosDia.porUsuario.map(u => (
-                <div key={u.cobrador} className="bg-gray-800/60 rounded-xl p-3 space-y-2">
-                  <p className="font-semibold text-sm text-white">{etiquetaCobradorMovimiento(u.cobrador)}</p>
+              {resumenCajaMarcosDia.porUsuarioCampo.map(u => (
+                <div key={u.cobrador} className="bg-gray-800/60 rounded-xl p-3">
+                  <p className="font-semibold text-sm text-white mb-2">{etiquetaCobradorMovimiento(u.cobrador)}</p>
                   <div className="grid grid-cols-3 gap-2 text-sm">
                     <div className="rounded-lg bg-green-950/40 border border-green-500/25 px-2 py-1.5">
-                      <p className="text-[10px] text-green-300/80 uppercase">Cobrado</p>
+                      <p className="text-[10px] text-green-300/80 uppercase">Ingresos</p>
                       <p className="font-bold text-green-400">{fmt(u.cobrado)}</p>
-                      <p className="text-[10px] text-gray-500">{u.cantCobros} cobro/s</p>
                     </div>
                     <div className="rounded-lg bg-orange-950/40 border border-orange-500/25 px-2 py-1.5">
-                      <p className="text-[10px] text-orange-300/80 uppercase">Gastos</p>
+                      <p className="text-[10px] text-orange-300/80 uppercase">Egresos</p>
                       <p className="font-bold text-orange-400">{fmt(u.gastos)}</p>
-                      <p className="text-[10px] text-gray-500">{u.cantGastos} gasto/s</p>
                     </div>
-                    <div className="rounded-lg bg-sky-950/40 border border-sky-500/25 px-2 py-1.5">
-                      <p className="text-[10px] text-sky-300/80 uppercase">En mano</p>
-                      <p className="font-bold text-sky-300">{fmt(u.enMano)}</p>
-                      <p className="text-[10px] text-gray-500">líquido hoy</p>
+                    <div className="rounded-lg bg-amber-950/40 border border-amber-500/25 px-2 py-1.5">
+                      <p className="text-[10px] text-amber-300/80 uppercase">Neto</p>
+                      <p className={`font-bold ${u.neto < 0 ? 'text-red-400' : 'text-amber-300'}`}>{fmt(u.neto)}</p>
                     </div>
                   </div>
                 </div>
               ))}
             </div>
+            {resumenCajaMarcosDia.corteActivo && (
+              <p className="text-[11px] text-violet-300/80 text-center">
+                Último cierre de día Marcos: {new Date(resumenCajaMarcosDia.corteActivo).toLocaleString('es-AR')}
+              </p>
+            )}
+
+            <div className="bg-gradient-to-br from-sky-950/70 via-gray-900/80 to-violet-950/50 border-2 border-sky-400/45 rounded-2xl p-6 text-center shadow-lg shadow-sky-900/20">
+              <p className="text-sm text-sky-200/90 font-semibold tracking-wide uppercase">Total Caja</p>
+              <p className={`text-4xl font-black mt-2 ${resumenCajaPropia.saldo < 0 ? 'text-red-400' : 'text-sky-100'}`}>
+                {fmt(resumenCajaPropia.saldo)}
+              </p>
+              <p className="text-[11px] text-gray-400 mt-2">Saldo disponible en caja propia</p>
+            </div>
 
             <div className="bg-gray-900/60 border border-violet-500/40 rounded-2xl p-4 space-y-4">
-              <div>
-                <h3 className="font-bold text-sm text-violet-200">🏦 Caja propia</h3>
-                <p className="text-xs text-gray-400 mt-1">
-                  Capital propio: ingresos, egresos parciales o dejar en $0 de un clic. Sin proveedor, usuarios ni comisiones.
-                </p>
-              </div>
-              <div className="grid grid-cols-3 gap-2 text-center">
-                <div className="rounded-xl bg-violet-950/50 border border-violet-500/30 p-2">
-                  <p className="text-[10px] text-gray-400">Saldo disponible</p>
-                  <p className={`text-lg font-black ${resumenCajaPropia.saldo < 0 ? 'text-red-400' : 'text-violet-200'}`}>
-                    {fmt(resumenCajaPropia.saldo)}
-                  </p>
-                </div>
-                <div className="rounded-xl bg-green-950/30 border border-green-500/20 p-2">
-                  <p className="text-[10px] text-gray-400">Ingresos hoy</p>
-                  <p className="text-sm font-bold text-green-400">+{fmt(resumenCajaPropia.ingresosHoy)}</p>
-                </div>
-                <div className="rounded-xl bg-orange-950/30 border border-orange-500/20 p-2">
-                  <p className="text-[10px] text-gray-400">Egresos hoy</p>
-                  <p className="text-sm font-bold text-orange-400">−{fmt(resumenCajaPropia.egresosHoy)}</p>
-                </div>
-              </div>
-              {resumenCajaPropia.saldo < 0 && (
-                <p className="text-[11px] text-red-300 bg-red-950/40 border border-red-500/30 rounded-xl px-3 py-2">
-                  El saldo no debería ser negativo. Si hubo un doble egreso, eliminá el movimiento duplicado en Supabase (tabla caja_propia_movimientos) y recargá.
-                </p>
-              )}
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
-                  onClick={() => setFormMovCajaPropia(f => ({ ...f, tipo: 'entrada' }))}
-                  className={`rounded-xl py-2.5 text-sm font-bold border transition ${
+                  onClick={() => setFormMovCajaPropia(f => ({ ...f, tipo: 'entrada', monto: '' }))}
+                  className={`rounded-xl py-3 text-xs sm:text-sm font-bold border transition ${
                     formMovCajaPropia.tipo === 'entrada'
                       ? 'bg-green-600/90 border-green-400 text-white'
                       : 'bg-gray-800 border-gray-700 text-gray-400'
                   }`}
                 >
-                  Ingreso propio
+                  Ingreso de Caja
                 </button>
                 <button
                   type="button"
-                  onClick={() => setFormMovCajaPropia(f => ({ ...f, tipo: 'salida' }))}
-                  className={`rounded-xl py-2.5 text-sm font-bold border transition ${
+                  onClick={() => setFormMovCajaPropia(f => ({ ...f, tipo: 'salida', monto: '' }))}
+                  className={`rounded-xl py-3 text-xs sm:text-sm font-bold border transition ${
                     formMovCajaPropia.tipo === 'salida'
                       ? 'bg-orange-600/90 border-orange-400 text-white'
                       : 'bg-gray-800 border-gray-700 text-gray-400'
                   }`}
                 >
-                  Egreso propio
+                  Egreso de Caja
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    guardandoBorrarCajaPropia ||
+                    guardandoMovCajaPropia ||
+                    resumenCajaPropia.saldo <= 0
+                  }
+                  onClick={() => void handleDejarCajaPropiaEnCero()}
+                  className="rounded-xl py-3 text-xs sm:text-sm font-bold border border-red-500/50 bg-red-950/50 hover:bg-red-950/70 text-red-200 disabled:opacity-50 active:scale-95 transition"
+                >
+                  {guardandoBorrarCajaPropia ? 'Caja a $0…' : 'Caja a $0'}
                 </button>
               </div>
-              {formMovCajaPropia.tipo === 'salida' && (
-                <p className="text-[11px] text-orange-200/80">
-                  Egreso parcial: retirá solo el monto que indiques. Saldo actual: {fmt(resumenCajaPropia.saldo)}.
-                </p>
-              )}
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="text-xs text-gray-400 block mb-1">
@@ -9180,11 +9929,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 value={formMovCajaPropia.nota}
                 onChange={e => setFormMovCajaPropia(f => ({ ...f, nota: e.target.value }))}
                 className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white"
-                placeholder={
-                  formMovCajaPropia.tipo === 'entrada'
-                    ? 'Nota opcional (origen del capital, referencia…)'
-                    : 'Nota opcional (motivo del retiro, destino del efectivo…)'
-                }
+                placeholder="Nota opcional"
               />
               <button
                 type="button"
@@ -9202,61 +9947,20 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 {guardandoMovCajaPropia
                   ? 'Registrando…'
                   : formMovCajaPropia.tipo === 'entrada'
-                    ? 'Registrar ingreso propio'
-                    : 'Registrar egreso propio'}
+                    ? 'Registrar ingreso de caja'
+                    : 'Registrar egreso de caja'}
               </button>
-              <button
-                type="button"
-                disabled={
-                  guardandoBorrarCajaPropia ||
-                  guardandoMovCajaPropia ||
-                  resumenCajaPropia.saldo <= 0
-                }
-                onClick={() => void handleDejarCajaPropiaEnCero()}
-                className="w-full disabled:opacity-50 border border-red-500/40 bg-red-950/40 hover:bg-red-950/60 text-red-200 rounded-xl py-2.5 text-sm font-bold active:scale-95 transition"
-              >
-                {guardandoBorrarCajaPropia
-                  ? 'Dejando en $0…'
-                  : resumenCajaPropia.saldo > 0
-                    ? `Dejar caja en $0 (${fmt(resumenCajaPropia.saldo)})`
-                    : 'Caja ya en $0'}
-              </button>
-              <p className="text-[10px] text-gray-500 text-center">
-                «Dejar en $0» egresa todo el saldo de una vez. «Egreso propio» es para montos parciales.
-              </p>
-              <div className="max-h-52 overflow-y-auto space-y-1.5 border-t border-gray-800 pt-3">
-                <p className="text-xs text-gray-500 font-semibold sticky top-0 bg-gray-900/95 py-1">Historial caja propia</p>
-                {resumenCajaPropia.movimientos.length === 0 && (
-                  <p className="text-xs text-gray-500 py-2">Sin movimientos aún.</p>
-                )}
-                {resumenCajaPropia.movimientos.map(m => (
-                  <div
-                    key={m.id}
-                    className={`flex justify-between gap-2 rounded-lg px-2 py-1.5 text-xs ${
-                      m.tipo === 'entrada' ? 'bg-green-950/25 text-green-100' : 'bg-orange-950/25 text-orange-100'
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <p className="font-medium truncate">{m.descripcion}</p>
-                      <p className="text-[10px] opacity-70">{m.fecha} · {m.registradoPor || '—'}</p>
-                    </div>
-                    <p className="shrink-0 font-bold">{m.tipo === 'entrada' ? '+' : '−'}{fmt(m.monto)}</p>
-                  </div>
-                ))}
-              </div>
             </div>
 
+            {solicitudesFondoPendientesAdmin.length > 0 && (
             <div className="bg-gray-900/60 border border-amber-500/40 rounded-2xl p-4 space-y-3">
               <div>
                 <h3 className="font-bold text-sm text-amber-200">💰 Habilitar créditos (desde caja propia)</h3>
                 <p className="text-xs text-gray-400 mt-1">
-                  Solicitudes de cobradores sin recaudado previo. Al confirmar, egresa de caja propia e ingresa al cobrador para el cliente indicado.
+                  Créditos pendientes de aprobación sin recaudado previo. Al confirmar, egresa de caja propia e ingresa al cobrador.
                 </p>
                 <p className="text-xs text-violet-300/90 mt-2">Saldo caja propia: <strong>{fmt(resumenCajaPropia.saldo)}</strong></p>
               </div>
-              {solicitudesFondoPendientesAdmin.length === 0 && (
-                <p className="text-sm text-gray-500">No hay solicitudes de ingreso pendientes.</p>
-              )}
               {solicitudesFondoPendientesAdmin.map(sol => {
                 const cliSol = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
                 const nombreCliSol = nombreCompletoCliente(cliSol) || 'Cliente';
@@ -9290,6 +9994,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 );
               })}
             </div>
+            )}
 
             <div className="bg-gray-900/60 border border-sky-500/35 rounded-2xl p-4 space-y-4">
               <div>
@@ -9583,10 +10288,20 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         {page === 'panel_control' && esMarcosPUsuario && (
           <div className="space-y-4">
             <h2 className="text-lg font-bold">🧭 Panel de Control</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
-                <p className="text-xs text-gray-400">Cobrado Hoy</p>
+                <p className="text-xs text-gray-400">Ingresos campo (hoy)</p>
                 <p className="text-2xl font-bold text-green-400">{fmt(panelControlStats.cobradoHoy)}</p>
+              </div>
+              <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
+                <p className="text-xs text-gray-400">Egresos campo (hoy)</p>
+                <p className="text-2xl font-bold text-orange-400">{fmt(panelControlStats.gastosCampoHoy)}</p>
+              </div>
+              <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 col-span-2 sm:col-span-1">
+                <p className="text-xs text-gray-400">Cobrado acumulado</p>
+                <p className={`text-2xl font-bold ${panelControlStats.netoCampoHoy < 0 ? 'text-red-400' : 'text-amber-300'}`}>
+                  {fmt(panelControlStats.netoCampoHoy)}
+                </p>
               </div>
               <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
                 <p className="text-xs text-gray-400">Total a cobrar hoy</p>
@@ -9595,7 +10310,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4">
                 <p className="text-xs text-gray-400">Efectividad diaria</p>
                 <p className="text-2xl font-bold text-blue-400">{panelControlStats.efectividad.toFixed(1)}%</p>
-                <p className="text-[10px] text-gray-500 mt-1">Cobrado ÷ total a cobrar</p>
+                <p className="text-[10px] text-gray-500 mt-1">Ingresos campo ÷ total a cobrar</p>
               </div>
             </div>
             <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-4 space-y-2 max-h-[420px] overflow-y-auto">
@@ -9629,21 +10344,27 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               <h3 className="font-semibold">Control por cobrador</h3>
               {panelControlStats.porCobrador.length === 0 && <p className="text-sm text-gray-500">Sin actividad ni cuotas a cobrar hoy.</p>}
               {panelControlStats.porCobrador.map(item => (
-                <div key={item.cobrador} className="bg-gray-800/60 rounded-xl p-3 grid grid-cols-2 sm:grid-cols-5 gap-2 items-center">
+                <div key={item.cobrador} className="bg-gray-800/60 rounded-xl p-3 grid grid-cols-2 sm:grid-cols-6 gap-2 items-center">
                   <div className="col-span-2 sm:col-span-1">
                     <p className="text-sm font-semibold truncate">{etiquetaCobradorMovimiento(item.cobrador)}</p>
                     <p className="text-[11px] text-gray-500">{etiquetaRolUsuario(item.cobrador)}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Total Cobrado</p>
+                    <p className="text-xs text-gray-400">Ingresos</p>
                     <p className="font-semibold text-green-400">{fmt(item.totalCobrado)}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Gastos</p>
+                    <p className="text-xs text-gray-400">Egresos</p>
                     <p className="font-semibold text-orange-400">{fmt(item.gastos)}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Total a cobrar</p>
+                    <p className="text-xs text-gray-400">Neto campo</p>
+                    <p className={`font-semibold ${item.totalCobrado - item.gastos < 0 ? 'text-red-400' : 'text-amber-300'}`}>
+                      {fmt(redondearPesos(item.totalCobrado - item.gastos))}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-400">A cobrar hoy</p>
                     <p className="font-semibold text-indigo-300">{fmt(item.totalACobrar)}</p>
                   </div>
                   <div>
@@ -9713,15 +10434,25 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                       <p className="text-[11px] text-gray-500">Cliente ID: {credito.cliente_id}</p>
                     </div>
                     {esMarcosPUsuario && (
-                      <button
-                        type="button"
-                        onClick={() => setMCreditoRevision(credito)}
-                        className={`shrink-0 rounded-lg px-3 py-2 text-xs font-semibold active:scale-95 transition ${
-                          esProcesado ? 'bg-gray-700 text-gray-200' : 'bg-green-500 text-white'
-                        }`}
-                      >
-                        {esProcesado ? 'Ver Detalles' : 'Aprobar'}
-                      </button>
+                      <div className="shrink-0 flex flex-col gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setMCreditoRevision(credito)}
+                          className={`rounded-lg px-3 py-2 text-xs font-semibold active:scale-95 transition ${
+                            esProcesado ? 'bg-gray-700 text-gray-200' : 'bg-green-500 text-white'
+                          }`}
+                        >
+                          {esProcesado ? 'Ver Detalles' : 'Aprobar'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={eliminandoCreditoId === credito.id}
+                          onClick={() => void handleEliminarCreditoCompleto(credito)}
+                          className="rounded-lg px-3 py-2 text-[10px] font-bold bg-red-600/90 text-white disabled:opacity-50 active:scale-95 transition"
+                        >
+                          {eliminandoCreditoId === credito.id ? '…' : 'Eliminar'}
+                        </button>
+                      </div>
                     )}
                   </div>
                 );
@@ -10204,8 +10935,10 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 guardandoPctId={guardandoPctComisionId}
                 liquidandoId={liquidandoComisionId}
                 aprobandoCreditoId={aprobandoComisionCreditoId}
+                eliminandoCreditoId={eliminandoComisionCreditoId}
                 onGuardarPct={(v, pct) => void handleGuardarPorcentajeComisionVendedor(v, pct)}
                 onAprobarComision={(c, v) => void handleAprobarComisionCredito(c, v)}
+                onEliminarComision={(c, v) => void handleEliminarComisionCredito(c, v)}
                 onLiquidar={v => void handleLiquidarComisionVendedor(v)}
               />
             ) : (
@@ -10623,6 +11356,16 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                         </div>
                         <div className="shrink-0 flex flex-col gap-2">
                           {destacar ? <>{btnWaCarton}{btnVerCarton}</> : <>{btnVerCarton}{btnWaCarton}</>}
+                          {esMarcosPUsuario && (
+                            <button
+                              type="button"
+                              disabled={eliminandoCreditoId === credito.id}
+                              onClick={() => void handleEliminarCreditoCompleto(credito)}
+                              className="rounded-lg px-3 py-2 text-[10px] font-bold bg-red-600/80 text-white disabled:opacity-50 active:scale-95 transition"
+                            >
+                              {eliminandoCreditoId === credito.id ? 'Eliminando…' : '🗑 Eliminar crédito'}
+                            </button>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -10656,12 +11399,13 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         >
           <div className="space-y-4">
             <div className="bg-gray-800/50 rounded-xl p-3 grid grid-cols-2 gap-3">
-              <div><p className="text-xs text-gray-400">Cuota</p><p className="font-bold text-green-400">{fmt(mPago.ficha.cuotaMonto)}</p></div>
-              <div><p className="text-xs text-gray-400">Saldo</p><p className="font-bold text-indigo-400">{fmt(mPago.ficha.saldo)}</p></div>
+              <div><p className="text-xs text-gray-400">Cuota / faltante</p><p className="font-bold text-green-400">{fmt(mPago.ficha.cuotaMonto)}</p></div>
+              <div><p className="text-xs text-gray-400">Saldo crédito</p><p className="font-bold text-indigo-400">{fmt(mPago.ficha.saldo)}</p></div>
               {mPago.ficha.Mora > 0 && <div className="col-span-2"><p className="text-xs text-red-400">⚠️ Mora: {fmt(mPago.ficha.Mora)}</p></div>}
             </div>
             <PagoForm
               ficha={mPago.ficha}
+              saldoCredito={mPago.ficha.saldo}
               onPago={(monto, obs) => handlePago(mPago.ficha, mPago.cliente, monto, obs)}
               gpsLoading={gpsLoading}
               gpsPos={gpsPos}
@@ -10952,12 +11696,14 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             historial={creditosOrEmpty.filter(c => c.cliente_id === mCreditoRevision.cliente_id && c.id !== mCreditoRevision.id)}
             puedeGestionarRevision={esMarcosPUsuario}
             cobradoresOpciones={cobradoresRevision}
+            eliminando={eliminandoCreditoId === mCreditoRevision.id}
             onCerrar={() => setMCreditoRevision(null)}
             onVerPlanilla={(credito) => setMPlanilla({ tipo: 'credito', credito, cliente: clientesOrEmpty.find(c => c.id === credito.cliente_id) || null })}
             onResolver={async (review, estado) => {
               await handleActualizarEstadoCredito(mCreditoRevision, estado, review);
               setMCreditoRevision(null);
             }}
+            onEliminarCredito={credito => void handleEliminarCreditoCompleto(credito)}
           />
         </Modal>
       )}
@@ -11376,8 +12122,9 @@ function Modal({ children, title, onClose }: { children: React.ReactNode; title:
   );
 }
 
-function PagoForm({ ficha, onPago, gpsLoading, gpsPos, onCapturarGPS, guardandoExterno = false, instruccionesGps = null, esMarcosP = false }: {
+function PagoForm({ ficha, saldoCredito, onPago, gpsLoading, gpsPos, onCapturarGPS, guardandoExterno = false, instruccionesGps = null, esMarcosP = false }: {
   ficha: Ficha;
+  saldoCredito?: number;
   onPago: (monto: number, obs: string) => void | Promise<void>;
   gpsLoading: boolean;
   gpsPos: any;
@@ -11386,12 +12133,15 @@ function PagoForm({ ficha, onPago, gpsLoading, gpsPos, onCapturarGPS, guardandoE
   instruccionesGps?: string | null;
   esMarcosP?: boolean;
 }) {
-  const [monto, setMonto] = useState(ficha.cuotaMonto.toString());
+  const cuotaRef = redondearPesos(Number(ficha.cuotaMonto) || 0);
+  const saldoRef = redondearPesos(Number(saldoCredito ?? ficha.saldo) || 0);
+  const [monto, setMonto] = useState(String(cuotaRef || ''));
   const [obs, setObs] = useState('');
   const [medio, setMedio] = useState<'efectivo' | 'transferencia'>('efectivo');
   const [enviandoPago, setEnviandoPago] = useState(false);
   const m = parseFloat(monto) || 0;
-  const esParcial = m < ficha.cuotaMonto && m > 0;
+  const esParcial = m > 0 && m < cuotaRef;
+  const esAdelanto = m > cuotaRef && m <= saldoRef;
   const bloqueado = guardandoExterno || enviandoPago;
   const gpsOkReal = Boolean(gpsPos && (Number(gpsPos.lat) !== 0 || Number(gpsPos.lng) !== 0));
   const confirmar = async () => {
@@ -11443,8 +12193,27 @@ function PagoForm({ ficha, onPago, gpsLoading, gpsPos, onCapturarGPS, guardandoE
       </div>
       <div>
         <label className="text-xs text-gray-400 block mb-1">Monto a registrar</label>
+        <div className="flex flex-wrap gap-2 mb-2">
+          <button
+            type="button"
+            onClick={() => setMonto(String(cuotaRef))}
+            className="rounded-lg bg-emerald-600/30 border border-emerald-500/40 px-3 py-1.5 text-[11px] font-bold text-emerald-200"
+          >
+            Cuota actual ({fmt(cuotaRef)})
+          </button>
+          {saldoRef > cuotaRef && (
+            <button
+              type="button"
+              onClick={() => setMonto(String(saldoRef))}
+              className="rounded-lg bg-sky-600/30 border border-sky-500/40 px-3 py-1.5 text-[11px] font-bold text-sky-200"
+            >
+              Saldo total ({fmt(saldoRef)})
+            </button>
+          )}
+        </div>
         <input type="number" value={monto} onChange={e => setMonto(e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white text-xl font-bold focus:outline-none focus:border-indigo-500" />
-        {esParcial && <p className="text-xs text-orange-400 mt-1">⚠️ Pago parcial. Faltante de {fmt(ficha.cuotaMonto - m)} se arrastrará a próxima cuota</p>}
+        {esParcial && <p className="text-xs text-orange-400 mt-1">⚠️ Pago parcial. Faltante de {fmt(cuotaRef - m)} queda pendiente en esta cuota</p>}
+        {esAdelanto && <p className="text-xs text-sky-300 mt-1">✓ Adelanto: el excedente se aplicará a cuotas siguientes según el saldo</p>}
       </div>
       <div>
         <label className="text-xs text-gray-400 block mb-1">Observaciones (opcional)</label>
@@ -11750,10 +12519,13 @@ function RecibosMensualesLista({
   );
 }
 
-function CalculadoraPlanesCredito() {
+function CalculadoraPlanesCredito({ puedeEditarTasa = true, tasaFija = 30 }: { puedeEditarTasa?: boolean; tasaFija?: number }) {
   const [monto, setMonto] = useState('');
   const [plan, setPlan] = useState<'Semanal' | 'Diario'>('Semanal');
-  const [tasaInteres, setTasaInteres] = useState('30');
+  const [tasaInteres, setTasaInteres] = useState(String(tasaFija));
+  useEffect(() => {
+    if (!puedeEditarTasa) setTasaInteres(String(tasaFija));
+  }, [puedeEditarTasa, tasaFija]);
   const [compartirSoloSeleccionado, setCompartirSoloSeleccionado] = useState(false);
   const tarjetaCapturaRef = useRef<HTMLDivElement | null>(null);
   const cuotasOpciones = plan === 'Semanal' ? PLAN_SEMANAL_OPCIONES : PLAN_DIARIO_OPCIONES;
@@ -12012,10 +12784,15 @@ function CalculadoraPlanesCredito() {
             type="number"
             value={tasaInteres}
             onChange={e => setTasaInteres(e.target.value)}
-            className="w-full rounded-xl px-3 py-2 focus:outline-none"
+            readOnly={!puedeEditarTasa}
+            disabled={!puedeEditarTasa}
+            className="w-full rounded-xl px-3 py-2 focus:outline-none disabled:opacity-70"
             style={{ backgroundColor: '#1f2937', border: '1px solid #374151', color: '#ffffff' }}
             placeholder="30"
           />
+          {!puedeEditarTasa && (
+            <p className="text-[10px] mt-1" style={{ color: '#94a3b8' }}>Tasa fijada por el administrador.</p>
+          )}
         </div>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
@@ -12678,8 +13455,10 @@ function ComisionesAdminPanel({
   guardandoPctId,
   liquidandoId,
   aprobandoCreditoId,
+  eliminandoCreditoId,
   onGuardarPct,
   onAprobarComision,
+  onEliminarComision,
   onLiquidar,
 }: {
   vendedores: VendedorComisionResumen[];
@@ -12688,8 +13467,10 @@ function ComisionesAdminPanel({
   guardandoPctId: string | null;
   liquidandoId: string | null;
   aprobandoCreditoId: string | null;
+  eliminandoCreditoId: string | null;
   onGuardarPct: (v: VendedorComisionResumen, pct: number) => void;
   onAprobarComision: (credito: Credito, v: VendedorComisionResumen) => void;
+  onEliminarComision: (credito: Credito, v: VendedorComisionResumen) => void;
   onLiquidar: (v: VendedorComisionResumen) => void;
 }) {
   const [pctDraft, setPctDraft] = useState<Record<string, string>>({});
@@ -12700,8 +13481,8 @@ function ComisionesAdminPanel({
   return (
     <div className="space-y-4">
       <p className="text-xs text-gray-400 leading-relaxed">
-        Definí el <strong className="text-gray-200">% de comisión</strong> por vendedor, revisá cada venta y <strong className="text-gray-200">aprobá</strong> la comisión.
-        El vendedor solo ve el monto a cobrar después de tu aprobación. Por defecto global: {pctGlobal}%.
+        Definí el <strong className="text-gray-200">% de comisión</strong> por vendedor, revisá cada venta y <strong className="text-gray-200">aprobá</strong> o <strong className="text-gray-200">eliminá</strong> la comisión.
+        El vendedor solo ve el monto a cobrar después de tu aprobación; si la eliminás, desaparece de su panel. Por defecto global: {pctGlobal}%.
       </p>
       <p className="text-[11px] text-amber-200/80">
         Corte semanal: {sabadoCorteSemana()} · Próximo sábado: {proximoSabadoDesde()}
@@ -12769,14 +13550,24 @@ function ComisionesAdminPanel({
                         </p>
                       </div>
                       <p className="font-bold text-violet-300 shrink-0">{fmt(Number(c.comision_vendedor) || 0)}</p>
-                      <button
-                        type="button"
-                        disabled={aprobandoCreditoId === c.id}
-                        onClick={() => onAprobarComision(c, v)}
-                        className="shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-bold text-white disabled:opacity-50"
-                      >
-                        {aprobandoCreditoId === c.id ? '…' : 'Aprobar comisión'}
-                      </button>
+                      <div className="flex shrink-0 gap-1.5">
+                        <button
+                          type="button"
+                          disabled={aprobandoCreditoId === c.id || eliminandoCreditoId === c.id}
+                          onClick={() => onAprobarComision(c, v)}
+                          className="rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-bold text-white disabled:opacity-50"
+                        >
+                          {aprobandoCreditoId === c.id ? '…' : 'Aprobar'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={aprobandoCreditoId === c.id || eliminandoCreditoId === c.id}
+                          onClick={() => onEliminarComision(c, v)}
+                          className="rounded-lg bg-red-600/90 px-3 py-1.5 text-[11px] font-bold text-white disabled:opacity-50"
+                        >
+                          {eliminandoCreditoId === c.id ? '…' : 'Eliminar'}
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -12787,11 +13578,19 @@ function ComisionesAdminPanel({
                 <p className="text-xs font-semibold text-teal-200/90 mb-2">Ventas con comisión aprobada ({v.ventas_aprobadas_pendientes.length})</p>
                 <div className="space-y-1.5 max-h-36 overflow-y-auto">
                   {v.ventas_aprobadas_pendientes.map(c => (
-                    <div key={c.id} className="flex justify-between text-xs bg-gray-900/40 rounded-lg px-3 py-2">
-                      <span className="text-gray-300 truncate pr-2">
+                    <div key={c.id} className="flex flex-col sm:flex-row sm:items-center gap-2 text-xs bg-gray-900/40 rounded-lg px-3 py-2">
+                      <span className="text-gray-300 truncate pr-2 flex-1 min-w-0">
                         {nombreClienteCredito(c)} · {String(c.nro_carton || '').slice(0, 10)}
                       </span>
                       <span className="font-bold text-teal-300 shrink-0">{fmt(Number(c.comision_vendedor) || 0)}</span>
+                      <button
+                        type="button"
+                        disabled={eliminandoCreditoId === c.id || aprobandoCreditoId === c.id}
+                        onClick={() => onEliminarComision(c, v)}
+                        className="shrink-0 rounded-lg bg-red-600/80 px-2.5 py-1 text-[10px] font-bold text-white disabled:opacity-50"
+                      >
+                        {eliminandoCreditoId === c.id ? '…' : 'Eliminar'}
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -12917,6 +13716,7 @@ function CreditoForm({
   const maxDiasFuturoFecha = maxDiasFuturoFechaInicioCredito(plazoUnidadFecha);
   const fechaMaxFutura = useMemo(() => addDias(hoy(), maxDiasFuturoFecha), [maxDiasFuturoFecha]);
 
+  const puedeEditarInteres = puedeEditarInteresCredito(rol);
   const esCobrador = String(rol || '').toLowerCase() === 'cobrador';
   const puedeRetro = puedeCargaRetroactivaCredito(rol);
   useEffect(() => {
@@ -12927,17 +13727,15 @@ function CreditoForm({
     }
   }, [puedeRetro, fechaInicio, fechaMaxFutura, plazoUnidadFecha]);
   useEffect(() => {
-    if (soloPlanMensual) {
-      setInteresAplicado(tasaInteresMensualPorMeses(plazoCantidad, configTasasMensual));
-      return;
-    }
-    if (esCobrador) {
-      setInteresAplicado(30);
+    if (!puedeEditarInteres || soloPlanMensual) {
+      setInteresAplicado(
+        interesAplicadoOficialCredito(tipo, rol, { interesCreditoM: interesM, interesCreditoP: interesP }, plazoCantidad, configTasasMensual),
+      );
       return;
     }
     const baseInteres = tipo === 'M' ? Number(interesM) : Number(interesP);
     setInteresAplicado(Number.isFinite(baseInteres) && baseInteres > 0 ? baseInteres : 30);
-  }, [soloPlanMensual, plazoCantidad, configTasasMensual, esCobrador, tipo, interesM, interesP]);
+  }, [soloPlanMensual, plazoCantidad, configTasasMensual, puedeEditarInteres, esCobrador, tipo, interesM, interesP, rol]);
   const planMensualOpciones = useMemo(
     () => listadoPlanMensualPlazoTasa(configTasasMensual),
     [configTasasMensual],
@@ -13070,16 +13868,18 @@ function CreditoForm({
           type="number"
           value={interesAplicado}
           onChange={e => setInteresAplicado(Number(e.target.value) || 0)}
-          readOnly={esCobrador || soloPlanMensual}
-          disabled={esCobrador || soloPlanMensual}
+          readOnly={!puedeEditarInteres || soloPlanMensual}
+          disabled={!puedeEditarInteres || soloPlanMensual}
           className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white disabled:opacity-70"
         />
         <p className="text-[11px] text-gray-500 mt-1">
           {soloPlanMensual
             ? 'La tasa se asigna automáticamente según la cantidad de cuotas mensuales.'
-            : esCobrador
-              ? 'Para cobrador el interés queda fijo en 30%.'
-              : 'Podés ajustar el interés antes de guardar la solicitud.'}
+            : puedeEditarInteres
+              ? 'Como administrador podés ajustar el interés antes de guardar.'
+              : esCobrador
+                ? 'El interés queda fijo en 30% (solo el administrador puede modificarlo).'
+                : 'El interés lo define el administrador; no podés modificarlo en la solicitud.'}
         </p>
       </div>
       <div>
@@ -13294,9 +14094,11 @@ function CreditoReviewForm({
   historial,
   puedeGestionarRevision,
   cobradoresOpciones,
+  eliminando,
   onCerrar,
   onVerPlanilla,
   onResolver,
+  onEliminarCredito,
 }: {
   credito: Credito;
   cliente: Cliente | null;
@@ -13305,6 +14107,7 @@ function CreditoReviewForm({
   puedeGestionarRevision: boolean;
   /** Solo admin/root: filas de `usuarios` rol cobrador para asignar crédito. */
   cobradoresOpciones: Array<{ valor: string; label: string }>;
+  eliminando?: boolean;
   onCerrar: () => void;
   onVerPlanilla: (credito: Credito) => void;
   onResolver: (review: {
@@ -13315,6 +14118,7 @@ function CreditoReviewForm({
     notas_admin: string;
     cobrador_id_admin?: string;
   }, estado: 'APROBADO' | 'RECHAZADO') => void | Promise<void>;
+  onEliminarCredito?: (credito: Credito) => void | Promise<void>;
 }) {
   const estadoCredito = String(credito.estado || '').trim().toUpperCase();
   const esProcesado = estadoCredito === 'ACTIVO' || estadoCredito === 'RECHAZADO' || estadoCredito === 'FINALIZADO';
@@ -13460,6 +14264,16 @@ function CreditoReviewForm({
           placeholder="Se incluirán en la notificación al cobrador."
         />
       </div>
+      {puedeGestionarRevision && onEliminarCredito && (
+        <button
+          type="button"
+          disabled={eliminando}
+          onClick={() => void onEliminarCredito(credito)}
+          className="w-full rounded-xl border border-red-500/45 bg-red-950/40 py-3 text-sm font-bold text-red-200 disabled:opacity-50 active:scale-[0.99] transition"
+        >
+          {eliminando ? 'Eliminando crédito y revirtiendo movimientos…' : '🗑 Eliminar crédito y revertir movimientos'}
+        </button>
+      )}
       <div className="flex flex-col gap-2 sm:flex-row">
         <button type="button" onClick={onCerrar} className="w-full sm:flex-1 bg-gray-700 text-white rounded-xl py-3 font-semibold">Cerrar</button>
         {puedeResolver && (

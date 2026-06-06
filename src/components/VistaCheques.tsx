@@ -137,6 +137,16 @@ export function VistaCheques({
     void cargar();
   }, [cargar]);
 
+  useEffect(() => {
+    const ch = supabase
+      .channel('cheques-live-sync')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'cheques' }, () => { void cargar(); })
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(ch);
+    };
+  }, [cargar]);
+
   const filtrados = useMemo(() => {
     const q = busqueda.trim().toLowerCase();
     if (!q) return cheques;
