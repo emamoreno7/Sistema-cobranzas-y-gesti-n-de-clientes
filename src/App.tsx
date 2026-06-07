@@ -1464,6 +1464,43 @@ function rendicionEsDelUsuarioActual(c: Cierre, authId: string | null, username:
   return false;
 }
 
+function rendicionesDelUsuario(cierres: Cierre[], authId: string | null, username: string | null): Cierre[] {
+  return cierres.filter(c => rendicionEsDelUsuarioActual(c, authId, username));
+}
+
+/** Rendición enviada y aún sin recepción de Marcos. */
+function miRendicionPendienteUsuario(cierres: Cierre[], authId: string | null, username: string | null): Cierre | undefined {
+  return rendicionesDelUsuario(cierres, authId, username)
+    .filter(c => !c.validado)
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
+}
+
+/** Inicio de la jornada abierta: última rendición aceptada por Marcos, o medianoche si es la primera del día. */
+function inicioJornadaActualMs(cierres: Cierre[], authId: string | null, username: string | null): number {
+  const validadas = rendicionesDelUsuario(cierres, authId, username)
+    .filter(c => c.validado && c.validadoAt)
+    .sort((a, b) => String(b.validadoAt).localeCompare(String(a.validadoAt)));
+  if (validadas[0]?.validadoAt) return new Date(validadas[0].validadoAt).getTime();
+  return new Date(`${hoy()}T00:00:00`).getTime();
+}
+
+function perteneceJornadaActual(ts: number | string | undefined | null, inicioMs: number): boolean {
+  const t = typeof ts === 'number' ? ts : new Date(String(ts || 0)).getTime();
+  return Number.isFinite(t) && t >= inicioMs;
+}
+
+function tsPagoRegistro(p: PagoRegistro): number {
+  return new Date(String(p.fechaPago ?? p.fecha ?? 0)).getTime();
+}
+
+function msCierreRutaAlmacenado(raw: string | null): number | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 10) return new Date(`${trimmed}T23:59:59`).getTime();
+  const t = new Date(trimmed).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
 function mapRowRendicionDb(r: Record<string, unknown>): Cierre {
   const created = r.created_at != null ? new Date(String(r.created_at)).getTime() : Date.now();
   return {
@@ -5513,10 +5550,14 @@ export default function App() {
     [data.config.jornadaSinBloqueosPruebas],
   );
 
-  const miRendicionHoy = useMemo(() => {
-    const h = hoy();
-    return cierresJornada.find(c => c.fecha === h && rendicionEsDelUsuarioActual(c, authUserId, user));
-  }, [cierresJornada, authUserId, user]);
+  const miRendicionPendiente = useMemo(
+    () => miRendicionPendienteUsuario(cierresJornada, authUserId, user),
+    [cierresJornada, authUserId, user],
+  );
+  const inicioJornadaMs = useMemo(
+    () => inicioJornadaActualMs(cierresJornada, authUserId, user),
+    [cierresJornada, authUserId, user],
+  );
 
   const creditoIdsAsignadosSesion = useMemo(() => {
     const clienteIds = new Map(clientesOrEmpty.map(c => [normalizarId(c.id), c]));
@@ -5531,19 +5572,22 @@ export default function App() {
   }, [creditosOrEmpty, clientesOrEmpty, rol, authUserId, user, loginEmail]);
 
   const cajaCobradorDia = useMemo(() => {
-    const h = hoy();
     const gList = Array.isArray(gastos) ? gastos : [];
-    const pagosH = pagosOrEmpty.filter(p => {
-      const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
-      return fd === h && esPagoEfectivo(p) && esRegistroDelCobrador(p, authUserId, user, loginEmail);
-    });
+    const pagosH = pagosOrEmpty.filter(p =>
+      perteneceJornadaActual(tsPagoRegistro(p), inicioJornadaMs)
+      && esPagoEfectivo(p)
+      && esRegistroDelCobrador(p, authUserId, user, loginEmail),
+    );
     const totalCobrado = redondearPesos(pagosH.reduce((s, p) => s + (Number(p.monto) || 0), 0));
-    const gastosH = gList.filter(g => String(g.fecha || '').slice(0, 10) === h && esGastoDelCobrador(g, authUserId, user, loginEmail));
+    const gastosH = gList.filter(g =>
+      perteneceJornadaActual(g.timestamp || new Date(`${String(g.fecha || hoy())}T12:00:00`).getTime(), inicioJornadaMs)
+      && esGastoDelCobrador(g, authUserId, user, loginEmail),
+    );
     const totalGastos = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
-    const movsHoy = movimientosCaja.filter(m => {
-      if (String(m.createdAt).slice(0, 10) !== h) return false;
-      return movimientoCajaDelCobradorSesion(m, authUserId, user, loginEmail, creditoIdsAsignadosSesion);
-    });
+    const movsHoy = movimientosCaja.filter(m =>
+      perteneceJornadaActual(new Date(m.createdAt).getTime(), inicioJornadaMs)
+      && movimientoCajaDelCobradorSesion(m, authUserId, user, loginEmail, creditoIdsAsignadosSesion),
+    );
     const ingresosCaja = redondearPesos(
       movsHoy.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0),
     );
@@ -5564,12 +5608,12 @@ export default function App() {
       efectivoEnMano: redondearPesos(totalCobrado + ingresosCaja - totalGastos - salidasEntregaCredito - salidasCaja),
       cantGastos: gastosH.length,
     };
-    /** Solo congelar mientras espera validación de Marcos; si ya fue aceptada, seguir sumando cobros en vivo. */
-    if (!jornadaSinBloqueosPruebas && miRendicionHoy && !miRendicionHoy.validado) {
-      const totalCobradoCong = redondearPesos(Number(miRendicionHoy.totalSistema) || 0);
-      const totalGastosCong = redondearPesos(Number(miRendicionHoy.totalGastos) || 0);
+    /** Solo congelar mientras espera recepción de Marcos. */
+    if (!jornadaSinBloqueosPruebas && miRendicionPendiente) {
+      const totalCobradoCong = redondearPesos(Number(miRendicionPendiente.totalSistema) || 0);
+      const totalGastosCong = redondearPesos(Number(miRendicionPendiente.totalGastos) || 0);
       const netoCong = redondearPesos(
-        Number(miRendicionHoy.netoEntregar) || totalCobradoCong - totalGastosCong,
+        Number(miRendicionPendiente.netoEntregar) || totalCobradoCong - totalGastosCong,
       );
       return {
         totalCobrado: totalCobradoCong,
@@ -5586,21 +5630,20 @@ export default function App() {
       ...live,
       congeladoRendicion: false as const,
     };
-  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy, jornadaSinBloqueosPruebas, creditoIdsAsignadosSesion]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionPendiente, jornadaSinBloqueosPruebas, creditoIdsAsignadosSesion, inicioJornadaMs]);
 
-  const esperandoValidacionRendicion = useMemo(() => Boolean(miRendicionHoy && !miRendicionHoy.validado), [miRendicionHoy]);
-  const jornadaCerradaValidadaHoy = useMemo(() => Boolean(miRendicionHoy && miRendicionHoy.validado), [miRendicionHoy]);
+  const esperandoValidacionRendicion = useMemo(() => Boolean(miRendicionPendiente), [miRendicionPendiente]);
   const cobradorBloqueadoCobros = useMemo(
-    () => !jornadaSinBloqueosPruebas && (rol || '').toLowerCase() === 'cobrador' && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
-    [jornadaSinBloqueosPruebas, rol, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
+    () => !jornadaSinBloqueosPruebas && esUsuarioCampoConCaja && esperandoValidacionRendicion,
+    [jornadaSinBloqueosPruebas, esUsuarioCampoConCaja, esperandoValidacionRendicion],
   );
   const puedeCerrarJornadaCampo = useMemo(
-    () => esUsuarioCampoConCaja && (jornadaSinBloqueosPruebas || !miRendicionHoy),
-    [esUsuarioCampoConCaja, jornadaSinBloqueosPruebas, miRendicionHoy],
+    () => esUsuarioCampoConCaja && (jornadaSinBloqueosPruebas || !miRendicionPendiente),
+    [esUsuarioCampoConCaja, jornadaSinBloqueosPruebas, miRendicionPendiente],
   );
   const usuarioCampoBloqueadoOperaciones = useMemo(
-    () => !jornadaSinBloqueosPruebas && esUsuarioCampoConCaja && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
-    [jornadaSinBloqueosPruebas, esUsuarioCampoConCaja, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
+    () => !jornadaSinBloqueosPruebas && esUsuarioCampoConCaja && esperandoValidacionRendicion,
+    [jornadaSinBloqueosPruebas, esUsuarioCampoConCaja, esperandoValidacionRendicion],
   );
   const rendicionesPendientesAdmin = useMemo(
     () => cierresJornada.filter(c => !c.validado),
@@ -7009,7 +7052,7 @@ export default function App() {
 
   const handlePago = async ( ficha: Ficha, cliente: Cliente, monto: number, observaciones: string ) => {
     if (cobradorBloqueadoCobros) {
-      alert('Tu jornada está cerrada o esperando validación del administrador. No podés registrar cobros hasta que la rendición sea aceptada o hasta mañana si ya fue confirmada.');
+      alert('Tu rendición está pendiente de recepción por Marcos. No podés registrar cobros hasta que la acepte.');
       return;
     }
     const montoPago = redondearPesos(monto);
@@ -8585,6 +8628,10 @@ export default function App() {
       usernameState: user,
       authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
     });
+    if (!jornadaSinBloqueosPruebas && miRendicionPendienteUsuario(cierresJornada, authUserId, user)) {
+      alert('Ya tenés una rendición pendiente de recepción por Marcos.');
+      return;
+    }
     const gRes = await intentarCapturarGpsParaCobranza('handleCierreJornada_obtener_gps', { forzar: true });
     if (!gRes.ok) return;
     const gps = gRes.coords;
@@ -8630,18 +8677,23 @@ export default function App() {
             .from('rendiciones')
             .update(rowDb as any)
             .eq('cobrador_id', cobradorId)
-            .eq('fecha_jornada', hoy())
+            .eq('validado', false)
             .select('*')
-            .single();
+            .maybeSingle();
           if (updErr) {
             console.error('rendiciones update (modo pruebas):', updErr);
-            alert('No se pudo actualizar el cierre de jornada de hoy.');
+            alert('No se pudo actualizar el cierre de jornada pendiente.');
             return;
           }
-          inserted = updated as Record<string, unknown>;
-          error = null;
+          if (updated) {
+            inserted = updated as Record<string, unknown>;
+            error = null;
+          } else {
+            alert('Ya tenés una rendición pendiente o ejecutá la migración 051_rendiciones_multiples_por_dia.sql en Supabase.');
+            return;
+          }
         } else {
-          alert('Ya registraste el cierre de jornada de hoy.');
+          alert('Ya tenés una rendición pendiente de recepción por Marcos.');
           return;
         }
       }
@@ -8801,7 +8853,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
         `Rendición ${c.id} — ${etiquetaCob} — ${fmt(neto)} ingresa a caja propia`,
       );
       await fetchData({ silencioso: true });
-      alert(`Rendición aceptada. ${fmt(neto)} ingresó a caja propia. ${etiquetaCob} queda liberado tras las 00:00.`);
+      alert(`Rendición aceptada. ${fmt(neto)} ingresó a caja propia. ${etiquetaCob} ya puede iniciar la próxima jornada.`);
     } catch (e: unknown) {
       console.error('handleAceptarRendicion:', e);
       alert(e instanceof Error ? e.message : 'No se pudo aceptar la rendición (¿migración 042?)');
@@ -8987,9 +9039,10 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
   }, [rutaCierreStorageKey]);
 
   const rutaPorCobrarItemsLista = useMemo(() => {
-    if (rutaDiaCerradoFecha === hoy()) return [];
+    const ms = msCierreRutaAlmacenado(rutaDiaCerradoFecha);
+    if (ms != null && ms > inicioJornadaMs) return [];
     return rutaPorCobrarItems;
-  }, [rutaPorCobrarItems, rutaDiaCerradoFecha]);
+  }, [rutaPorCobrarItems, rutaDiaCerradoFecha, inicioJornadaMs]);
 
   const metricasCierreCajaRutaHoy = useMemo(() => {
     const f = hoy();
@@ -9019,7 +9072,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
     };
   }, [rutaGruposBaseItems, pagosOrEmpty, visitasFallidasOrEmpty, authUserId, user, loginEmail]);
 
-  const rutaBloqueadaPorCierreHoy = !jornadaSinBloqueosPruebas && rutaDiaCerradoFecha === hoy();
+  const rutaBloqueadaPorCierreHoy = useMemo(() => {
+    if (jornadaSinBloqueosPruebas) return false;
+    const ms = msCierreRutaAlmacenado(rutaDiaCerradoFecha);
+    return ms != null && ms > inicioJornadaMs;
+  }, [jornadaSinBloqueosPruebas, rutaDiaCerradoFecha, inicioJornadaMs]);
 
   useEffect(() => {
     if (!menuPerfilAbierto) return;
@@ -9044,12 +9101,13 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
       alert(`El monto confirmado (${fmt(ingresado)}) no coincide con el total del día (${fmt(esperado)}: efectivo + transferencias).`);
       return;
     }
+    const cierreRutaAt = new Date().toISOString();
     try {
-      localStorage.setItem(rutaCierreStorageKey, hoy());
+      localStorage.setItem(rutaCierreStorageKey, cierreRutaAt);
     } catch {
       /* */
     }
-    setRutaDiaCerradoFecha(hoy());
+    setRutaDiaCerradoFecha(cierreRutaAt);
     setMontoConfirmacionCierreRuta('');
     audit('CIERRE_DIA_RUTA', `Cierre día ruta ${hoy()} — Total ${fmt(esperado)} — Visitados ${metricasCierreCajaRutaHoy.clientesVisitados} — No pago ${metricasCierreCajaRutaHoy.clientesNoPago}`);
     void logAuditDb('CIERRE_DIA_RUTA', `Cierre día ruta ${hoy()}; total ${esperado}`);
@@ -9754,25 +9812,17 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     <p className="text-xs text-violet-100/70 mt-1">Sin bloqueo de cobros, cierres de jornada ni ruta por día cerrado.</p>
                   </div>
                 )}
-                {(usuarioCampoBloqueadoOperaciones || cobradorBloqueadoCobros) && (
-                  <div className={`rounded-2xl border p-3 text-center text-sm ${esperandoValidacionRendicion ? 'border-amber-500/50 bg-amber-500/10 text-amber-200' : 'border-sky-500/40 bg-sky-500/10 text-sky-200'}`}>
-                    {esperandoValidacionRendicion && (
-                      <p className="font-semibold">⏳ Esperando validación del administrador. No podés registrar cobros hasta que acepte la rendición.</p>
-                    )}
-                    {jornadaCerradaValidadaHoy && cobradorBloqueadoCobros && (
-                      <p className="font-semibold">✅ Rendición aceptada. Nueva jornada a partir de las 00:00. No podés registrar cobros hasta entonces.</p>
-                    )}
-                    {jornadaCerradaValidadaHoy && esUsuarioVendedorSesion && (
-                      <p className="font-semibold">✅ Rendición aceptada. Como vendedor podés seguir cobrando hoy; los montos se suman en «Efectivo en mano».</p>
-                    )}
+                {esperandoValidacionRendicion && (
+                  <div className="rounded-2xl border border-amber-500/50 bg-amber-500/10 p-3 text-center text-sm text-amber-200">
+                    <p className="font-semibold">⏳ Esperando recepción de Marcos. No podés registrar cobros hasta que acepte la rendición.</p>
                   </div>
                 )}
                 <div className="bg-emerald-500/10 border border-emerald-500/35 rounded-2xl p-4">
-                  <h3 className="font-bold text-sm text-emerald-200 mb-3">💵 Efectivo en mano (hoy)</h3>
+                  <h3 className="font-bold text-sm text-emerald-200 mb-3">💵 Efectivo en mano (jornada actual)</h3>
                   <p className="text-[11px] text-emerald-100/70 mb-3">
                     {cajaCobradorDia.congeladoRendicion
                       ? 'Montos congelados al cerrar jornada. Pendiente de recepción por Marcos.'
-                      : 'Cada gasto operativo resta del efectivo que llevás. Jornada = día calendario (00:00–00:00).'}
+                      : 'Cada gasto operativo resta del efectivo que llevás. Nueva jornada al recibir la rendición anterior.'}
                   </p>
                   <div className="grid grid-cols-1 gap-2 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Cobrado</span><span className="font-semibold text-white">{fmt(cajaCobradorDia.totalCobrado)}</span></div>
@@ -9813,20 +9863,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 )}
                 {esperandoValidacionRendicion && (
                   <div className="bg-amber-500/10 border border-amber-500/35 rounded-2xl p-4 text-center">
-                    <p className="text-amber-200 font-semibold text-sm">Rendición enviada — pendiente de aprobación</p>
-                    <p className="text-amber-100/60 text-xs mt-1">El administrador debe aceptarla para liberar tu próxima jornada.</p>
-                  </div>
-                )}
-                {jornadaCerradaValidadaHoy && cobradorBloqueadoCobros && (
-                  <div className="bg-sky-500/10 border border-sky-500/35 rounded-2xl p-4 text-center">
-                    <p className="text-sky-200 font-semibold text-sm">Jornada cerrada y rendición aceptada</p>
-                    <p className="text-sky-100/60 text-xs mt-1">Mañana a las 00:00 podés volver a cobrar.</p>
-                  </div>
-                )}
-                {jornadaCerradaValidadaHoy && esUsuarioVendedorSesion && (
-                  <div className="bg-sky-500/10 border border-sky-500/35 rounded-2xl p-4 text-center">
-                    <p className="text-sky-200 font-semibold text-sm">Rendición de cobrador cerrada hoy</p>
-                    <p className="text-sky-100/60 text-xs mt-1">Tus cobros de vendedor siguen acumulándose en efectivo en mano.</p>
+                    <p className="text-amber-200 font-semibold text-sm">Rendición enviada — pendiente de recepción</p>
+                    <p className="text-amber-100/60 text-xs mt-1">Marcos debe aceptarla para habilitar tu próxima jornada.</p>
                   </div>
                 )}
               </div>
@@ -10472,7 +10510,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
           <div className="space-y-4">
             <div>
               <h2 className="text-lg font-bold">📑 Rendiciones pendientes</h2>
-              <p className="text-xs text-gray-400">Aceptá cada cierre de caja. El neto ingresa a caja propia; el usuario queda en pendiente hasta la recepción y liberado tras las 00:00.</p>
+              <p className="text-xs text-gray-400">Aceptá cada cierre de caja. El neto ingresa a caja propia y el usuario puede iniciar la próxima jornada al instante.</p>
             </div>
             <div className="flex rounded-xl overflow-hidden border border-gray-700">
               <button
@@ -13785,7 +13823,7 @@ function JornadaForm({
   const gpsOkReal = Boolean(gpsPos && (Number(gpsPos.lat) !== 0 || Number(gpsPos.lng) !== 0));
   return (
     <div className="space-y-4">
-      <p className="text-[11px] text-gray-500 text-center">Jornada calendario 00:00–00:00 (día local). Neto = cobrado − gastos operativos.</p>
+      <p className="text-[11px] text-gray-500 text-center">Jornada actual desde la última rendición aceptada. Neto = cobrado − gastos operativos.</p>
       {instruccionesGps && (
         <div className="rounded-xl border border-amber-500/40 bg-amber-950/40 px-3 py-2 text-xs text-amber-100 leading-relaxed">
           <p className="font-semibold text-amber-200 mb-1">Ubicación bloqueada</p>

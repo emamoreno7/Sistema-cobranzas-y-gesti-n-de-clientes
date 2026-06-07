@@ -208,8 +208,8 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
       <div>
         <p className="font-semibold text-white">Modo pruebas — cobros sin bloqueo de jornada</p>
         <p className="text-xs text-gray-400 leading-relaxed mt-1">
-          Permite a cobradores y vendedores cobrar, cerrar jornada y usar la ruta «Por cobrar» sin esperar las 00:00
-          ni quedar bloqueados tras rendición. Solo para pruebas; desactivá al terminar.
+          Permite a cobradores y vendedores cobrar, cerrar jornada y usar la ruta «Por cobrar» sin quedar bloqueados
+          por rendición pendiente. Solo para pruebas; desactivá al terminar.
         </p>
       </div>
       {configJornadaError && (
