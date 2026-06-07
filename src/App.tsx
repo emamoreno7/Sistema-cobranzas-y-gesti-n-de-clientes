@@ -7399,7 +7399,7 @@ export default function App() {
     if (!montoG || montoG <= 0) { alert('Monto inválido'); return; }
     const cobradorGastoId = cobradorIdCanonicoDesdeSesionActiva(authUserId, user, loginEmail);
     const nuevo: Gasto = {
-      id: genId(),
+      id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : genId(),
       fecha: hoy(),
       categoria: g.categoria || 'Otros',
       monto: montoG,
@@ -7427,7 +7427,7 @@ export default function App() {
       alert(
         'No se pudo guardar el gasto en el servidor. '
         + (ins.error.message || 'Error desconocido')
-        + '\n\nSi persiste, ejecutá la migración 047_gastos_insert_app.sql en Supabase.',
+        + '\n\nEjecutá en Supabase la migración 048_gastos_uuid_default_fix.sql.',
       );
       return;
     }

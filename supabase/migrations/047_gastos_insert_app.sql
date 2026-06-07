@@ -1,7 +1,7 @@
--- Gastos: inserts desde la app (sin enviar id manual o con uuid).
+-- Gastos: inserts desde la app. Producción usa id uuid (no text).
 
 create table if not exists public.gastos (
-  id text primary key default (gen_random_uuid()::text),
+  id uuid primary key default gen_random_uuid(),
   fecha date not null default current_date,
   categoria text not null default 'Otros',
   monto numeric not null default 0,
@@ -10,8 +10,23 @@ create table if not exists public.gastos (
   created_at timestamptz not null default now()
 );
 
-alter table public.gastos
-  alter column id set default (gen_random_uuid()::text);
+-- Tabla existente: default según tipo real de id (uuid o text legacy)
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'gastos' and column_name = 'id'
+      and udt_name = 'uuid'
+  ) then
+    execute 'alter table public.gastos alter column id set default gen_random_uuid()';
+  elsif exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'gastos' and column_name = 'id'
+      and data_type = 'text'
+  ) then
+    execute 'alter table public.gastos alter column id set default (gen_random_uuid()::text)';
+  end if;
+end $$;
 
 alter table public.gastos enable row level security;
 
