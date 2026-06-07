@@ -20,6 +20,8 @@ export type ConfigApp = {
   trialFin: string | null;
   /** Último cierre de día de Marcos: contadores en pantalla solo cuentan movimientos posteriores (mismo día). */
   cierreCajaMarcosAt: string | null;
+  /** Root: desactiva bloqueos de jornada/rendición para pruebas en campo. */
+  jornadaSinBloqueosPruebas: boolean;
 };
 
 export const CONFIG_DEFECTO: ConfigApp = {
@@ -37,6 +39,7 @@ export const CONFIG_DEFECTO: ConfigApp = {
   modoExterior: false,
   trialFin: null,
   cierreCajaMarcosAt: null,
+  jornadaSinBloqueosPruebas: false,
 };
 
 function soloDigitosTel(v: string): string {
@@ -83,6 +86,7 @@ export function configDesdeSupabase(raw: Record<string, unknown> | null | undefi
       cfg.cierre_caja_marcos_at != null && String(cfg.cierre_caja_marcos_at).trim()
         ? String(cfg.cierre_caja_marcos_at)
         : null,
+    jornadaSinBloqueosPruebas: Boolean(cfg.jornada_sin_bloqueos_pruebas ?? cfg.jornadaSinBloqueosPruebas),
     nombreEmpresa: textoEmpresaPermitido(cfg.nombre_empresa ?? cfg.nombreEmpresa, CONFIG_DEFECTO.nombreEmpresa),
     direccionEmpresa: textoEmpresaPermitido(cfg.direccion_empresa ?? cfg.direccionEmpresa, CONFIG_DEFECTO.direccionEmpresa),
     ruc: String(cfg.ruc ?? CONFIG_DEFECTO.ruc).trim() || CONFIG_DEFECTO.ruc,
@@ -109,5 +113,6 @@ export function configDesdeCacheLocal(partial: Partial<ConfigApp> | null | undef
       ? { porcentajeComisionVendedor: partial.porcentajeComisionVendedor } : {}),
     modoExterior: Boolean(partial.modoExterior),
     trialFin: partial.trialFin ?? base.trialFin,
+    jornadaSinBloqueosPruebas: Boolean(partial.jornadaSinBloqueosPruebas),
   };
 }

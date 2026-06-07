@@ -811,6 +811,8 @@ interface Config {
   modoExterior: boolean;
   trialFin?: string | null;
   cierreCajaMarcosAt?: string | null;
+  /** Root: sin bloqueo de cobros/cierres por rendición (modo pruebas). */
+  jornadaSinBloqueosPruebas?: boolean;
 }
 interface VisitaFallida { clienteId: string; fecha: string; hora: string; motivo: 'no_domicilio' | 'sin_dinero' | 'promesa_pago' | 'local_cerrado'; lat: number; lng: number; observaciones?: string; promesaFecha?: string; }
 interface Credito {
@@ -2638,6 +2640,57 @@ function solicitudFondoCreditoEsHuerfana(sol: SolicitudFondoCredito, creditos: C
   return !cred || !creditoEstadoPendienteAprobacion(cred.estado);
 }
 
+/** Ingreso de Marcos sigue vigente hoy: crédito activo + entrada en caja del cobrador (día actual). */
+function solicitudFondoCreditoIngresoCajaVigente(
+  sol: SolicitudFondoCredito,
+  creditos: Credito[],
+  movimientos: MovimientoCaja[],
+  authUserId: string | null,
+  username: string | null,
+  loginEmail: string | null,
+  fecha = hoy(),
+): boolean {
+  if (sol.estado !== 'fondado') return false;
+  const cred = creditos.find(c => fichaIdUuid(c.id) === fichaIdUuid(sol.credito_id));
+  if (!cred || !esCreditoActivo(cred)) return false;
+  const creditoId = fichaIdUuid(sol.credito_id);
+  const monto = redondearPesos(Number(sol.monto) || 0);
+  if (!creditoId || monto <= 0) return false;
+  return movimientos.some(m =>
+    m.tipo === 'entrada'
+    && String(m.createdAt).slice(0, 10) === fecha
+    && fichaIdUuid(m.fichaId ?? '') === creditoId
+    && redondearPesos(m.monto) === monto
+    && esRegistroDelCobrador(
+      { cobradorId: m.cobradorId, userId: m.cobradorId } as PagoRegistro,
+      authUserId,
+      username,
+      loginEmail,
+    ),
+  );
+}
+
+/** Para limpieza en fetch: fondado sin crédito activo o sin entrada en caja hoy. */
+function solicitudFondoCreditoFondadoObsoletaEnDb(
+  sol: SolicitudFondoCredito,
+  creditos: Credito[],
+  movimientos: MovimientoCaja[],
+  fecha = hoy(),
+): boolean {
+  if (sol.estado !== 'fondado') return false;
+  const cred = creditos.find(c => fichaIdUuid(c.id) === fichaIdUuid(sol.credito_id));
+  if (!cred || !esCreditoActivo(cred)) return true;
+  const creditoId = fichaIdUuid(sol.credito_id);
+  const monto = redondearPesos(Number(sol.monto) || 0);
+  if (!creditoId || monto <= 0) return true;
+  return !movimientos.some(m =>
+    m.tipo === 'entrada'
+    && String(m.createdAt).slice(0, 10) === fecha
+    && fichaIdUuid(m.fichaId ?? '') === creditoId
+    && redondearPesos(m.monto) === monto,
+  );
+}
+
 /** Sin cobranzas ni ingresos previos en caja del cobrador que crea el crédito. */
 function cobradorSinRecaudadoEnCaja(
   cobradorId: string,
@@ -3939,6 +3992,7 @@ export default function App() {
           timestamp: Number(g?.timestamp ?? new Date(g?.created_at ?? Date.now()).getTime()),
         })) as Gasto[]);
       }
+      let cajaRowsFetch: MovimientoCaja[] = [];
       {
         let cajaQuery = supabase.from('caja').select('*').order('created_at', { ascending: false }).limit(300);
         if (!verTodosLosCreditos) {
@@ -3953,9 +4007,10 @@ export default function App() {
           devWarn('Supabase fetch caja:', cajaErr);
           setMovimientosCaja([]);
         } else {
-          setMovimientosCaja(
-            (Array.isArray(cajaDb) ? cajaDb : []).map(r => mapFilaCajaSupabase(r as Record<string, unknown>)),
+          cajaRowsFetch = (Array.isArray(cajaDb) ? cajaDb : []).map(r =>
+            mapFilaCajaSupabase(r as Record<string, unknown>),
           );
+          setMovimientosCaja(cajaRowsFetch);
         }
       }
 
@@ -3977,16 +4032,27 @@ export default function App() {
         const mappedSolFondo = (Array.isArray(solFondoDb) ? solFondoDb : []).map(r =>
           mapSolicitudFondoCredito(r as Record<string, unknown>),
         );
-        const staleSolIds = mappedSolFondo
+        const stalePendienteIds = mappedSolFondo
           .filter(s => solicitudFondoCreditoEsHuerfana(s, creditosNormalizados))
           .map(s => s.id);
-        if (staleSolIds.length > 0) {
+        if (stalePendienteIds.length > 0) {
           void supabase
             .from('solicitudes_fondo_credito')
             .update({ estado: 'cancelado' })
-            .in('id', staleSolIds)
+            .in('id', stalePendienteIds)
             .eq('estado', 'pendiente');
         }
+        const staleFondadoIds = mappedSolFondo
+          .filter(s => solicitudFondoCreditoFondadoObsoletaEnDb(s, creditosNormalizados, cajaRowsFetch))
+          .map(s => s.id);
+        if (staleFondadoIds.length > 0) {
+          void supabase
+            .from('solicitudes_fondo_credito')
+            .update({ estado: 'cancelado' })
+            .in('id', staleFondadoIds)
+            .eq('estado', 'fondado');
+        }
+        const staleSolIds = [...new Set([...stalePendienteIds, ...staleFondadoIds])];
         setSolicitudesFondoCredito(
           mappedSolFondo.map(s => (staleSolIds.includes(s.id) ? { ...s, estado: 'cancelado' as const } : s)),
         );
@@ -5328,6 +5394,10 @@ export default function App() {
     () => data.config.cierreCajaMarcosAt ?? null,
     [data.config.cierreCajaMarcosAt],
   );
+  const jornadaSinBloqueosPruebas = useMemo(
+    () => Boolean(data.config.jornadaSinBloqueosPruebas),
+    [data.config.jornadaSinBloqueosPruebas],
+  );
 
   const miRendicionHoy = useMemo(() => {
     const h = hoy();
@@ -5363,7 +5433,7 @@ export default function App() {
       cantGastos: gastosH.length,
     };
     /** Solo congelar mientras espera validación de Marcos; si ya fue aceptada, seguir sumando cobros en vivo. */
-    if (miRendicionHoy && !miRendicionHoy.validado) {
+    if (!jornadaSinBloqueosPruebas && miRendicionHoy && !miRendicionHoy.validado) {
       const totalCobradoCong = redondearPesos(Number(miRendicionHoy.totalSistema) || 0);
       const totalGastosCong = redondearPesos(Number(miRendicionHoy.totalGastos) || 0);
       const netoCong = redondearPesos(
@@ -5383,21 +5453,21 @@ export default function App() {
       ...live,
       congeladoRendicion: false as const,
     };
-  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy, jornadaSinBloqueosPruebas]);
 
   const esperandoValidacionRendicion = useMemo(() => Boolean(miRendicionHoy && !miRendicionHoy.validado), [miRendicionHoy]);
   const jornadaCerradaValidadaHoy = useMemo(() => Boolean(miRendicionHoy && miRendicionHoy.validado), [miRendicionHoy]);
   const cobradorBloqueadoCobros = useMemo(
-    () => (rol || '').toLowerCase() === 'cobrador' && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
-    [rol, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
+    () => !jornadaSinBloqueosPruebas && (rol || '').toLowerCase() === 'cobrador' && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
+    [jornadaSinBloqueosPruebas, rol, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
   );
   const puedeCerrarJornadaCampo = useMemo(
-    () => esUsuarioCampoConCaja && !miRendicionHoy,
-    [esUsuarioCampoConCaja, miRendicionHoy],
+    () => esUsuarioCampoConCaja && (jornadaSinBloqueosPruebas || !miRendicionHoy),
+    [esUsuarioCampoConCaja, jornadaSinBloqueosPruebas, miRendicionHoy],
   );
   const usuarioCampoBloqueadoOperaciones = useMemo(
-    () => esUsuarioCampoConCaja && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
-    [esUsuarioCampoConCaja, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
+    () => !jornadaSinBloqueosPruebas && esUsuarioCampoConCaja && (esperandoValidacionRendicion || jornadaCerradaValidadaHoy),
+    [jornadaSinBloqueosPruebas, esUsuarioCampoConCaja, esperandoValidacionRendicion, jornadaCerradaValidadaHoy],
   );
   const rendicionesPendientesAdmin = useMemo(
     () => cierresJornada.filter(c => !c.validado),
@@ -5474,6 +5544,14 @@ export default function App() {
   const misSolicitudesFondoCreditoVigentes = useMemo(
     () => misSolicitudesFondoCredito.filter(s => solicitudFondoCreditoVigente(s, creditosOrEmpty)),
     [misSolicitudesFondoCredito, creditosOrEmpty],
+  );
+
+  /** Ingresos de Marcos que siguen en caja del cobrador (crédito activo + movimiento en caja). */
+  const misSolicitudesFondoCreditoFondadosVigentes = useMemo(
+    () => misSolicitudesFondoCredito.filter(s =>
+      solicitudFondoCreditoIngresoCajaVigente(s, creditosOrEmpty, movimientosCaja, authUserId, user, loginEmail),
+    ),
+    [misSolicitudesFondoCredito, creditosOrEmpty, movimientosCaja, authUserId, user, loginEmail],
   );
 
   const cumpleañosHoy = useMemo(() => {
@@ -8010,11 +8088,15 @@ export default function App() {
       const du = (n.destinatario_usuario || '').trim().toLowerCase();
       const dr = (n.destinatario_rol || '').toLowerCase();
       const rolCoincide = dr === r || (dr === 'admin' && ['admin', 'root', 'super'].includes(r));
-      if (du && emailNorm && du === emailNorm) return true;
-      if (rolCoincide) return true;
-      return false;
+      const esDelUsuario = (du && emailNorm && du === emailNorm) || rolCoincide;
+      if (!esDelUsuario) return false;
+      const titulo = String(n.titulo ?? '').toLowerCase();
+      if (titulo.includes('ingreso en caja')) {
+        return misSolicitudesFondoCreditoFondadosVigentes.length > 0;
+      }
+      return true;
     });
-  }, [notificacionesOrEmpty, rol, loginEmail]);
+  }, [notificacionesOrEmpty, rol, loginEmail, misSolicitudesFondoCreditoFondadosVigentes]);
   const notificacionesNoLeidas = useMemo(() => notificacionesUsuario.filter(n => !n.leido).length, [notificacionesUsuario]);
   const getDiasAtrasoCredito = useCallback((credito: Credito | null | undefined) => {
     if (!credito || !['ACTIVO', 'VIGENTE', 'APROBADO'].includes(String(credito.estado || '').toUpperCase())) return 0;
@@ -8330,16 +8412,37 @@ export default function App() {
       gps_lng: gps.lng,
     };
 
-    const { data: inserted, error } = await supabase.from('rendiciones').insert([rowDb as any]).select('*').single();
+    let inserted: Record<string, unknown> | null = null;
+    let error: { code?: string; message?: string } | null = null;
+    ({ data: inserted, error } = await supabase.from('rendiciones').insert([rowDb as any]).select('*').single());
 
     let cierre: Cierre;
     if (error) {
       const code = String((error as { code?: string }).code || '');
       const msg = String(error.message || '');
       if (code === '23505' || msg.toLowerCase().includes('duplicate')) {
-        alert('Ya registraste el cierre de jornada de hoy.');
-        return;
+        if (jornadaSinBloqueosPruebas) {
+          const { data: updated, error: updErr } = await supabase
+            .from('rendiciones')
+            .update(rowDb as any)
+            .eq('cobrador_id', cobradorId)
+            .eq('fecha_jornada', hoy())
+            .select('*')
+            .single();
+          if (updErr) {
+            console.error('rendiciones update (modo pruebas):', updErr);
+            alert('No se pudo actualizar el cierre de jornada de hoy.');
+            return;
+          }
+          inserted = updated as Record<string, unknown>;
+          error = null;
+        } else {
+          alert('Ya registraste el cierre de jornada de hoy.');
+          return;
+        }
       }
+    }
+    if (error) {
       console.error('rendiciones insert:', error);
       cierre = {
         id: genId(),
@@ -8711,7 +8814,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
     };
   }, [rutaGruposBaseItems, pagosOrEmpty, visitasFallidasOrEmpty, authUserId, user, loginEmail]);
 
-  const rutaBloqueadaPorCierreHoy = rutaDiaCerradoFecha === hoy();
+  const rutaBloqueadaPorCierreHoy = !jornadaSinBloqueosPruebas && rutaDiaCerradoFecha === hoy();
 
   useEffect(() => {
     if (!menuPerfilAbierto) return;
@@ -9172,11 +9275,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             </p>
           </div>
         )}
-        {misSolicitudesFondoCredito.some(s => s.estado === 'fondado') && (
+        {misSolicitudesFondoCreditoFondadosVigentes.length > 0 && (
           <div className="mb-4 rounded-2xl border border-green-500/35 bg-green-950/30 px-4 py-3 text-sm text-green-100">
             <p className="font-semibold text-green-300">Ingresos de Marcos en tu caja</p>
             <ul className="mt-2 space-y-1 text-xs">
-              {misSolicitudesFondoCredito.filter(s => s.estado === 'fondado').slice(0, 5).map(s => {
+              {misSolicitudesFondoCreditoFondadosVigentes.slice(0, 5).map(s => {
                 const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(s.cliente_id));
                 return (
                   <li key={s.id}>
@@ -9440,6 +9543,12 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             {/* Cobrador / vendedor: caja del día y cierre de jornada (pendiente hasta recepción Marcos) */}
             {esUsuarioCampoConCaja && (
               <div className="space-y-3">
+                {jornadaSinBloqueosPruebas && (
+                  <div className="rounded-2xl border border-violet-500/45 bg-violet-500/10 p-3 text-center text-sm text-violet-200">
+                    <p className="font-semibold">🧪 Modo pruebas activo (Root)</p>
+                    <p className="text-xs text-violet-100/70 mt-1">Sin bloqueo de cobros, cierres de jornada ni ruta por día cerrado.</p>
+                  </div>
+                )}
                 {(usuarioCampoBloqueadoOperaciones || cobradorBloqueadoCobros) && (
                   <div className={`rounded-2xl border p-3 text-center text-sm ${esperandoValidacionRendicion ? 'border-amber-500/50 bg-amber-500/10 text-amber-200' : 'border-sky-500/40 bg-sky-500/10 text-sky-200'}`}>
                     {esperandoValidacionRendicion && (

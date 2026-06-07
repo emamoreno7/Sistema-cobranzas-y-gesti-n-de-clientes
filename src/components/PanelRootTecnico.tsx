@@ -83,6 +83,49 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [filtroSesion, setFiltroSesion] = useState('');
   const [nuevoTicket, setNuevoTicket] = useState({ titulo: '', descripcion: '', prioridad: 'media' });
+  const [jornadaSinBloqueosPruebas, setJornadaSinBloqueosPruebas] = useState(false);
+  const [guardandoJornadaPruebas, setGuardandoJornadaPruebas] = useState(false);
+
+  const cargarConfigSistema = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('configuracion')
+      .select('jornada_sin_bloqueos_pruebas')
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      console.error('configuracion (root):', error);
+      return;
+    }
+    setJornadaSinBloqueosPruebas(Boolean(data?.jornada_sin_bloqueos_pruebas));
+  }, []);
+
+  const toggleJornadaSinBloqueosPruebas = useCallback(async () => {
+    const nuevo = !jornadaSinBloqueosPruebas;
+    setGuardandoJornadaPruebas(true);
+    try {
+      const now = new Date().toISOString();
+      const { error } = await supabase.from('configuracion').upsert([{
+        id: 'global_config',
+        jornada_sin_bloqueos_pruebas: nuevo,
+        updated_at: now,
+      }], { onConflict: 'id' });
+      if (error) {
+        alert('No se pudo guardar: ' + (error.message || 'error desconocido'));
+        return;
+      }
+      setJornadaSinBloqueosPruebas(nuevo);
+      await supabase.from('audit_logs').insert([{
+        actor: 'root',
+        accion: nuevo ? 'JORNADA_PRUEBAS_ON' : 'JORNADA_PRUEBAS_OFF',
+        detalle: nuevo
+          ? 'Modo pruebas: sin bloqueo de cobros/cierres/ruta'
+          : 'Modo pruebas desactivado: bloqueos normales',
+      }]);
+    } finally {
+      setGuardandoJornadaPruebas(false);
+    }
+  }, [jornadaSinBloqueosPruebas]);
 
   const cargarDatos = useCallback(async () => {
     setLoading(true);
@@ -106,7 +149,8 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
 
   useEffect(() => {
     void cargarDatos();
-  }, [cargarDatos]);
+    void cargarConfigSistema();
+  }, [cargarDatos, cargarConfigSistema]);
 
   const sesionesFiltradas = useMemo(() => {
     const q = filtroSesion.trim().toLowerCase();
@@ -388,8 +432,38 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
               Marcos y cobradores usan la app de gestión; vos solo esta consola.
             </p>
             <p className="text-xs text-gray-500">
-              Migraciones: 030 (sesiones, tickets, permisos root).
+              Migraciones: 030 (sesiones, tickets), 046 (modo pruebas jornada).
             </p>
+          </div>
+          <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-4 space-y-3">
+            <div>
+              <p className="font-semibold text-white">Modo pruebas — jornada sin bloqueos</p>
+              <p className="text-xs text-gray-400 leading-relaxed mt-1">
+                Permite a cobradores y vendedores cobrar, cerrar jornada y usar la ruta «Por cobrar» sin esperar las 00:00
+                ni quedar bloqueados tras rendición. Solo para pruebas; desactivá al terminar.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={guardandoJornadaPruebas}
+              onClick={() => void toggleJornadaSinBloqueosPruebas()}
+              className={`w-full py-3 rounded-xl border font-semibold text-sm transition ${
+                jornadaSinBloqueosPruebas
+                  ? 'bg-violet-600/30 border-violet-400/50 text-violet-100'
+                  : 'bg-gray-800 border-gray-600 text-gray-300'
+              } disabled:opacity-50`}
+            >
+              {guardandoJornadaPruebas
+                ? 'Guardando…'
+                : jornadaSinBloqueosPruebas
+                  ? '🧪 ACTIVO — Tocar para desactivar'
+                  : 'Activar modo pruebas (sin bloqueos)'}
+            </button>
+            {jornadaSinBloqueosPruebas && (
+              <p className="text-[11px] text-violet-300/80 text-center">
+                Los usuarios en campo verán un aviso violeta. Los cambios se aplican al instante vía realtime.
+              </p>
+            )}
           </div>
           <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 space-y-2">
             <p className="font-semibold text-white">Herramientas</p>
