@@ -23,7 +23,8 @@ export type AuditAction =
   | 'CIERRE_DIA_RUTA'
   | 'RENDICION_ACEPTADA'
   | 'CONFIG_CAMBIO'
-  | 'CREDITO_ELIMINADO';
+  | 'CREDITO_ELIMINADO'
+  | 'ASIGNAR_COBRADOR_FICHA';
 
 type AuditItem = {
   id: string;

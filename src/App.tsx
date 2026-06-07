@@ -748,6 +748,8 @@ interface Ficha {
   plan_pago?: PlanPago;
   pagos: { fecha: string; monto: number; dia: number; tipo: 'completo' | 'parcial' | 'mora'; observaciones?: string }[];
   Mora: number; moraPorciento: number;
+  /** Cobrador de campo asignado para cobrar (desde creditos.cobrador_id). */
+  cobradorId?: string | null;
 }
 interface Gasto { id: string; fecha: string; categoria: string; monto: number; nota: string; userId: string; sync: boolean; timestamp: number; }
 interface MovimientoCaja {
@@ -4004,6 +4006,7 @@ export default function App() {
             })),
             Mora: 0,
             moraPorciento: M.moraPorciento,
+            cobradorId: c.cobrador_id != null ? String(c.cobrador_id) : null,
           };
         }));
       setPagos((verTodosLosCreditos ? pagosRaw : pagosRawVisibles).map(p => ({
@@ -4439,7 +4442,7 @@ export default function App() {
   }, [mAuditoria, esMarcosPUsuario]);
 
   useEffect(() => {
-    if (!mCreditoRevision || !esMarcosPUsuario) {
+    if (!esMarcosPUsuario) {
       setCobradoresRevision([]);
       return;
     }
@@ -4453,7 +4456,7 @@ export default function App() {
         .order('username');
       if (cancelled) return;
       if (error) {
-        devWarn('fetch usuarios cobradores (revisión crédito):', error);
+        devWarn('fetch usuarios cobradores:', error);
         setCobradoresRevision([]);
         return;
       }
@@ -4467,7 +4470,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [mCreditoRevision, esMarcosPUsuario]);
+  }, [esMarcosPUsuario]);
 
   const fetchVendedoresComisionAdmin = useCallback(async () => {
     if (!esMarcosPUsuario) {
@@ -6671,6 +6674,32 @@ export default function App() {
   // ==========================================
   // FICHAS
   // ==========================================
+  const handleAsignarCobradorFicha = async (fichaId: string, cobradorId: string) => {
+    if (!esMarcosPUsuario) {
+      alert('Solo el administrador puede reasignar el cobrador de una ficha.');
+      return;
+    }
+    const idCred = fichaIdUuid(fichaId);
+    const cobId = String(cobradorId || '').trim();
+    if (!idCred || !cobId) {
+      alert('Seleccioná un cobrador o vendedor.');
+      return;
+    }
+    const etiquetaNueva = etiquetaCobradorMovimiento(cobId);
+    const { error } = await supabase.from('creditos').update({ cobrador_id: cobId }).eq('id', idCred);
+    if (error) {
+      console.error('asignar cobrador ficha:', error);
+      alert('No se pudo guardar la asignación: ' + (error.message || 'error'));
+      return;
+    }
+    setCreditos(prev => prev.map(c => (fichaIdUuid(c.id) === idCred ? { ...c, cobrador_id: cobId } : c)));
+    setFichas(prev => prev.map(f => (fichaIdUuid(f.id) === idCred ? { ...f, cobradorId: cobId } : f)));
+    audit('ASIGNAR_COBRADOR_FICHA', `Ficha ${idCred} → ${etiquetaNueva}`);
+    void logAuditDb('ASIGNAR_COBRADOR_FICHA', `credito ${idCred}; cobrador ${etiquetaNueva}`);
+    alert(`Cobrador asignado: ${etiquetaNueva}. El usuario verá la ficha al recargar o en unos segundos (tiempo real).`);
+    await fetchData({ silencioso: true });
+  };
+
   const handleSaveFicha = async (fic: Partial<Ficha>) => {
     if (!fic.clienteId || !fic.montoTotal) { alert('Datos incompletos: falta clienteId o montoTotal'); return; }
     const cli = clientesOrEmpty.find(c => c.id === fic.clienteId);
@@ -6691,14 +6720,19 @@ export default function App() {
       save({ fichas: editada });
       const row = editada.find(x => x.id === fic.id);
       if (row) {
-        const cobradorFicha = String(user || loginEmail || 'sin_usuario').trim();
+        const creditoPrev = creditosOrEmpty.find(c => fichaIdUuid(c.id) === fichaIdUuid(row.id));
+        const cobradorFicha = String(
+          fic.cobradorId ?? row.cobradorId ?? creditoPrev?.cobrador_id ?? user ?? loginEmail ?? 'sin_usuario',
+        ).trim();
         const dbRow = {
           cliente_id: fichaIdUuid(String(row.clienteId)),
           monto_solicitado: montoTotal,
           monto_total: montoTotal,
           cuotas: cuotasTotales,
           plan: planPago === 'Diario' ? 'Diario' : 'Semanal',
-          estado: 'PENDIENTE',
+          estado: creditoPrev?.estado && ['ACTIVO', 'VIGENTE', 'APROBADO'].includes(String(creditoPrev.estado).toUpperCase())
+            ? String(creditoPrev.estado).toUpperCase()
+            : 'PENDIENTE',
           fecha_inicio: row.fecha_inicio || row.fecha || hoy(),
           cobrador_id: cobradorFicha ? (fichaIdUuid(cobradorFicha) || cobradorFicha) : cobradorFicha,
         };
@@ -9925,6 +9959,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                         <p className="font-bold">{nombreCompletoCliente(cli) ?? '—'}</p>
                         <p className="text-xs text-gray-400">{fic.tipo === 'prestamo' ? '💳 Préstamo' : '🛒 Venta'} · {fic.cuotasPagas}/{fic.cuotas} cuotas</p>
                         <p className="text-[11px] text-cyan-300">Producto: {productoFichaLabel(fic)}</p>
+                        {esMarcosPUsuario && (
+                          <p className="text-[11px] text-violet-300 mt-1">
+                            👤 Cobrador: {fic.cobradorId ? etiquetaCobradorMovimiento(fic.cobradorId) : 'Sin asignar'}
+                          </p>
+                        )}
                       </div>
                       <div className="text-right">
                         <p className="font-bold text-indigo-400">{fmt(saldoRestante)}</p>
@@ -11423,6 +11462,11 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                           <p className="text-sm font-semibold truncate">{productoFichaLabel(f)}</p>
                           <p className="text-xs text-gray-500">Ficha: {f.id}</p>
                           <p className="text-xs text-gray-400">{f.cuotasPagas}/{f.cuotas} cuotas · Estado: {String(f.estado).replace(/_/g, ' ')}</p>
+                          {esMarcosPUsuario && (
+                            <p className="text-[11px] text-violet-300 mt-1">
+                              👤 Cobrador: {f.cobradorId ? etiquetaCobradorMovimiento(f.cobradorId) : 'Sin asignar'}
+                            </p>
+                          )}
                         </div>
                         <div className="text-right">
                           <p className="text-xs text-gray-500">Saldo real</p>
@@ -11812,6 +11856,9 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             onSetTab={setTab}
             onEliminarPago={handleEliminarPago}
             puedeEliminarPagos={esMarcosPUsuario}
+            puedeAsignarCobrador={esMarcosPUsuario}
+            cobradoresOpciones={cobradoresRevision}
+            onAsignarCobrador={(fichaId, cobradorId) => void handleAsignarCobradorFicha(fichaId, cobradorId)}
           />
         </Modal>
       )}
@@ -13429,9 +13476,49 @@ function ClienteForm({
   );
 }
 
-function FichaForm({ ficha, cliente, clientes, onSave, onTab, onSetTab, onEliminarPago, puedeEliminarPagos = true }: { ficha?: Ficha; cliente: Cliente | null; clientes: Cliente[]; onSave: (f: Partial<Ficha>) => void; onTab: number; onSetTab: (t: number) => void; onEliminarPago: (ficha: Ficha, idx: number) => void; puedeEliminarPagos?: boolean }) {
+function FichaForm({
+  ficha,
+  cliente,
+  clientes,
+  onSave,
+  onTab,
+  onSetTab,
+  onEliminarPago,
+  puedeEliminarPagos = true,
+  puedeAsignarCobrador = false,
+  cobradoresOpciones = [],
+  onAsignarCobrador,
+}: {
+  ficha?: Ficha;
+  cliente: Cliente | null;
+  clientes: Cliente[];
+  onSave: (f: Partial<Ficha>) => void;
+  onTab: number;
+  onSetTab: (t: number) => void;
+  onEliminarPago: (ficha: Ficha, idx: number) => void;
+  puedeEliminarPagos?: boolean;
+  puedeAsignarCobrador?: boolean;
+  cobradoresOpciones?: Array<{ valor: string; label: string }>;
+  onAsignarCobrador?: (fichaId: string, cobradorId: string) => void | Promise<void>;
+}) {
   const [f, setF] = useState<Partial<Ficha>>(() => ficha || { clienteId: cliente?.id || '', tipo: 'prestamo', montoTotal: 0, cuotas: 4, costo: 0, plan_pago: 'Mensual' });
+  const [cobradorSel, setCobradorSel] = useState(() => String(ficha?.cobradorId ?? '').trim());
+  const [guardandoCobrador, setGuardandoCobrador] = useState(false);
   const s = (k: keyof Ficha, v: any) => setF(prev => ({ ...prev, [k]: v }));
+
+  useEffect(() => {
+    const cid = String(ficha?.cobradorId ?? '').trim();
+    if (cid) {
+      setCobradorSel(cid);
+      return;
+    }
+    setCobradorSel(cobradoresOpciones[0]?.valor ?? '');
+  }, [ficha?.id, ficha?.cobradorId, cobradoresOpciones]);
+
+  const cobradorAsignadoLabel = ficha?.cobradorId
+    ? etiquetaCobradorMovimiento(ficha.cobradorId)
+    : 'Sin asignar';
+
   return (
     <div className="space-y-4">
       <div className="flex bg-gray-800 rounded-xl p-1 gap-1">
@@ -13441,6 +13528,43 @@ function FichaForm({ ficha, cliente, clientes, onSave, onTab, onSetTab, onElimin
       </div>
       {onTab === 0 && (
         <div className="space-y-4">
+          {ficha && (
+            <div className="rounded-xl border border-violet-500/30 bg-violet-950/25 p-3 space-y-2">
+              <p className="text-xs text-violet-200 font-semibold">Cobrador asignado para cobrar</p>
+              <p className="text-sm text-white font-bold">{cobradorAsignadoLabel}</p>
+              {puedeAsignarCobrador && onAsignarCobrador && (
+                <>
+                  <select
+                    value={cobradorSel}
+                    onChange={e => setCobradorSel(e.target.value)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white text-sm"
+                  >
+                    {cobradoresOpciones.length === 0 ? (
+                      <option value="">— Sin cobradores en usuarios —</option>
+                    ) : (
+                      cobradoresOpciones.map(o => (
+                        <option key={`${o.valor}-${o.label}`} value={o.valor}>{o.label}</option>
+                      ))
+                    )}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={guardandoCobrador || !cobradorSel.trim()}
+                    onClick={() => {
+                      setGuardandoCobrador(true);
+                      void Promise.resolve(onAsignarCobrador(ficha.id, cobradorSel.trim())).finally(() => {
+                        setGuardandoCobrador(false);
+                      });
+                    }}
+                    className="w-full bg-violet-600 text-white font-bold py-3 rounded-xl active:scale-95 transition disabled:opacity-50"
+                  >
+                    {guardandoCobrador ? 'Guardando…' : '💾 Guardar cobrador asignado'}
+                  </button>
+                  <p className="text-[10px] text-gray-500">El usuario elegido verá esta ficha en su lista y podrá cobrar.</p>
+                </>
+              )}
+            </div>
+          )}
           {!ficha && (<div><label className="text-xs text-gray-400 block mb-1">Cliente</label><select id="selCliente" value={f.clienteId || ''} onChange={e => s('clienteId', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"><option value="">Seleccionar...</option>{clientes.map(c => <option key={c?.id ?? ''} value={c?.id ?? ''}>{nombreCompletoCliente(c) ?? '—'}</option>)}</select></div>)}
           <div><label className="text-xs text-gray-400 block mb-1">Tipo</label><select value={f.tipo || 'prestamo'} onChange={e => s('tipo', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"><option value="prestamo">💳 Préstamo</option><option value="venta">🛒 Venta</option></select></div>
           <div><label className="text-xs text-gray-400 block mb-1">Monto Total</label><input type="number" value={f.montoTotal || ''} onChange={e => s('montoTotal', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
