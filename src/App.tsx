@@ -4081,13 +4081,10 @@ export default function App() {
       let cajaRowsFetch: MovimientoCaja[] = [];
       {
         let cajaQuery = supabase.from('caja').select('*').order('created_at', { ascending: false }).limit(300);
-        if (!verTodosLosCreditos) {
-          if (cobradorIdsFilter.length === 0) {
-            cajaQuery = cajaQuery.limit(0);
-          } else {
-            cajaQuery = cajaQuery.in('cobrador_id', cobradorIdsFilter);
-          }
+        if (!verTodosLosCreditos && cobradorIdsFilter.length === 0) {
+          cajaQuery = cajaQuery.limit(0);
         }
+        /** Sin filtro cobrador_id en campo: ingreso Marcos y entrega crédito pueden estar con el cobrador asignado al crédito. */
         const { data: cajaDb, error: cajaErr } = await cajaQuery;
         if (cajaErr) {
           devWarn('Supabase fetch caja:', cajaErr);
@@ -5523,7 +5520,7 @@ export default function App() {
       return movimientoCajaDelCobradorSesion(m, authUserId, user, loginEmail, creditoIdsAsignadosSesion);
     });
     const ingresosCaja = redondearPesos(
-      movsHoy.filter(esIngresoMarcosFondoCreditoCaja).reduce((s, m) => s + m.monto, 0),
+      movsHoy.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0),
     );
     const salidasEntregaCredito = redondearPesos(
       movsHoy.filter(esSalidaEntregaCreditoCaja).reduce((s, m) => s + m.monto, 0),
@@ -7427,7 +7424,7 @@ export default function App() {
       alert(
         'No se pudo guardar el gasto en el servidor. '
         + (ins.error.message || 'Error desconocido')
-        + '\n\nEjecutá en Supabase la migración 048_gastos_uuid_default_fix.sql.',
+        + '\n\nEjecutá en Supabase la migración 049_gastos_columnas_app.sql y recargá el schema (Settings → API → Reload schema).',
       );
       return;
     }
