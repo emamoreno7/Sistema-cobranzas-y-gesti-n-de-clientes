@@ -2798,7 +2798,7 @@ function solicitudFondoCreditoIngresoCajaVigente(
   const monto = redondearPesos(Number(sol.monto) || 0);
   if (!creditoId || monto <= 0) return false;
   return movimientos.some(m =>
-    m.tipo === 'entrada'
+    esIngresoMarcosFondoCreditoCaja(m)
     && String(m.createdAt).slice(0, 10) === fecha
     && fichaIdUuid(m.fichaId ?? '') === creditoId
     && redondearPesos(m.monto) === monto
@@ -2825,40 +2825,141 @@ function solicitudFondoCreditoFondadoObsoletaEnDb(
   const monto = redondearPesos(Number(sol.monto) || 0);
   if (!creditoId || monto <= 0) return true;
   return !movimientos.some(m =>
-    m.tipo === 'entrada'
+    esIngresoMarcosFondoCreditoCaja(m)
     && String(m.createdAt).slice(0, 10) === fecha
     && fichaIdUuid(m.fichaId ?? '') === creditoId
     && redondearPesos(m.monto) === monto,
   );
 }
 
-/** Sin cobranzas ni ingresos previos en caja del cobrador que crea el crédito. */
-function cobradorSinRecaudadoEnCaja(
+function movimientoCajaDelCobradorId(
+  m: MovimientoCaja,
+  cobradorId: string,
+  creditoIdsAsignados: Set<string>,
+): boolean {
+  const cid = String(cobradorId || '').trim();
+  if (!cid) return false;
+  if (cobradorIdCoincideConSesion(m.cobradorId, cid, cid, null)) return true;
+  const fid = m.fichaId ? fichaIdUuid(m.fichaId) : '';
+  return Boolean(fid && creditoIdsAsignados.has(fid));
+}
+
+function creditoIdsVisiblesParaCobradorId(
+  creditos: Credito[],
+  cobradorId: string,
+): Set<string> {
+  return new Set(
+    creditos
+      .filter(c => {
+        const cid = String(c.cobrador_id ?? c.creado_por ?? '').trim();
+        return cid && cobradorIdCoincideConSesion(cid, cobradorId, cobradorId, null);
+      })
+      .map(c => fichaIdUuid(c.id)),
+  );
+}
+
+/** Efectivo en mano del cobrador en la jornada (cobrado + fondo Marcos − gastos − entregas). */
+function efectivoEnManoCobradorId(
   cobradorId: string,
   pagos: PagoRegistro[],
+  gastos: Gasto[],
   movimientos: MovimientoCaja[],
-  authUserId: string | null,
-  username: string | null,
-  loginEmail: string | null,
+  creditoIdsAsignados: Set<string>,
+  inicioMs: number,
+): number {
+  const cid = String(cobradorId || '').trim();
+  if (!cid) return 0;
+  const pagosH = pagos.filter(p =>
+    perteneceJornadaActual(tsPagoRegistro(p), inicioMs)
+    && esPagoEfectivo(p)
+    && esRegistroDelCobrador(p, cid, cid, null),
+  );
+  const totalCobrado = redondearPesos(pagosH.reduce((s, p) => s + (Number(p.monto) || 0), 0));
+  const gastosH = gastos.filter(g =>
+    perteneceJornadaActual(g.timestamp || new Date(`${String(g.fecha || hoy())}T12:00:00`).getTime(), inicioMs)
+    && cobradorIdCoincideConSesion(g.userId, cid, cid, null),
+  );
+  const totalGastos = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
+  const movs = movimientos.filter(m =>
+    perteneceJornadaActual(new Date(m.createdAt).getTime(), inicioMs)
+    && movimientoCajaDelCobradorId(m, cid, creditoIdsAsignados),
+  );
+  const ingresosMarcos = redondearPesos(
+    movs.filter(esIngresoMarcosFondoCreditoCaja).reduce((s, m) => s + m.monto, 0),
+  );
+  const salidasEntrega = redondearPesos(
+    movs.filter(esSalidaEntregaCreditoCaja).reduce((s, m) => s + m.monto, 0),
+  );
+  const salidasOtras = redondearPesos(
+    movs
+      .filter(m =>
+        m.tipo === 'salida'
+        && !esSalidaEntregaCreditoCaja(m)
+        && !esSalidaGastoDuplicadoEnCaja(m)
+        && !esSalidaRendicionRecibidaCaja(m),
+      )
+      .reduce((s, m) => s + m.monto, 0),
+  );
+  return redondearPesos(totalCobrado + ingresosMarcos - totalGastos - salidasEntrega - salidasOtras);
+}
+
+function tieneIngresoMarcosFondoParaCredito(
+  movimientos: MovimientoCaja[],
+  creditoId: string,
+  monto: number,
+  cobradorId: string,
 ): boolean {
-  const cobradoPagos = pagos
-    .filter(p => esPagoEfectivo(p) && esRegistroDelCobrador(p, authUserId, username, loginEmail))
-    .reduce((s, p) => s + redondearPesos(Number(p.monto) || 0), 0);
-  if (cobradoPagos > 0) return false;
-  const k = String(cobradorId || authUserId || username || loginEmail || '').trim();
-  const entradas = movimientos
-    .filter(m => {
-      if (m.tipo !== 'entrada' || m.monto <= 0) return false;
-      const mc = String(m.cobradorId || '').trim();
-      return mc === k || esRegistroDelCobrador({ cobradorId: mc, userId: mc } as PagoRegistro, authUserId, username, loginEmail);
-    })
-    .reduce((s, m) => s + m.monto, 0);
-  return entradas <= 0;
+  const cid = fichaIdUuid(creditoId);
+  const montoR = redondearPesos(monto);
+  if (!cid || montoR <= 0) return false;
+  return movimientos.some(m =>
+    esIngresoMarcosFondoCreditoCaja(m)
+    && fichaIdUuid(m.fichaId ?? '') === cid
+    && redondearPesos(m.monto) === montoR
+    && cobradorIdCoincideConSesion(m.cobradorId, cobradorId, cobradorId, null),
+  );
+}
+
+async function ingresoMarcosFondoCreditoEnBd(
+  creditoId: string,
+  monto: number,
+  cobradorId: string,
+): Promise<boolean> {
+  const cid = fichaIdUuid(creditoId);
+  if (!cid) return false;
+  const { data, error } = await supabase
+    .from('caja')
+    .select('tipo, monto, descripcion, ficha_id, cobrador_id')
+    .eq('ficha_id', cid)
+    .eq('tipo', 'entrada');
+  if (error) {
+    devWarn('ingresoMarcosFondoCreditoEnBd:', error);
+    return false;
+  }
+  const movs: MovimientoCaja[] = (data ?? []).map(row => {
+    const r = row as Record<string, unknown>;
+    return {
+      id: '',
+      tipo: 'entrada',
+      monto: Number(r.monto) || 0,
+      descripcion: String(r.descripcion ?? ''),
+      cobradorId: String(r.cobrador_id ?? ''),
+      fichaId: String(r.ficha_id ?? ''),
+      createdAt: hoy(),
+    };
+  });
+  return tieneIngresoMarcosFondoParaCredito(movs, creditoId, monto, cobradorId);
 }
 
 function descripcionIngresoMarcosCredito(nombreCliente: string): string {
   const nom = (nombreCliente || 'cliente').trim();
   return `Ingreso de Marcos para crédito entregado — ${nom}`;
+}
+
+function esIngresoMarcosFondoCreditoCaja(m: MovimientoCaja): boolean {
+  const d = String(m.descripcion ?? '').toLowerCase();
+  return m.tipo === 'entrada'
+    && (d.includes('ingreso de marcos') || d.includes('marcos para crédito') || d.includes('marcos para credito'));
 }
 
 function esSalidaEntregaCreditoCaja(m: MovimientoCaja): boolean {
@@ -2946,6 +3047,118 @@ async function obtenerSaldoCajaPropiaDesdeDb(): Promise<number> {
     saldo += String(r.tipo ?? 'entrada') === 'salida' ? -m : m;
   }
   return redondearPesos(saldo);
+}
+
+type ResultadoFondoCreditoCaja =
+  | { ok: true; cajaId: string }
+  | { ok: false; codigo: 'ya_procesada' | 'saldo_insuficiente' | 'invalido' | 'db_error'; mensaje: string };
+
+/** Ingreso en caja del cobrador + egreso en caja propia de Marcos (idempotente por solicitud). */
+async function fondarSolicitudCreditoEnCajaPropia(
+  sol: SolicitudFondoCredito,
+  nombreCliente: string,
+  actor: string,
+  etiquetaCobrador: (id: string) => string,
+): Promise<ResultadoFondoCreditoCaja> {
+  if (sol.estado !== 'pendiente') {
+    return { ok: false, codigo: 'ya_procesada', mensaje: 'Esta solicitud ya fue habilitada.' };
+  }
+  const creditoId = fichaIdUuid(sol.credito_id);
+  const clienteId = normalizarUuidPostgrest(sol.cliente_id);
+  if (!creditoId || !clienteId) {
+    return { ok: false, codigo: 'invalido', mensaje: 'Solicitud con crédito o cliente inválido.' };
+  }
+
+  const { data: egresoPrevio } = await supabase
+    .from('caja_propia_movimientos')
+    .select('id')
+    .eq('solicitud_fondo_id', sol.id)
+    .maybeSingle();
+  if (egresoPrevio) {
+    return { ok: false, codigo: 'ya_procesada', mensaje: 'Esta solicitud ya tiene un egreso en caja propia.' };
+  }
+
+  const revertirSolicitudPendiente = async () => {
+    await supabase
+      .from('solicitudes_fondo_credito')
+      .update({ estado: 'pendiente', fondado_at: null })
+      .eq('id', sol.id);
+  };
+
+  let saldoPropio = await obtenerSaldoCajaPropiaDesdeDb();
+  if (saldoPropio < sol.monto) {
+    return {
+      ok: false,
+      codigo: 'saldo_insuficiente',
+      mensaje: `Saldo de caja propia insuficiente. Disponible: ${fmt(saldoPropio)} · Requerido: ${fmt(sol.monto)}`,
+    };
+  }
+
+  const { data: claimed, error: claimErr } = await supabase
+    .from('solicitudes_fondo_credito')
+    .update({ estado: 'fondado', fondado_at: new Date().toISOString() })
+    .eq('id', sol.id)
+    .eq('estado', 'pendiente')
+    .select('id')
+    .maybeSingle();
+  if (claimErr) {
+    return { ok: false, codigo: 'db_error', mensaje: claimErr.message || 'No se pudo reservar la solicitud.' };
+  }
+  if (!claimed) {
+    return { ok: false, codigo: 'ya_procesada', mensaje: 'Esta solicitud ya fue procesada por otro intento.' };
+  }
+
+  saldoPropio = await obtenerSaldoCajaPropiaDesdeDb();
+  if (saldoPropio < sol.monto) {
+    await revertirSolicitudPendiente();
+    return {
+      ok: false,
+      codigo: 'saldo_insuficiente',
+      mensaje: `Saldo de caja propia insuficiente. Disponible: ${fmt(saldoPropio)} · Requerido: ${fmt(sol.monto)}`,
+    };
+  }
+
+  const desc = descripcionIngresoMarcosCredito(nombreCliente);
+  const cobradorCaja = String(sol.cobrador_id || 'sin_usuario').trim();
+
+  const { data: cajaRow, error: cajaErr } = await supabase
+    .from('caja')
+    .insert([{
+      tipo: 'entrada',
+      monto: sol.monto,
+      descripcion: desc,
+      cobrador_id: cobradorCaja,
+      cliente_id: clienteId,
+      ficha_id: creditoId,
+    } as Record<string, unknown>])
+    .select('id')
+    .single();
+  if (cajaErr) {
+    await revertirSolicitudPendiente();
+    return { ok: false, codigo: 'db_error', mensaje: cajaErr.message || 'No se pudo registrar el ingreso en caja del cobrador.' };
+  }
+  const cajaId = cajaRow != null ? String((cajaRow as Record<string, unknown>).id ?? '') : '';
+
+  const { error: propErr } = await supabase.from('caja_propia_movimientos').insert([{
+    tipo: 'salida',
+    monto: sol.monto,
+    descripcion: `Egreso caja propia — habilitación crédito ${nombreCliente}`,
+    nota: `Solicitud fondo · cobrador ${etiquetaCobrador(cobradorCaja)}`,
+    registrado_por: actor || 'Marcos',
+    solicitud_fondo_id: sol.id,
+    caja_referencia_id: cajaId || null,
+    fecha: hoy(),
+  }]);
+  if (propErr) {
+    await revertirSolicitudPendiente();
+    const code = (propErr as { code?: string }).code;
+    if (code === '23505') {
+      return { ok: false, codigo: 'ya_procesada', mensaje: 'El egreso ya estaba registrado.' };
+    }
+    return { ok: false, codigo: 'db_error', mensaje: propErr.message || 'No se pudo registrar el egreso en caja propia.' };
+  }
+
+  return { ok: true, cajaId };
 }
 
 /**
@@ -5678,7 +5891,7 @@ export default function App() {
       && movimientoCajaDelCobradorSesion(m, authUserId, user, loginEmail, creditoIdsAsignadosSesion),
     );
     const ingresosCaja = redondearPesos(
-      movsHoy.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0),
+      movsHoy.filter(esIngresoMarcosFondoCreditoCaja).reduce((s, m) => s + m.monto, 0),
     );
     const salidasEntregaCredito = redondearPesos(
       movsHoy.filter(esSalidaEntregaCreditoCaja).reduce((s, m) => s + m.monto, 0),
@@ -5872,8 +6085,8 @@ export default function App() {
     movimientosCaja.forEach(m => {
       const fd = String(m.createdAt).slice(0, 10);
       if (fd !== h || !perteneceContadorMarcosActivo(fd, m.createdAt, corte)) return;
-      if (m.tipo === 'entrada') totalIngresosCajaHoy += redondearPesos(m.monto);
-      else totalSalidasCajaHoy += redondearPesos(m.monto);
+      if (esIngresoMarcosFondoCreditoCaja(m)) totalIngresosCajaHoy += redondearPesos(m.monto);
+      else if (m.tipo === 'salida') totalSalidasCajaHoy += redondearPesos(m.monto);
     });
     totalIngresosCajaHoy = redondearPesos(totalIngresosCajaHoy);
     totalSalidasCajaHoy = redondearPesos(totalSalidasCajaHoy);
@@ -5923,8 +6136,8 @@ export default function App() {
       const fd = String(m.createdAt).slice(0, 10);
       if (fd !== h || !perteneceContadorMarcosActivo(fd, m.createdAt, corte)) return;
       const item = touch(String(m.cobradorId || 'sin_usuario'));
-      if (m.tipo === 'entrada') item.ingresosCaja += redondearPesos(m.monto);
-      else item.salidasCaja += redondearPesos(m.monto);
+      if (esIngresoMarcosFondoCreditoCaja(m)) item.ingresosCaja += redondearPesos(m.monto);
+      else if (m.tipo === 'salida') item.salidasCaja += redondearPesos(m.monto);
     });
     porUsuario.forEach(item => {
       item.enMano = redondearPesos(item.cobrado + item.ingresosCaja - item.gastos - item.salidasCaja);
@@ -7881,114 +8094,26 @@ export default function App() {
     fondoCreditoProcesandoRef.current.add(sol.id);
     setGuardandoFondoCreditoId(sol.id);
 
-    const revertirSolicitudPendiente = async () => {
-      await supabase
-        .from('solicitudes_fondo_credito')
-        .update({ estado: 'pendiente', fondado_at: null })
-        .eq('id', sol.id);
-    };
-
     try {
-      if (sol.estado !== 'pendiente') {
-        alert('Esta solicitud ya fue habilitada.');
-        return;
-      }
-      const creditoId = fichaIdUuid(sol.credito_id);
-      const clienteId = normalizarUuidPostgrest(sol.cliente_id);
-      if (!creditoId || !clienteId) {
-        alert('Solicitud con crédito o cliente inválido.');
-        return;
-      }
-
-      const { data: egresoPrevio } = await supabase
-        .from('caja_propia_movimientos')
-        .select('id')
-        .eq('solicitud_fondo_id', sol.id)
-        .maybeSingle();
-      if (egresoPrevio) {
-        alert('Esta solicitud ya tiene un egreso en caja propia. No se duplicó el movimiento.');
-        await fetchData({ silencioso: true });
-        return;
-      }
-
-      let saldoPropio = await obtenerSaldoCajaPropiaDesdeDb();
-      if (saldoPropio < sol.monto) {
-        alert(
-          `Saldo de caja propia insuficiente.\nDisponible: ${fmt(saldoPropio)}\nRequerido: ${fmt(sol.monto)}\n\nRegistrá un ingreso propio en caja propia antes de habilitar al cobrador.`,
-        );
-        return;
-      }
-
-      const { data: claimed, error: claimErr } = await supabase
-        .from('solicitudes_fondo_credito')
-        .update({ estado: 'fondado', fondado_at: new Date().toISOString() })
-        .eq('id', sol.id)
-        .eq('estado', 'pendiente')
-        .select('id')
-        .maybeSingle();
-      if (claimErr) throw claimErr;
-      if (!claimed) {
-        alert('Esta solicitud ya fue procesada por otro intento. No se duplicó el egreso.');
-        await fetchData({ silencioso: true });
-        return;
-      }
-
-      saldoPropio = await obtenerSaldoCajaPropiaDesdeDb();
-      if (saldoPropio < sol.monto) {
-        await revertirSolicitudPendiente();
-        alert(
-          `Saldo de caja propia insuficiente.\nDisponible: ${fmt(saldoPropio)}\nRequerido: ${fmt(sol.monto)}`,
-        );
-        return;
-      }
-
       const cli = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(sol.cliente_id));
       const nombreCli = nombreCompletoCliente(cli) || 'cliente';
-      const desc = descripcionIngresoMarcosCredito(nombreCli);
       const actor = nombreParaMostrarSesion({
         loginEmail,
         usernameState: user,
         authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
       });
-      const cobradorCaja = String(sol.cobrador_id || 'sin_usuario').trim();
-
-      const { data: cajaRow, error: cajaErr } = await supabase
-        .from('caja')
-        .insert([{
-          tipo: 'entrada',
-          monto: sol.monto,
-          descripcion: desc,
-          cobrador_id: cobradorCaja,
-          cliente_id: clienteId,
-          ficha_id: creditoId,
-        } as Record<string, unknown>])
-        .select('id')
-        .single();
-      if (cajaErr) {
-        await revertirSolicitudPendiente();
-        throw cajaErr;
-      }
-      const cajaId = cajaRow != null ? String((cajaRow as Record<string, unknown>).id ?? '') : '';
-
-      const { error: propErr } = await supabase.from('caja_propia_movimientos').insert([{
-        tipo: 'salida',
-        monto: sol.monto,
-        descripcion: `Egreso caja propia — habilitación crédito ${nombreCli}`,
-        nota: `Solicitud fondo · cobrador ${etiquetaCobradorMovimiento(cobradorCaja)}`,
-        registrado_por: actor || 'Marcos',
-        solicitud_fondo_id: sol.id,
-        caja_referencia_id: cajaId || null,
-        fecha: hoy(),
-      }]);
-      if (propErr) {
-        await revertirSolicitudPendiente();
-        const code = (propErr as { code?: string }).code;
-        if (code === '23505') {
-          alert('El egreso ya estaba registrado. No se duplicó.');
+      const resultado = await fondarSolicitudCreditoEnCajaPropia(
+        sol,
+        nombreCli,
+        actor,
+        etiquetaCobradorMovimiento,
+      );
+      if (!resultado.ok) {
+        if (resultado.codigo === 'ya_procesada') {
           await fetchData({ silencioso: true });
-          return;
         }
-        throw propErr;
+        alert(resultado.mensaje);
+        return;
       }
 
       const emailCob = normalizarEmail(sol.solicitante_email);
@@ -8148,20 +8273,23 @@ export default function App() {
     const esCreadorSinMarcos = !esUsuarioMarcosOperador(user, loginEmail) && !esMarcosPUsuario;
 
     if (esCreadorSinMarcos && !esMensualCred && creditoIdNuevo && capitalOtorgar > 0) {
-      const sinRecaudado = cobradorSinRecaudadoEnCaja(
-        cobradorCreditoNorm,
+      const cobradorFondoId = cobradorCreditoNorm || String(authUserId || user || 'sin_usuario');
+      const inicioMsFondo = inicioJornadaActualMs(cierresJornada, authUserId, user, loginEmail);
+      const creditoIdsFondo = creditoIdsVisiblesParaCobradorId(creditosOrEmpty, cobradorFondoId);
+      const enManoFondo = efectivoEnManoCobradorId(
+        cobradorFondoId,
         pagosOrEmpty,
+        Array.isArray(gastos) ? gastos : [],
         movimientosCaja,
-        authUserId,
-        user,
-        loginEmail,
+        creditoIdsFondo,
+        inicioMsFondo,
       );
-      if (sinRecaudado) {
+      if (enManoFondo < capitalOtorgar) {
         try {
           const { error: solInsErr } = await supabase.from('solicitudes_fondo_credito').insert([{
             credito_id: creditoIdNuevo,
             cliente_id: clienteIdNorm,
-            cobrador_id: cobradorCreditoNorm || String(authUserId || user || 'sin_usuario'),
+            cobrador_id: cobradorFondoId,
             solicitante_email: emailSesion || null,
             solicitante_nombre: etiquetaCreadorCredito,
             monto: capitalOtorgar,
@@ -8172,14 +8300,14 @@ export default function App() {
           } else {
             await crearNotificacion({
               titulo: 'Solicitud ingreso en caja',
-              mensaje: `${etiquetaCreadorCredito} solicita ${fmt(capitalOtorgar)} en caja para crédito de ${nombreCliCred} (sin recaudado previo).`,
+              mensaje: `${etiquetaCreadorCredito} necesita ${fmt(capitalOtorgar)} en caja para el crédito de ${nombreCliCred} (en mano: ${fmt(enManoFondo)}).`,
               destinatario_usuario: EMAIL_ADMIN_MARCOS_CAJA,
               destinatario_rol: 'admin',
               accion: `go_fondo_credito:${creditoIdNuevo}`,
             });
             await crearNotificacion({
               titulo: 'Fondo solicitado a Marcos',
-              mensaje: `Se envió a Marcos la solicitud de ingreso de ${fmt(capitalOtorgar)} para el crédito de ${nombreCliCred}. Verás el ingreso en caja cuando lo registre.`,
+              mensaje: `Se envió a Marcos la solicitud de ${fmt(capitalOtorgar)} para el crédito de ${nombreCliCred}. El ingreso debe igualar la entrega al cliente.`,
               destinatario_usuario: emailSesion || null,
               accion: 'go_creditos',
             });
@@ -8258,18 +8386,74 @@ export default function App() {
       return;
     }
     const idCredito = fichaIdUuid(credito.id);
-    if (estado === 'APROBADO') {
-      const solPend = solicitudesFondoCredito.find(
-        s =>
-          fichaIdUuid(s.credito_id) === idCredito
-          && solicitudFondoCreditoVigenteParaAdmin(s, creditosOrEmpty, solicitudesFondoIdsConEgresoPropia),
+    const clienteCreditoPre = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(credito.cliente_id));
+    const cobradorIdPre = resolverCobradorIdCobroCredito(credito, clienteCreditoPre, review?.cobrador_id_admin);
+    const capitalEntregaPre = redondearPesos(Number(credito.monto_solicitado) || 0);
+
+    if (estado === 'APROBADO' && capitalEntregaPre > 0) {
+      const creditoIdsAsig = creditoIdsVisiblesParaCobradorId(creditosOrEmpty, cobradorIdPre);
+      if (idCredito) creditoIdsAsig.add(idCredito);
+      const inicioMsCobrador = inicioJornadaActualMs(cierresJornada, cobradorIdPre, cobradorIdPre, null);
+      const enManoCobrador = efectivoEnManoCobradorId(
+        cobradorIdPre,
+        pagosOrEmpty,
+        Array.isArray(gastos) ? gastos : [],
+        movimientosCaja,
+        creditoIdsAsig,
+        inicioMsCobrador,
       );
-      if (solPend) {
-        alert(
-          `Hay una solicitud de ingreso en caja pendiente (${fmt(solPend.monto)}). Registrala en Cierre de Caja antes de activar el crédito.`,
+      const yaTieneIngresoMarcos = tieneIngresoMarcosFondoParaCredito(
+        movimientosCaja,
+        idCredito,
+        capitalEntregaPre,
+        cobradorIdPre,
+      );
+
+      if (!yaTieneIngresoMarcos && enManoCobrador < capitalEntregaPre) {
+        const solPend = solicitudesFondoCredito.find(
+          s =>
+            fichaIdUuid(s.credito_id) === idCredito
+            && s.estado === 'pendiente'
+            && solicitudFondoCreditoVigenteParaAdmin(s, creditosOrEmpty, solicitudesFondoIdsConEgresoPropia),
         );
-        setPage('cierre_caja');
-        return;
+        if (!solPend) {
+          alert(
+            `El cobrador no tiene ${fmt(capitalEntregaPre)} en caja (en mano: ${fmt(enManoCobrador)}) y no hay solicitud de fondo registrada. No se puede activar el crédito.`,
+          );
+          return;
+        }
+        const actorFondo = nombreParaMostrarSesion({
+          loginEmail,
+          usernameState: user,
+          authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
+        });
+        const nombreCliFondo = nombreCompletoCliente(clienteCreditoPre) || 'cliente';
+        const resultadoFondo = await fondarSolicitudCreditoEnCajaPropia(
+          solPend,
+          nombreCliFondo,
+          actorFondo,
+          etiquetaCobradorMovimiento,
+        );
+        if (!resultadoFondo.ok) {
+          alert(
+            resultadoFondo.codigo === 'saldo_insuficiente'
+              ? `${resultadoFondo.mensaje}\n\nRegistrá un ingreso en caja propia o habilitá el fondo manualmente en Cierre de Caja.`
+              : resultadoFondo.mensaje,
+          );
+          if (resultadoFondo.codigo === 'saldo_insuficiente') setPage('cierre_caja');
+          return;
+        }
+        const emailCobFondo = normalizarEmail(solPend.solicitante_email);
+        if (emailCobFondo) {
+          await crearNotificacion({
+            titulo: 'Ingreso en caja',
+            mensaje: `Marcos ingresó ${fmt(solPend.monto)} desde caja propia para el crédito de ${nombreCliFondo} (aprobación automática).`,
+            destinatario_usuario: emailCobFondo,
+            accion: 'go_creditos',
+          });
+        }
+        audit('CONFIG_CAMBIO', `Auto-fondo crédito ${fmt(solPend.monto)} — ${nombreCliFondo}`);
+        await fetchData({ silencioso: true });
       }
     }
     if (review && normalizarPlazoUnidad(review.plazo_unidad) === 'Meses') {
@@ -8351,15 +8535,37 @@ export default function App() {
       await sincronizarCuotasCreditoSupabase(baseSync, { fechaActivacion: hoy() });
       const capitalEntrega = redondearPesos(Number(baseSync.monto_solicitado ?? credito.monto_solicitado) || 0);
       if (capitalEntrega > 0) {
-        const { error: cajaCredErr } = await supabase.from('caja').insert([{
-          tipo: 'salida',
-          monto: capitalEntrega,
-          descripcion: `Entrega crédito — ${String(baseSync.tipo || credito.tipo || 'P')}`,
-          cobrador_id: cobradorIdActivo || String(authUserId || loginEmail || user || 'marcos').trim(),
-          cliente_id: String(baseSync.cliente_id ?? credito.cliente_id ?? '').trim() || null,
-          ficha_id: idCredito,
-        } as Record<string, unknown>]);
-        if (cajaCredErr) devWarn('Caja entrega crédito no insertada:', cajaCredErr);
+        const cobradorEntrega = cobradorIdActivo || String(authUserId || loginEmail || user || 'marcos').trim();
+        const creditoIdsEntrega = creditoIdsVisiblesParaCobradorId(creditosOrEmpty, cobradorEntrega);
+        if (idCredito) creditoIdsEntrega.add(idCredito);
+        const inicioMsEntrega = inicioJornadaActualMs(cierresJornada, cobradorEntrega, cobradorEntrega, null);
+        const enManoEntrega = efectivoEnManoCobradorId(
+          cobradorEntrega,
+          pagosOrEmpty,
+          Array.isArray(gastos) ? gastos : [],
+          movimientosCaja,
+          creditoIdsEntrega,
+          inicioMsEntrega,
+        );
+        const tieneFondoMarcos = await ingresoMarcosFondoCreditoEnBd(idCredito, capitalEntrega, cobradorEntrega);
+        if (!tieneFondoMarcos && enManoEntrega < capitalEntrega) {
+          devWarn(
+            `Entrega crédito omitida: sin ingreso Marcos de ${fmt(capitalEntrega)} ni efectivo suficiente (en mano: ${fmt(enManoEntrega)}).`,
+          );
+          alert(
+            `El crédito quedó activo pero no se registró la entrega en caja: falta el ingreso de Marcos por ${fmt(capitalEntrega)} (debe igualar la entrega al cliente). Revisá Cierre de Caja.`,
+          );
+        } else {
+          const { error: cajaCredErr } = await supabase.from('caja').insert([{
+            tipo: 'salida',
+            monto: capitalEntrega,
+            descripcion: `Entrega crédito — ${String(baseSync.tipo || credito.tipo || 'P')}`,
+            cobrador_id: cobradorEntrega,
+            cliente_id: String(baseSync.cliente_id ?? credito.cliente_id ?? '').trim() || null,
+            ficha_id: idCredito,
+          } as Record<string, unknown>]);
+          if (cajaCredErr) devWarn('Caja entrega crédito no insertada:', cajaCredErr);
+        }
       }
       const vid = String(baseSync.vendedor_id ?? credito.vendedor_id ?? '').trim();
       const comisionPrev = Number(baseSync.comision_vendedor ?? credito.comision_vendedor ?? 0);
