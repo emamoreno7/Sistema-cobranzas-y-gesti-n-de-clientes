@@ -2722,6 +2722,37 @@ function descripcionIngresoMarcosCredito(nombreCliente: string): string {
   return `Ingreso de Marcos para crédito entregado — ${nom}`;
 }
 
+function esIngresoMarcosFondoCreditoCaja(m: MovimientoCaja): boolean {
+  const d = String(m.descripcion ?? '').toLowerCase();
+  return m.tipo === 'entrada'
+    && (d.includes('ingreso de marcos') || d.includes('marcos para crédito') || d.includes('marcos para credito'));
+}
+
+function esSalidaEntregaCreditoCaja(m: MovimientoCaja): boolean {
+  const d = String(m.descripcion ?? '').toLowerCase();
+  return m.tipo === 'salida' && (d.includes('entrega crédito') || d.includes('entrega credito'));
+}
+
+function esSalidaGastoDuplicadoEnCaja(m: MovimientoCaja): boolean {
+  const d = String(m.descripcion ?? '').toLowerCase();
+  return m.tipo === 'salida' && d.startsWith('gasto —');
+}
+
+/** Movimiento de caja del cobrador: por ID de sesión o por crédito asignado (entrega al cliente). */
+function movimientoCajaDelCobradorSesion(
+  m: MovimientoCaja,
+  authUserId: string | null,
+  username: string | null,
+  loginEmail: string | null,
+  creditoIdsAsignados: Set<string>,
+): boolean {
+  if (esRegistroDelCobrador({ cobradorId: m.cobradorId, userId: m.cobradorId }, authUserId, username, loginEmail)) {
+    return true;
+  }
+  const fid = m.fichaId ? fichaIdUuid(m.fichaId) : '';
+  return Boolean(fid && creditoIdsAsignados.has(fid));
+}
+
 function mapMovimientoCajaPropia(row: Record<string, unknown>): MovimientoCajaPropia {
   return {
     id: String(row.id ?? genId()),
@@ -4031,16 +4062,21 @@ export default function App() {
       setCreditos(creditosNormalizados);
       setNotificaciones(Array.isArray(notiDb) ? (notiDb as Notificacion[]) : []);
       if (Array.isArray(gastosDb) && !gastosErr) {
-        setGastos((gastosDb as any[]).map(g => ({
+        const fromDb = (gastosDb as any[]).map(g => ({
           id: String(g?.id ?? genId()),
           fecha: String(g?.fecha ?? hoy()).slice(0, 10),
           categoria: String(g?.categoria ?? 'Otros'),
           monto: redondearPesos(Number(g?.monto ?? 0)),
           nota: String(g?.nota ?? ''),
           userId: String(g?.cobrador_id ?? g?.user_id ?? g?.userId ?? ''),
-          sync: true,
+          sync: true as const,
           timestamp: Number(g?.timestamp ?? new Date(g?.created_at ?? Date.now()).getTime()),
-        })) as Gasto[]);
+        })) as Gasto[];
+        setGastos(prev => {
+          const pendientes = (Array.isArray(prev) ? prev : []).filter(x => x && !x.sync);
+          const idsDb = new Set(fromDb.map(x => x.id));
+          return [...fromDb, ...pendientes.filter(p => !idsDb.has(p.id))];
+        });
       }
       let cajaRowsFetch: MovimientoCaja[] = [];
       {
@@ -5460,6 +5496,18 @@ export default function App() {
     return cierresJornada.find(c => c.fecha === h && rendicionEsDelUsuarioActual(c, authUserId, user));
   }, [cierresJornada, authUserId, user]);
 
+  const creditoIdsAsignadosSesion = useMemo(() => {
+    const clienteIds = new Map(clientesOrEmpty.map(c => [normalizarId(c.id), c]));
+    return new Set(
+      creditosOrEmpty
+        .filter(c => {
+          const cli = clienteIds.get(normalizarId(c.cliente_id));
+          return creditoVisibleParaSesion(c, rol, authUserId, user, loginEmail, cli?.cobrador_id);
+        })
+        .map(c => fichaIdUuid(c.id)),
+    );
+  }, [creditosOrEmpty, clientesOrEmpty, rol, authUserId, user, loginEmail]);
+
   const cajaCobradorDia = useMemo(() => {
     const h = hoy();
     const gList = Array.isArray(gastos) ? gastos : [];
@@ -5472,20 +5520,26 @@ export default function App() {
     const totalGastos = redondearPesos(gastosH.reduce((s, g) => s + (Number(g.monto) || 0), 0));
     const movsHoy = movimientosCaja.filter(m => {
       if (String(m.createdAt).slice(0, 10) !== h) return false;
-      return esRegistroDelCobrador({ cobradorId: m.cobradorId, userId: m.cobradorId } as PagoRegistro, authUserId, user, loginEmail);
+      return movimientoCajaDelCobradorSesion(m, authUserId, user, loginEmail, creditoIdsAsignadosSesion);
     });
     const ingresosCaja = redondearPesos(
-      movsHoy.filter(m => m.tipo === 'entrada').reduce((s, m) => s + m.monto, 0),
+      movsHoy.filter(esIngresoMarcosFondoCreditoCaja).reduce((s, m) => s + m.monto, 0),
+    );
+    const salidasEntregaCredito = redondearPesos(
+      movsHoy.filter(esSalidaEntregaCreditoCaja).reduce((s, m) => s + m.monto, 0),
     );
     const salidasCaja = redondearPesos(
-      movsHoy.filter(m => m.tipo === 'salida').reduce((s, m) => s + m.monto, 0),
+      movsHoy
+        .filter(m => m.tipo === 'salida' && !esSalidaEntregaCreditoCaja(m) && !esSalidaGastoDuplicadoEnCaja(m))
+        .reduce((s, m) => s + m.monto, 0),
     );
     const live = {
       totalCobrado,
       totalGastos,
       ingresosCaja,
+      salidasEntregaCredito,
       salidasCaja,
-      efectivoEnMano: redondearPesos(totalCobrado + ingresosCaja - totalGastos - salidasCaja),
+      efectivoEnMano: redondearPesos(totalCobrado + ingresosCaja - totalGastos - salidasEntregaCredito - salidasCaja),
       cantGastos: gastosH.length,
     };
     /** Solo congelar mientras espera validación de Marcos; si ya fue aceptada, seguir sumando cobros en vivo. */
@@ -5499,6 +5553,7 @@ export default function App() {
         totalCobrado: totalCobradoCong,
         totalGastos: totalGastosCong,
         ingresosCaja: 0,
+        salidasEntregaCredito: 0,
         salidasCaja: 0,
         efectivoEnMano: netoCong,
         cantGastos: 0,
@@ -5509,7 +5564,7 @@ export default function App() {
       ...live,
       congeladoRendicion: false as const,
     };
-  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy, jornadaSinBloqueosPruebas]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionHoy, jornadaSinBloqueosPruebas, creditoIdsAsignadosSesion]);
 
   const esperandoValidacionRendicion = useMemo(() => Boolean(miRendicionHoy && !miRendicionHoy.validado), [miRendicionHoy]);
   const jornadaCerradaValidadaHoy = useMemo(() => Boolean(miRendicionHoy && miRendicionHoy.validado), [miRendicionHoy]);
@@ -7342,34 +7397,46 @@ export default function App() {
   const handleSaveGasto = async (g: Partial<Gasto>) => {
     const montoG = redondearPesos(Number(g.monto));
     if (!montoG || montoG <= 0) { alert('Monto inválido'); return; }
-    const cobradorFuerte = String(authUserId || user || '').trim();
-    const nuevo: Gasto = { id: genId(), fecha: hoy(), categoria: g.categoria || 'Otros', monto: montoG, nota: g.nota || '', userId: cobradorFuerte || user || '', sync: isOnline, timestamp: Date.now() };
-    try {
-      const { error } = await supabase.from('gastos').insert({
-        id: nuevo.id,
-        fecha: nuevo.fecha,
-        categoria: nuevo.categoria,
-        monto: montoG,
-        nota: nuevo.nota,
-        cobrador_id: cobradorFuerte || user || '',
-      });
-      if (error) throw error;
-      nuevo.sync = true;
-      const { error: cajaGastoErr } = await supabase.from('caja').insert([{
-        tipo: 'salida',
-        monto: montoG,
-        descripcion: `Gasto — ${nuevo.categoria}`,
-        cobrador_id: cobradorFuerte || user || '',
-      } as Record<string, unknown>]);
-      if (cajaGastoErr) devWarn('Caja gasto no insertada:', cajaGastoErr);
-    } catch (error) {
-      devWarn('No se pudo guardar gasto en Supabase. Verificar tabla/políticas de gastos; queda guardado localmente:', error);
-      nuevo.sync = false;
+    const cobradorGastoId = cobradorIdCanonicoDesdeSesionActiva(authUserId, user, loginEmail);
+    const nuevo: Gasto = {
+      id: genId(),
+      fecha: hoy(),
+      categoria: g.categoria || 'Otros',
+      monto: montoG,
+      nota: g.nota || '',
+      userId: cobradorGastoId,
+      sync: false,
+      timestamp: Date.now(),
+    };
+    const rowGasto: Record<string, unknown> = {
+      fecha: nuevo.fecha,
+      categoria: nuevo.categoria,
+      monto: montoG,
+      nota: nuevo.nota || null,
+      cobrador_id: cobradorGastoId,
+    };
+    let ins = await supabase.from('gastos').insert(rowGasto).select('id').single();
+    if (ins.error) {
+      const idUuid = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : genId();
+      ins = await supabase.from('gastos').insert({ ...rowGasto, id: idUuid }).select('id').single();
     }
-    save({ gastos: [...(Array.isArray(gastos) ? gastos : []), nuevo] });
+    if (ins.error) {
+      console.error('gastos insert:', ins.error);
+      alert(
+        'No se pudo guardar el gasto en el servidor. '
+        + (ins.error.message || 'Error desconocido')
+        + '\n\nSi persiste, ejecutá la migración 047_gastos_insert_app.sql en Supabase.',
+      );
+      return;
+    }
+    nuevo.id = String(ins.data?.id ?? nuevo.id);
+    nuevo.sync = true;
+    setGastos(prev => [...(Array.isArray(prev) ? prev : []), nuevo]);
     audit('GASTO_CREADO', `Gasto registrado: ${fmt(montoG)} - ${g.categoria}`);
     setMGasto(null);
-    void refrescarDatosApp();
+    await fetchData({ silencioso: true });
   };
 
   const handleDeleteGasto = (id: string) => {
@@ -9688,7 +9755,10 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                     {cajaCobradorDia.ingresosCaja > 0 && (
                       <div className="flex justify-between"><span className="text-gray-400">Ingreso Marcos (crédito)</span><span className="font-semibold text-amber-300">+ {fmt(cajaCobradorDia.ingresosCaja)}</span></div>
                     )}
-                    <div className="flex justify-between"><span className="text-gray-400">Gastos</span><span className="font-semibold text-orange-300">− {fmt(cajaCobradorDia.totalGastos)}</span></div>
+                    {cajaCobradorDia.salidasEntregaCredito > 0 && (
+                      <div className="flex justify-between"><span className="text-gray-400">Entrega crédito al cliente</span><span className="font-semibold text-rose-300">− {fmt(cajaCobradorDia.salidasEntregaCredito)}</span></div>
+                    )}
+                    <div className="flex justify-between"><span className="text-gray-400">Gastos operativos</span><span className="font-semibold text-orange-300">− {fmt(cajaCobradorDia.totalGastos)}</span></div>
                     <div className="flex justify-between border-t border-emerald-500/25 pt-2 mt-1"><span className="text-emerald-200 font-semibold">En mano</span><span className="font-black text-emerald-300 text-lg">{fmt(cajaCobradorDia.efectivoEnMano)}</span></div>
                   </div>
                   {(rol || '').toLowerCase() === 'cobrador' && !usuarioCampoBloqueadoOperaciones && (
