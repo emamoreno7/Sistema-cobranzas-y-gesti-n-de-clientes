@@ -2861,12 +2861,6 @@ function descripcionIngresoMarcosCredito(nombreCliente: string): string {
   return `Ingreso de Marcos para crédito entregado — ${nom}`;
 }
 
-function esIngresoMarcosFondoCreditoCaja(m: MovimientoCaja): boolean {
-  const d = String(m.descripcion ?? '').toLowerCase();
-  return m.tipo === 'entrada'
-    && (d.includes('ingreso de marcos') || d.includes('marcos para crédito') || d.includes('marcos para credito'));
-}
-
 function esSalidaEntregaCreditoCaja(m: MovimientoCaja): boolean {
   const d = String(m.descripcion ?? '').toLowerCase();
   return m.tipo === 'salida' && (d.includes('entrega crédito') || d.includes('entrega credito'));
@@ -6891,7 +6885,7 @@ export default function App() {
       }
     }
     const saldoAntes = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
-    save({ config: { cierreCajaMarcosAt: now } });
+    save({ config: { ...data.config, cierreCajaMarcosAt: now } });
     audit('CONFIG_CAMBIO', `Cierre de día Marcos — contadores reiniciados · caja propia ${fmt(saldoAntes)}`);
     await fetchData({ silencioso: true });
     const saldo = await obtenerSaldoCajaPropiaDesdeDb();
