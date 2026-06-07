@@ -5230,7 +5230,13 @@ export default function App() {
             setFilterStatus('all');
             setTab(0);
             setMQrScan(false);
-            setMFicha({ cliente, ...(fichaActiva ? { ficha: fichaActiva } : {}) });
+            if (esMarcosPUsuario) {
+              setMFicha({ cliente, ...(fichaActiva ? { ficha: fichaActiva } : {}) });
+            } else if (fichaActiva) {
+              setMPago({ ficha: fichaActiva, cliente });
+            } else {
+              alert('Este cliente no tiene ficha activa para cobrar.');
+            }
           },
           () => {},
         );
@@ -6700,7 +6706,24 @@ export default function App() {
     await fetchData({ silencioso: true });
   };
 
+  const abrirFichaDesdeLista = useCallback((cli: Cliente, fic?: Ficha) => {
+    if (esMarcosPUsuario) {
+      setMFicha({ cliente: cli, ...(fic ? { ficha: fic } : {}) });
+      setTab(0);
+      return;
+    }
+    if (fic) {
+      setMPago({ ficha: fic, cliente: cli });
+      return;
+    }
+    alert('Solo el administrador puede crear o editar fichas.');
+  }, [esMarcosPUsuario]);
+
   const handleSaveFicha = async (fic: Partial<Ficha>) => {
+    if (!esMarcosPUsuario) {
+      alert('Solo el administrador puede crear o editar fichas.');
+      return;
+    }
     if (!fic.clienteId || !fic.montoTotal) { alert('Datos incompletos: falta clienteId o montoTotal'); return; }
     const cli = clientesOrEmpty.find(c => c.id === fic.clienteId);
     if (!cli) { alert('Cliente no encontrado'); return; }
@@ -9940,16 +9963,16 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
               const saldoRestante = saldoRestanteFicha(fic);
               return (
                 <SwipeRow key={fic.id} id={fic.id}
-                  onEdit={() => { setMFicha({ cliente: cli, ficha: fic }); setTab(0); }}
+                  onEdit={esMarcosPUsuario ? () => abrirFichaDesdeLista(cli, fic) : undefined}
                   onDelete={esMarcosPUsuario ? (() => handleDeleteFicha(fic.id)) : undefined}>
                   <div
                     role="button"
                     tabIndex={0}
-                    onClick={() => setMFicha({ cliente: cli, ficha: fic })}
+                    onClick={() => abrirFichaDesdeLista(cli, fic)}
                     onKeyDown={e => {
                       if (e.key === 'Enter' || e.key === ' ') {
                         e.preventDefault();
-                        setMFicha({ cliente: cli, ficha: fic });
+                        abrirFichaDesdeLista(cli, fic);
                       }
                     }}
                     className={`w-full bg-gradient-to-br ${semaforo.cardClass} rounded-2xl p-4 text-left active:scale-[0.98] transition-all cursor-pointer`}
@@ -9978,7 +10001,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                 </SwipeRow>
               );
             })}
-            {isAdminOrRoot(rol) && (
+            {esMarcosPUsuario && (
               <button onClick={() => {
                 const firstUuid = clientesOrEmpty.find(c => esUuidClienteId(String(c?.id ?? '')));
                 const first = firstUuid || clientesOrEmpty[0];
@@ -11855,6 +11878,7 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
             onTab={tab}
             onSetTab={setTab}
             onEliminarPago={handleEliminarPago}
+            puedeEditar={esMarcosPUsuario}
             puedeEliminarPagos={esMarcosPUsuario}
             puedeAsignarCobrador={esMarcosPUsuario}
             cobradoresOpciones={cobradoresRevision}
@@ -13484,6 +13508,7 @@ function FichaForm({
   onTab,
   onSetTab,
   onEliminarPago,
+  puedeEditar = false,
   puedeEliminarPagos = true,
   puedeAsignarCobrador = false,
   cobradoresOpciones = [],
@@ -13496,6 +13521,7 @@ function FichaForm({
   onTab: number;
   onSetTab: (t: number) => void;
   onEliminarPago: (ficha: Ficha, idx: number) => void;
+  puedeEditar?: boolean;
   puedeEliminarPagos?: boolean;
   puedeAsignarCobrador?: boolean;
   cobradoresOpciones?: Array<{ valor: string; label: string }>;
@@ -13565,15 +13591,15 @@ function FichaForm({
               )}
             </div>
           )}
-          {!ficha && (<div><label className="text-xs text-gray-400 block mb-1">Cliente</label><select id="selCliente" value={f.clienteId || ''} onChange={e => s('clienteId', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"><option value="">Seleccionar...</option>{clientes.map(c => <option key={c?.id ?? ''} value={c?.id ?? ''}>{nombreCompletoCliente(c) ?? '—'}</option>)}</select></div>)}
-          <div><label className="text-xs text-gray-400 block mb-1">Tipo</label><select value={f.tipo || 'prestamo'} onChange={e => s('tipo', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"><option value="prestamo">💳 Préstamo</option><option value="venta">🛒 Venta</option></select></div>
-          <div><label className="text-xs text-gray-400 block mb-1">Monto Total</label><input type="number" value={f.montoTotal || ''} onChange={e => s('montoTotal', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-          <div><label className="text-xs text-gray-400 block mb-1">Producto</label><input value={String(f.producto || '')} onChange={e => s('producto', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" placeholder="Ej: Heladera, Electrodoméstico, Préstamo en efectivo..." /></div>
+          {!ficha && puedeEditar && (<div><label className="text-xs text-gray-400 block mb-1">Cliente</label><select id="selCliente" value={f.clienteId || ''} onChange={e => s('clienteId', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"><option value="">Seleccionar...</option>{clientes.map(c => <option key={c?.id ?? ''} value={c?.id ?? ''}>{nombreCompletoCliente(c) ?? '—'}</option>)}</select></div>)}
+          <div><label className="text-xs text-gray-400 block mb-1">Tipo</label><select value={f.tipo || 'prestamo'} onChange={e => s('tipo', e.target.value)} disabled={!puedeEditar} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-60"><option value="prestamo">💳 Préstamo</option><option value="venta">🛒 Venta</option></select></div>
+          <div><label className="text-xs text-gray-400 block mb-1">Monto Total</label><input type="number" value={f.montoTotal || ''} onChange={e => s('montoTotal', parseFloat(e.target.value))} readOnly={!puedeEditar} disabled={!puedeEditar} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-60" /></div>
+          <div><label className="text-xs text-gray-400 block mb-1">Producto</label><input value={String(f.producto || '')} onChange={e => s('producto', e.target.value)} readOnly={!puedeEditar} disabled={!puedeEditar} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-60" placeholder="Ej: Heladera, Electrodoméstico, Préstamo en efectivo..." /></div>
           <div className="grid grid-cols-2 gap-3">
-            <div><label className="text-xs text-gray-400 block mb-1">Costo</label><input type="number" value={f.costo || ''} onChange={e => s('costo', parseFloat(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
-            <div><label className="text-xs text-gray-400 block mb-1">Cuotas</label><input type="number" value={f.cuotas || 4} onChange={e => s('cuotas', parseInt(e.target.value))} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" /></div>
+            <div><label className="text-xs text-gray-400 block mb-1">Costo</label><input type="number" value={f.costo || ''} onChange={e => s('costo', parseFloat(e.target.value))} readOnly={!puedeEditar} disabled={!puedeEditar} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-60" /></div>
+            <div><label className="text-xs text-gray-400 block mb-1">Cuotas</label><input type="number" value={f.cuotas || 4} onChange={e => s('cuotas', parseInt(e.target.value))} readOnly={!puedeEditar} disabled={!puedeEditar} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-60" /></div>
           </div>
-          <div><label className="text-xs text-gray-400 block mb-1">Plan de pago (vencimientos / dorso)</label><select value={f.plan_pago || 'Mensual'} onChange={e => s('plan_pago', e.target.value as PlanPago)} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500"><option value="Diario">Diario (domingos tachados en grilla)</option><option value="Quincenal">Quincenal (cada 15 días)</option><option value="Mensual">Mensual (cierre de mes)</option></select></div>
+          <div><label className="text-xs text-gray-400 block mb-1">Plan de pago (vencimientos / dorso)</label><select value={f.plan_pago || 'Mensual'} onChange={e => s('plan_pago', e.target.value as PlanPago)} disabled={!puedeEditar} className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 disabled:opacity-60"><option value="Diario">Diario (domingos tachados en grilla)</option><option value="Quincenal">Quincenal (cada 15 días)</option><option value="Mensual">Mensual (cierre de mes)</option></select></div>
           {f.montoTotal && f.cuotas && <div className="bg-indigo-500/10 border border-indigo-500/30 rounded-xl p-3 text-center"><p className="text-xs text-indigo-400">Precio Venta</p><p className="text-2xl font-bold text-indigo-300">{fmt(redondearPesos((f.montoTotal || 0) * 1.3))}</p><p className="text-xs text-indigo-400/60">Ganancia: {fmt(redondearPesos((f.montoTotal || 0) * 0.3))}</p></div>}
         </div>
       )}
@@ -13607,7 +13633,7 @@ function FichaForm({
           </div>
         </div>
       )}
-      {onTab === 0 && (
+      {onTab === 0 && puedeEditar && (
         <div className="flex gap-3 sticky bottom-0 bg-gray-900 pt-2">
           <button onClick={() => onSave(f)} className="flex-1 bg-indigo-500 text-white font-bold py-3 rounded-xl active:scale-95 transition-all">💾 Guardar</button>
         </div>
