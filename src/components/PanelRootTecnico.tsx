@@ -85,8 +85,10 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
   const [nuevoTicket, setNuevoTicket] = useState({ titulo: '', descripcion: '', prioridad: 'media' });
   const [jornadaSinBloqueosPruebas, setJornadaSinBloqueosPruebas] = useState(false);
   const [guardandoJornadaPruebas, setGuardandoJornadaPruebas] = useState(false);
+  const [configJornadaError, setConfigJornadaError] = useState<string | null>(null);
 
   const cargarConfigSistema = useCallback(async () => {
+    setConfigJornadaError(null);
     const { data, error } = await supabase
       .from('configuracion')
       .select('jornada_sin_bloqueos_pruebas')
@@ -95,6 +97,12 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
       .maybeSingle();
     if (error) {
       console.error('configuracion (root):', error);
+      const msg = String(error.message || '');
+      if (msg.includes('jornada_sin_bloqueos_pruebas') || msg.includes('column')) {
+        setConfigJornadaError('Falta la migración 046 en Supabase (columna jornada_sin_bloqueos_pruebas).');
+      } else {
+        setConfigJornadaError(msg || 'No se pudo leer configuración.');
+      }
       return;
     }
     setJornadaSinBloqueosPruebas(Boolean(data?.jornada_sin_bloqueos_pruebas));
@@ -111,7 +119,12 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
         updated_at: now,
       }], { onConflict: 'id' });
       if (error) {
-        alert('No se pudo guardar: ' + (error.message || 'error desconocido'));
+        const msg = String(error.message || 'error desconocido');
+        if (msg.includes('jornada_sin_bloqueos_pruebas') || msg.includes('column')) {
+          alert('Ejecutá la migración 046 en Supabase SQL Editor antes de usar este toggle.');
+        } else {
+          alert('No se pudo guardar: ' + msg);
+        }
         return;
       }
       setJornadaSinBloqueosPruebas(nuevo);
@@ -190,6 +203,44 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
     void cargarDatos();
   };
 
+  const cardModoPruebasJornada = (
+    <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-4 space-y-3">
+      <div>
+        <p className="font-semibold text-white">Modo pruebas — cobros sin bloqueo de jornada</p>
+        <p className="text-xs text-gray-400 leading-relaxed mt-1">
+          Permite a cobradores y vendedores cobrar, cerrar jornada y usar la ruta «Por cobrar» sin esperar las 00:00
+          ni quedar bloqueados tras rendición. Solo para pruebas; desactivá al terminar.
+        </p>
+      </div>
+      {configJornadaError && (
+        <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2">
+          ⚠️ {configJornadaError}
+        </p>
+      )}
+      <button
+        type="button"
+        disabled={guardandoJornadaPruebas || Boolean(configJornadaError)}
+        onClick={() => void toggleJornadaSinBloqueosPruebas()}
+        className={`w-full py-3 rounded-xl border font-semibold text-sm transition ${
+          jornadaSinBloqueosPruebas
+            ? 'bg-violet-600/30 border-violet-400/50 text-violet-100'
+            : 'bg-gray-800 border-gray-600 text-gray-300'
+        } disabled:opacity-50`}
+      >
+        {guardandoJornadaPruebas
+          ? 'Guardando…'
+          : jornadaSinBloqueosPruebas
+            ? '🧪 ACTIVO — Tocar para desactivar'
+            : 'Activar modo pruebas (sin bloqueos)'}
+      </button>
+      {jornadaSinBloqueosPruebas && (
+        <p className="text-[11px] text-violet-300/80 text-center">
+          Los usuarios en campo verán un aviso violeta. Los cambios se aplican al instante vía realtime.
+        </p>
+      )}
+    </div>
+  );
+
   const actualizarTicketEstado = async (id: string, estado: string) => {
     const { error } = await supabase.from('tickets_soporte').update({
       estado,
@@ -213,7 +264,7 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
           <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
-              onClick={() => void cargarDatos()}
+              onClick={() => { void cargarDatos(); void cargarConfigSistema(); }}
               disabled={loading}
               className="text-xs bg-emerald-600/30 border border-emerald-500/40 text-emerald-100 px-3 py-2 rounded-lg font-semibold"
               title="Actualizar datos"
@@ -246,12 +297,16 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
             }`}
           >
             {t.icon} {t.label}
+            {t.id === 'sistema' && jornadaSinBloqueosPruebas && (
+              <span className="ml-1 text-[9px] bg-violet-500 text-white px-1 rounded">ON</span>
+            )}
           </button>
         ))}
       </div>
 
       {tab === 'resumen' && (
         <div className="space-y-3">
+          {cardModoPruebasJornada}
           <div className="grid grid-cols-2 gap-2">
             <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-3">
               <p className="text-[10px] text-gray-500">Logins hoy</p>
@@ -435,36 +490,7 @@ export function PanelRootTecnico({ onLogout }: { onLogout: () => void }) {
               Migraciones: 030 (sesiones, tickets), 046 (modo pruebas jornada).
             </p>
           </div>
-          <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-4 space-y-3">
-            <div>
-              <p className="font-semibold text-white">Modo pruebas — jornada sin bloqueos</p>
-              <p className="text-xs text-gray-400 leading-relaxed mt-1">
-                Permite a cobradores y vendedores cobrar, cerrar jornada y usar la ruta «Por cobrar» sin esperar las 00:00
-                ni quedar bloqueados tras rendición. Solo para pruebas; desactivá al terminar.
-              </p>
-            </div>
-            <button
-              type="button"
-              disabled={guardandoJornadaPruebas}
-              onClick={() => void toggleJornadaSinBloqueosPruebas()}
-              className={`w-full py-3 rounded-xl border font-semibold text-sm transition ${
-                jornadaSinBloqueosPruebas
-                  ? 'bg-violet-600/30 border-violet-400/50 text-violet-100'
-                  : 'bg-gray-800 border-gray-600 text-gray-300'
-              } disabled:opacity-50`}
-            >
-              {guardandoJornadaPruebas
-                ? 'Guardando…'
-                : jornadaSinBloqueosPruebas
-                  ? '🧪 ACTIVO — Tocar para desactivar'
-                  : 'Activar modo pruebas (sin bloqueos)'}
-            </button>
-            {jornadaSinBloqueosPruebas && (
-              <p className="text-[11px] text-violet-300/80 text-center">
-                Los usuarios en campo verán un aviso violeta. Los cambios se aplican al instante vía realtime.
-              </p>
-            )}
-          </div>
+          {cardModoPruebasJornada}
           <div className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 space-y-2">
             <p className="font-semibold text-white">Herramientas</p>
             <button
