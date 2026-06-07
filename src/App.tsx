@@ -879,6 +879,7 @@ interface PagoRegistro {
   userId?: string | null;
   cobradorId?: string | null;
   fechaPago?: string;
+  createdAt?: string;
   /** Registro automático $0 cierre de día; no reduce saldo ni cuenta como cuota cobrada. */
   esRegistroNoPago?: boolean;
   cuotaNumero?: number | null;
@@ -961,6 +962,7 @@ function calcularRecaudacionCampoHoy(
   pagos: PagoRegistro[],
   gastosList: Gasto[],
   fecha = hoy(),
+  corteAt?: string | null,
 ): {
   ingresosCampoHoy: number;
   egresosCampoHoy: number;
@@ -974,13 +976,19 @@ function calcularRecaudacionCampoHoy(
       && esPagoEfectivo(p)
       && redondearPesos(Number(p.monto) || 0) > 0
       && esMovimientoUsuarioCampo(p.cobradorId ?? p.userId)
+      && perteneceContadorMarcosActivo(fd, tsPagoRegistro(p), corteAt)
     );
   });
   const gastosCampoHoy = gastosList.filter(
     g =>
       g
       && String(g.fecha || '').slice(0, 10) === fecha
-      && esMovimientoUsuarioCampo(g.userId),
+      && esMovimientoUsuarioCampo(g.userId)
+      && perteneceContadorMarcosActivo(
+        String(g.fecha || '').slice(0, 10),
+        g.timestamp || new Date(`${String(g.fecha || fecha)}T12:00:00`).getTime(),
+        corteAt,
+      ),
   );
   const ingresosCampoHoy = redondearPesos(
     pagosCampoHoy.reduce((s, p) => s + (Number(p.monto) || 0), 0),
@@ -1457,40 +1465,100 @@ function esMovimientoUsuarioCampo(rawId: string | null | undefined): boolean {
   return !lower.includes('marcos') && !lower.includes('emamoreno');
 }
 
-function rendicionEsDelUsuarioActual(c: Cierre, authId: string | null, username: string | null) {
-  const uid = String(c.userId || '').trim();
-  if (authId && uid === authId) return true;
-  if (username && uid === username) return true;
-  return false;
+function rendicionEsDelUsuarioActual(
+  c: Cierre,
+  authId: string | null,
+  username: string | null,
+  email: string | null = null,
+) {
+  return cobradorIdCoincideConSesion(c.userId, authId, username, email);
 }
 
-function rendicionesDelUsuario(cierres: Cierre[], authId: string | null, username: string | null): Cierre[] {
-  return cierres.filter(c => rendicionEsDelUsuarioActual(c, authId, username));
+function rendicionesDelUsuario(
+  cierres: Cierre[],
+  authId: string | null,
+  username: string | null,
+  email: string | null = null,
+): Cierre[] {
+  return cierres.filter(c => rendicionEsDelUsuarioActual(c, authId, username, email));
 }
 
 /** Rendición enviada y aún sin recepción de Marcos. */
-function miRendicionPendienteUsuario(cierres: Cierre[], authId: string | null, username: string | null): Cierre | undefined {
-  return rendicionesDelUsuario(cierres, authId, username)
+function miRendicionPendienteUsuario(
+  cierres: Cierre[],
+  authId: string | null,
+  username: string | null,
+  email: string | null = null,
+): Cierre | undefined {
+  return rendicionesDelUsuario(cierres, authId, username, email)
     .filter(c => !c.validado)
     .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0];
 }
 
-/** Inicio de la jornada abierta: última rendición aceptada por Marcos, o medianoche si es la primera del día. */
-function inicioJornadaActualMs(cierres: Cierre[], authId: string | null, username: string | null): number {
-  const validadas = rendicionesDelUsuario(cierres, authId, username)
-    .filter(c => c.validado && c.validadoAt)
-    .sort((a, b) => String(b.validadoAt).localeCompare(String(a.validadoAt)));
-  if (validadas[0]?.validadoAt) return new Date(validadas[0].validadoAt).getTime();
+function ultimaRendicionValidadaUsuario(
+  cierres: Cierre[],
+  authId: string | null,
+  username: string | null,
+  email: string | null = null,
+): Cierre | undefined {
+  return rendicionesDelUsuario(cierres, authId, username, email)
+    .filter(c => c.validado)
+    .sort((a, b) => {
+      const ta = String(a.validadoAt ?? '');
+      const tb = String(b.validadoAt ?? '');
+      if (ta !== tb) return tb.localeCompare(ta);
+      return (b.timestamp || 0) - (a.timestamp || 0);
+    })[0];
+}
+
+/** Inicio de la jornada abierta: instante en que Marcos recepcionó la última rendición. */
+function inicioJornadaActualMs(
+  cierres: Cierre[],
+  authId: string | null,
+  username: string | null,
+  email: string | null = null,
+): number {
+  const ultima = ultimaRendicionValidadaUsuario(cierres, authId, username, email);
+  if (ultima?.validadoAt) return new Date(ultima.validadoAt).getTime();
+  if (ultima?.timestamp) return ultima.timestamp;
   return new Date(`${hoy()}T00:00:00`).getTime();
 }
 
 function perteneceJornadaActual(ts: number | string | undefined | null, inicioMs: number): boolean {
   const t = typeof ts === 'number' ? ts : new Date(String(ts || 0)).getTime();
-  return Number.isFinite(t) && t >= inicioMs;
+  return Number.isFinite(t) && t > inicioMs;
 }
 
 function tsPagoRegistro(p: PagoRegistro): number {
+  if (p.createdAt) {
+    const ca = new Date(p.createdAt).getTime();
+    if (Number.isFinite(ca)) return ca;
+  }
   return new Date(String(p.fechaPago ?? p.fecha ?? 0)).getTime();
+}
+
+function cajaCobradorVacia(): {
+  totalCobrado: number;
+  totalGastos: number;
+  ingresosCaja: number;
+  salidasEntregaCredito: number;
+  salidasCaja: number;
+  efectivoEnMano: number;
+  cantGastos: number;
+  jornadaEnReposo: true;
+  congeladoRendicion: false;
+} {
+  return {
+    totalCobrado: 0,
+    totalGastos: 0,
+    ingresosCaja: 0,
+    salidasEntregaCredito: 0,
+    salidasCaja: 0,
+    efectivoEnMano: 0,
+    cantGastos: 0,
+    jornadaEnReposo: true as const,
+    congeladoRendicion: false as const,
+  };
 }
 
 function msCierreRutaAlmacenado(raw: string | null): number | null {
@@ -2809,6 +2877,12 @@ function esSalidaGastoDuplicadoEnCaja(m: MovimientoCaja): boolean {
   return m.tipo === 'salida' && d.startsWith('gasto —');
 }
 
+function esSalidaRendicionRecibidaCaja(m: MovimientoCaja): boolean {
+  const d = String(m.descripcion ?? '').toLowerCase();
+  return m.tipo === 'salida'
+    && (d.includes('rendición entregada') || d.includes('rendicion entregada'));
+}
+
 /** Movimiento de caja del cobrador: por ID de sesión o por crédito asignado (entrega al cliente). */
 function movimientoCajaDelCobradorSesion(
   m: MovimientoCaja,
@@ -2846,7 +2920,7 @@ function timestampDesdeFechaMov(fecha: string, ts?: string | number | null): num
     if (Number.isFinite(n)) return n;
   }
   const f = String(fecha || '').slice(0, 10);
-  return f ? new Date(`${f}T23:59:59`).getTime() : 0;
+  return f ? new Date(`${f}T12:00:00`).getTime() : 0;
 }
 
 /** Movimiento del día visible en contadores de Marcos tras un cierre de día (mismo calendario). */
@@ -4127,6 +4201,7 @@ export default function App() {
         userId: p?.cobrador_id ?? p?.userId ?? null,
         cobradorId: p?.cobrador_id ?? p?.userId ?? null,
         fechaPago: p?.fecha_pago ?? p?.fecha,
+        createdAt: p?.created_at != null ? String(p.created_at) : undefined,
         esRegistroNoPago: Boolean(p?.es_registro_no_pago),
         cuotaNumero: p?.cuota_numero != null ? Number(p.cuota_numero) : undefined,
       })) as PagoRegistro[]);
@@ -5471,7 +5546,12 @@ export default function App() {
       });
     const pagosBase = isAdminOrRoot(rol) ? pagosHoyGlobal : pagosHoyUsuario;
     const gastosList = Array.isArray(gastos) ? gastos : [];
-    const recaudacionCampo = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, h);
+    const recaudacionCampo = calcularRecaudacionCampoHoy(
+      pagosOrEmpty,
+      gastosList,
+      h,
+      data.config.cierreCajaMarcosAt ?? null,
+    );
     const totalCobradoHoy = isAdminOrRoot(rol)
       ? recaudacionCampo.ingresosCampoHoy
       : pagosBase.reduce((s: number, p: any) => s + (Number(p?.monto) || 0), 0);
@@ -5515,7 +5595,7 @@ export default function App() {
       cuotasCobradasHoy,
       recaudacionCampo: isAdminOrRoot(rol) ? recaudacionCampo : null,
     };
-  }, [clientesOrEmpty, gastos, pagosOrEmpty, user, loginEmail, rol, creditosOrEmpty, authUserId]);
+  }, [clientesOrEmpty, gastos, pagosOrEmpty, user, loginEmail, rol, creditosOrEmpty, authUserId, data.config.cierreCajaMarcosAt]);
   const resumenCobrador = useMemo(() => {
     const h = hoy();
     const pagosHoy = pagosOrEmpty.filter((p: any) => {
@@ -5551,12 +5631,16 @@ export default function App() {
   );
 
   const miRendicionPendiente = useMemo(
-    () => miRendicionPendienteUsuario(cierresJornada, authUserId, user),
-    [cierresJornada, authUserId, user],
+    () => miRendicionPendienteUsuario(cierresJornada, authUserId, user, loginEmail),
+    [cierresJornada, authUserId, user, loginEmail],
+  );
+  const ultimaRendicionValidada = useMemo(
+    () => ultimaRendicionValidadaUsuario(cierresJornada, authUserId, user, loginEmail),
+    [cierresJornada, authUserId, user, loginEmail],
   );
   const inicioJornadaMs = useMemo(
-    () => inicioJornadaActualMs(cierresJornada, authUserId, user),
-    [cierresJornada, authUserId, user],
+    () => inicioJornadaActualMs(cierresJornada, authUserId, user, loginEmail),
+    [cierresJornada, authUserId, user, loginEmail],
   );
 
   const creditoIdsAsignadosSesion = useMemo(() => {
@@ -5573,6 +5657,17 @@ export default function App() {
 
   const cajaCobradorDia = useMemo(() => {
     const gList = Array.isArray(gastos) ? gastos : [];
+    if (!jornadaSinBloqueosPruebas && !miRendicionPendiente && ultimaRendicionValidada) {
+      const hayNuevaActividad = pagosOrEmpty.some(p =>
+        perteneceJornadaActual(tsPagoRegistro(p), inicioJornadaMs)
+        && esPagoEfectivo(p)
+        && esRegistroDelCobrador(p, authUserId, user, loginEmail),
+      ) || gList.some(g =>
+        perteneceJornadaActual(g.timestamp || new Date(`${String(g.fecha || hoy())}T12:00:00`).getTime(), inicioJornadaMs)
+        && esGastoDelCobrador(g, authUserId, user, loginEmail),
+      );
+      if (!hayNuevaActividad) return cajaCobradorVacia();
+    }
     const pagosH = pagosOrEmpty.filter(p =>
       perteneceJornadaActual(tsPagoRegistro(p), inicioJornadaMs)
       && esPagoEfectivo(p)
@@ -5596,7 +5691,12 @@ export default function App() {
     );
     const salidasCaja = redondearPesos(
       movsHoy
-        .filter(m => m.tipo === 'salida' && !esSalidaEntregaCreditoCaja(m) && !esSalidaGastoDuplicadoEnCaja(m))
+        .filter(m =>
+          m.tipo === 'salida'
+          && !esSalidaEntregaCreditoCaja(m)
+          && !esSalidaGastoDuplicadoEnCaja(m)
+          && !esSalidaRendicionRecibidaCaja(m),
+        )
         .reduce((s, m) => s + m.monto, 0),
     );
     const live = {
@@ -5630,7 +5730,7 @@ export default function App() {
       ...live,
       congeladoRendicion: false as const,
     };
-  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionPendiente, jornadaSinBloqueosPruebas, creditoIdsAsignadosSesion, inicioJornadaMs]);
+  }, [pagosOrEmpty, gastos, movimientosCaja, authUserId, user, loginEmail, miRendicionPendiente, ultimaRendicionValidada, jornadaSinBloqueosPruebas, creditoIdsAsignadosSesion, inicioJornadaMs]);
 
   const esperandoValidacionRendicion = useMemo(() => Boolean(miRendicionPendiente), [miRendicionPendiente]);
   const cobradorBloqueadoCobros = useMemo(
@@ -5747,13 +5847,13 @@ export default function App() {
     const h = hoy();
     const corte = cierreCajaMarcosAt;
     const gastosList = Array.isArray(gastos) ? gastos : [];
-    /** Recaudación en vivo de cobradores/vendedores (hoy, sin esperar cierre de caja). */
+    /** Recaudación en vivo respetando cierre de día Marcos (contadores en $0 tras el corte). */
     const {
       ingresosCampoHoy,
       egresosCampoHoy,
       cobradoAcumuladoCampo,
       porUsuarioCampo,
-    } = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, h);
+    } = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, h, corte);
 
     const pagosH = pagosOrEmpty.filter(p => {
       const fd = String(p.fechaPago ?? p.fecha ?? '').slice(0, 10);
@@ -5761,7 +5861,7 @@ export default function App() {
         fd === h
         && esPagoEfectivo(p)
         && redondearPesos(Number(p.monto) || 0) > 0
-        && perteneceContadorMarcosActivo(fd, p.fechaPago ?? (p as { timestamp?: number }).timestamp, corte)
+        && perteneceContadorMarcosActivo(fd, tsPagoRegistro(p), corte)
       );
     });
     const gastosH = (Array.isArray(gastos) ? gastos : []).filter(
@@ -6791,11 +6891,12 @@ export default function App() {
       }
     }
     const saldoAntes = saldoCajaPropiaDesdeMovimientos(movimientosCajaPropia);
+    save({ config: { cierreCajaMarcosAt: now } });
     audit('CONFIG_CAMBIO', `Cierre de día Marcos — contadores reiniciados · caja propia ${fmt(saldoAntes)}`);
     await fetchData({ silencioso: true });
     const saldo = await obtenerSaldoCajaPropiaDesdeDb();
     alert(`Día cerrado. Contadores en $0. Saldo caja propia (acumulado): ${fmt(saldo)}.`);
-  }, [esMarcosPUsuario, rendicionesPendientesAdmin, data.config, movimientosCajaPropia, audit, fetchData]);
+  }, [esMarcosPUsuario, rendicionesPendientesAdmin, data.config, movimientosCajaPropia, audit, fetchData, save]);
 
   // ==========================================
   // FICHAS
@@ -8356,7 +8457,12 @@ export default function App() {
   const panelControlStats = useMemo(() => {
     const hoyIso = hoy();
     const gastosList = Array.isArray(gastos) ? gastos : [];
-    const recaudacionCampo = calcularRecaudacionCampoHoy(pagosOrEmpty, gastosList, hoyIso);
+    const recaudacionCampo = calcularRecaudacionCampoHoy(
+      pagosOrEmpty,
+      gastosList,
+      hoyIso,
+      data.config.cierreCajaMarcosAt ?? null,
+    );
     const cobradoHoy = recaudacionCampo.ingresosCampoHoy;
     const gastosCampoHoy = recaudacionCampo.egresosCampoHoy;
     const netoCampoHoy = recaudacionCampo.cobradoAcumuladoCampo;
@@ -8417,7 +8523,7 @@ export default function App() {
       porCobrador,
       porUsuarioCampo: recaudacionCampo.porUsuarioCampo,
     };
-  }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito]);
+  }, [pagosOrEmpty, clientesOrEmpty, creditosOrEmpty, gastos, getDiasAtrasoCredito, data.config.cierreCajaMarcosAt]);
 
   const feedMovimientosControl = useMemo((): FilaMovimientoControl[] => {
     const filas: FilaMovimientoControl[] = [];
@@ -8628,7 +8734,7 @@ export default function App() {
       usernameState: user,
       authUser: authUserMeta ? { user_metadata: authUserMeta } : null,
     });
-    if (!jornadaSinBloqueosPruebas && miRendicionPendienteUsuario(cierresJornada, authUserId, user)) {
+    if (!jornadaSinBloqueosPruebas && miRendicionPendienteUsuario(cierresJornada, authUserId, user, loginEmail)) {
       alert('Ya tenés una rendición pendiente de recepción por Marcos.');
       return;
     }
@@ -9822,7 +9928,9 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
                   <p className="text-[11px] text-emerald-100/70 mb-3">
                     {cajaCobradorDia.congeladoRendicion
                       ? 'Montos congelados al cerrar jornada. Pendiente de recepción por Marcos.'
-                      : 'Cada gasto operativo resta del efectivo que llevás. Nueva jornada al recibir la rendición anterior.'}
+                      : (cajaCobradorDia as { jornadaEnReposo?: boolean }).jornadaEnReposo
+                        ? 'Rendición recepcionada. Todo en $0 hasta tu próximo cobro o gasto.'
+                        : 'Cada gasto operativo resta del efectivo que llevás. Nueva jornada al recibir la rendición anterior.'}
                   </p>
                   <div className="grid grid-cols-1 gap-2 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Cobrado</span><span className="font-semibold text-white">{fmt(cajaCobradorDia.totalCobrado)}</span></div>
