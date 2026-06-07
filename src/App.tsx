@@ -3104,27 +3104,62 @@ function construirFichaRutaDesdeCredito(credito: Credito, pagos: PagoRegistro[])
   };
 }
 
-/** Ruta / listados: crédito activo se muestra al cobrador cuyo `cobrador_id` coincide con la sesión (UUID auth, usuario o email). Admin/root ven todo. */
+/** Crédito cobrable por la sesión: cobrador, vendedor, cliente asignado o créditos con admin como titular. */
 function creditoVisibleParaSesion(
   credito: Credito,
   rol: string | null | undefined,
   authUserId: string | null | undefined,
   user: string | null | undefined,
   loginEmail: string | null | undefined,
+  clienteCobradorId?: string | null,
 ): boolean {
   if (isAdminOrRoot(rol)) return true;
+  const r = (rol || '').toLowerCase();
+  const esCampo = r === 'cobrador' || r === 'vendedor';
+  const match = (raw: string | null | undefined) =>
+    cobradorIdCoincideConSesion(raw, authUserId ?? null, user ?? null, loginEmail ?? null);
+
+  if (match(credito.cobrador_id) || match(credito.creado_por)) return true;
+  if (match(credito.vendedor_id)) return true;
+  if (match(clienteCobradorId)) return true;
+
+  const notif = String(credito.cobrador_notif_email ?? '').trim();
+  if (notif) {
+    const notifNorm = normalizarEmail(notif);
+    const emailNorm = normalizarEmail(loginEmail);
+    if (notifNorm && emailNorm && notifNorm === emailNorm) return true;
+    const perfilSesion = resolverPerfilDesdeAuthEmail(loginEmail) || resolverPerfilDesdeEntradaLogin(user);
+    const perfilNotif = resolverPerfilDesdeAuthEmail(notif) || resolverPerfilDesdeEntradaLogin(notif.split('@')[0]);
+    if (perfilSesion && perfilNotif && perfilSesion.login === perfilNotif.login) return true;
+  }
+
   const cid = String(credito.cobrador_id || credito.creado_por || '').trim();
-  if (!cid) return true;
-  const emailTrim = String(loginEmail ?? '').trim();
-  const emailLocal = emailTrim.includes('@') ? emailTrim.split('@')[0] : '';
-  const cand = new Set(
-    [authUserId, user, loginEmail, emailLocal || null]
-      .map(x => String(x ?? '').trim())
-      .filter(Boolean),
-  );
-  const igual = (a: string, b: string) =>
-    a === b || a.toLowerCase() === b.toLowerCase();
-  return [...cand].some(x => igual(x, cid));
+  if (!cid) return esCampo;
+  /** Créditos creados/aprobados por Marcos sin cobrador de campo: visibles para cobrar en equipo. */
+  if (esCampo && esReferenciaMarcosOAdmin(cid)) return true;
+  return false;
+}
+
+/** Al activar/crear: evita dejar `cobrador_id` del admin si hay cobrador de campo en solicitud o cliente. */
+function resolverCobradorIdCobroCredito(
+  credito: Pick<Credito, 'cobrador_id' | 'vendedor_id' | 'cobrador_notif_email' | 'creado_por'>,
+  cliente?: Cliente | null,
+  cobradorAdmin?: string | null,
+): string {
+  const desdeAdmin = String(cobradorAdmin ?? '').trim();
+  if (desdeAdmin && !esReferenciaMarcosOAdmin(desdeAdmin)) return desdeAdmin;
+  for (const raw of [credito.cobrador_id, credito.vendedor_id, credito.creado_por, cliente?.cobrador_id]) {
+    const id = String(raw ?? '').trim();
+    if (id && !esReferenciaMarcosOAdmin(id)) return id;
+  }
+  const notif = String(credito.cobrador_notif_email ?? '').trim();
+  if (notif) {
+    const perfil = resolverPerfilDesdeAuthEmail(notif) || resolverPerfilDesdeEntradaLogin(notif.split('@')[0]);
+    if (perfil && perfil.rolDefecto !== 'root' && !perfil.esAdmin) {
+      return perfil.login;
+    }
+  }
+  return String(credito.cobrador_id ?? credito.creado_por ?? '').trim();
 }
 
 /** Candidatos para `cobrador_id.in.(…)` con la sesión: UUID de auth, email y username de `cp_session` (p. ej. cobrador1). */
@@ -3829,9 +3864,8 @@ export default function App() {
           gastosQuery = supabase.from('gastos').select('*').limit(0);
           creditosQuery = supabase.from('creditos').select('*').limit(0);
         } else {
-          pagosQuery = pagosQuery.in('cobrador_id', cobradorIdsFilter);
+          /** Gastos: solo los del cobrador. Créditos/pagos: cartera completa del ámbito y filtro en cliente. */
           gastosQuery = gastosQuery.in('cobrador_id', cobradorIdsFilter);
-          creditosQuery = creditosQuery.in('cobrador_id', cobradorIdsFilter);
         }
       }
 
@@ -3866,7 +3900,10 @@ export default function App() {
         ? (clientesDb as Record<string, unknown>[]).map(c => mapClienteFilaSupabase(c))
         : [];
       setClientes(mappedClientes);
-      const creditosNormalizados = Array.isArray(creditosDb) ? (creditosDb as any[]).map((c): Credito => {
+      const clientesByIdFetch = new Map(mappedClientes.map(c => [normalizarId(c.id), c]));
+      const authIdFetch = String(session?.user?.id ?? '').trim() || null;
+      const rolVisFetch = rolFetch || rol;
+      const creditosNormalizadosRaw = Array.isArray(creditosDb) ? (creditosDb as any[]).map((c): Credito => {
         const planRaw = String(c?.plan ?? '').trim();
         const plazo_unidad = normalizarPlazoUnidad(planRaw || 'Diario');
         const cuotas = Math.max(1, Number(c?.cuotas ?? c?.plazo_cantidad ?? 1));
@@ -3901,11 +3938,21 @@ export default function App() {
           porcentaje_comision_credito: Number(c?.porcentaje_comision_credito ?? 0) || undefined,
         };
       }) : [];
+      const creditosNormalizados = verTodosLosCreditos
+        ? creditosNormalizadosRaw
+        : creditosNormalizadosRaw.filter(c => {
+          const cli = clientesByIdFetch.get(normalizarId(c.cliente_id));
+          return creditoVisibleParaSesion(c, rolVisFetch, authIdFetch, user, loginEmail, cli?.cobrador_id);
+        });
       const pagosRaw = Array.isArray(pagosDb) ? (pagosDb as any[]) : [];
+      const visibleCreditoIds = new Set(creditosNormalizados.map(c => fichaIdUuid(c.id)));
+      const pagosRawVisibles = verTodosLosCreditos
+        ? pagosRaw
+        : pagosRaw.filter(p => visibleCreditoIds.has(fichaIdUuid(p?.ficha_id ?? p?.fichaId)));
       setFichas(creditosNormalizados
         .filter(c => ['ACTIVO', 'VIGENTE', 'APROBADO'].includes(String(c.estado || '').toUpperCase()))
         .map(c => {
-          const pagosCredito = pagosRaw.filter(p => fichaIdUuid(p?.ficha_id ?? p?.fichaId) === fichaIdUuid(c.id));
+          const pagosCredito = pagosRawVisibles.filter(p => fichaIdUuid(p?.ficha_id ?? p?.fichaId) === fichaIdUuid(c.id));
           const pagosEfectivos = pagosCredito.filter(p => !p?.es_registro_no_pago && redondearPesos(Number(p?.monto) || 0) > 0);
           const pagosParaCtx: PagoRegistro[] = pagosEfectivos.map(p => ({
             id: String(p?.id ?? ''),
@@ -3959,7 +4006,7 @@ export default function App() {
             moraPorciento: M.moraPorciento,
           };
         }));
-      setPagos(Array.isArray(pagosDb) ? (pagosDb as any[]).map(p => ({
+      setPagos((verTodosLosCreditos ? pagosRaw : pagosRawVisibles).map(p => ({
         id: p?.id,
         clienteId: String(p?.cliente_id ?? p?.clienteId ?? ''),
         fichaId: p?.ficha_id != null && String(p.ficha_id).trim() !== ''
@@ -3977,7 +4024,7 @@ export default function App() {
         fechaPago: p?.fecha_pago ?? p?.fecha,
         esRegistroNoPago: Boolean(p?.es_registro_no_pago),
         cuotaNumero: p?.cuota_numero != null ? Number(p.cuota_numero) : undefined,
-      })) as PagoRegistro[] : []);
+      })) as PagoRegistro[]);
       setCreditos(creditosNormalizados);
       setNotificaciones(Array.isArray(notiDb) ? (notiDb as Notificacion[]) : []);
       if (Array.isArray(gastosDb) && !gastosErr) {
@@ -7709,8 +7756,18 @@ export default function App() {
     let rowCredito: Record<string, unknown> | null = null;
     try {
     const { data: sess } = await supabase.auth.getSession();
-    const cobradorId = String(sess.session?.user?.id || user || loginEmail || 'sin_usuario');
     const emailSesion = String(sess.session?.user?.email ?? loginEmail ?? '').trim();
+    const clienteCreditoNuevo = clientesOrEmpty.find(c => fichaIdUuid(c.id) === fichaIdUuid(idClientePlanoStr));
+    const cobradorId = resolverCobradorIdCobroCredito(
+      {
+        cobrador_id: String(sess.session?.user?.id || user || loginEmail || 'sin_usuario'),
+        vendedor_id: esUsuarioVendedorSesion ? String(sess.session?.user?.id || user || loginEmail || '') : null,
+        cobrador_notif_email: emailSesion || null,
+        creado_por: String(sess.session?.user?.id || user || loginEmail || ''),
+      },
+      clienteCreditoNuevo,
+      isAdminOrRoot(rol) ? undefined : String(sess.session?.user?.id || user || loginEmail || ''),
+    ) || String(sess.session?.user?.id || user || loginEmail || 'sin_usuario');
     const plazoUnidadSol = normalizarPlazoUnidad(payload.plazo_unidad);
     const esMensualCred = esUsuarioMensualSesion(rol);
     if (!esMensualCred && plazoUnidadSol === 'Meses') {
@@ -7934,11 +7991,10 @@ export default function App() {
       return;
     }
     const estadoDb: Credito['estado'] = estado === 'APROBADO' ? 'ACTIVO' : 'RECHAZADO';
-    const cobradorIdActivo = (() => {
-      const desdeAdmin = review?.cobrador_id_admin != null ? String(review.cobrador_id_admin).trim() : '';
-      if (estadoDb === 'ACTIVO' && desdeAdmin !== '') return desdeAdmin;
-      return String(credito.cobrador_id ?? '').trim();
-    })();
+    const clienteCredito = clientesOrEmpty.find(c => normalizarId(c.id) === normalizarId(credito.cliente_id));
+    const cobradorIdActivo = estadoDb === 'ACTIVO'
+      ? resolverCobradorIdCobroCredito(credito, clienteCredito, review?.cobrador_id_admin)
+      : String(credito.cobrador_id ?? '').trim();
 
     let cambios: Record<string, unknown>;
     if (estadoDb === 'ACTIVO') {
@@ -8669,7 +8725,8 @@ _${data.config.nombreEmpresa || MARCA_COMPLETA}_`;
     if (page !== 'ruta') return [];
     const porCliente = new Map<string, { cliente: Cliente; filas: FilaRutaResumen[] }>();
     for (const c of creditosOrEmpty) {
-      if (!creditoVisibleParaSesion(c, rol, authUserId, user, loginEmail)) continue;
+      const cliRuta = clientesOrEmpty.find(cl => normalizarId(cl.id) === normalizarId(c.cliente_id));
+      if (!creditoVisibleParaSesion(c, rol, authUserId, user, loginEmail, cliRuta?.cobrador_id)) continue;
       const resumen = resumenCuotasRutaCredito(c, pagosOrEmpty);
       if (!resumen.enRuta) continue;
       const cli = clientesOrEmpty.find(cl => normalizarId(cl.id) === normalizarId(c.cliente_id));
