@@ -1365,6 +1365,40 @@ function esGastoDelCobrador(g: Gasto, authId: string | null, username: string | 
   return cobradorIdCoincideConSesion(g.userId, authId, username, email);
 }
 
+/** Producción legacy: `gastos.detalle` NOT NULL; la app usa categoria + nota. */
+function detalleGastoParaBd(categoria: string, nota: string): string {
+  const cat = (categoria || 'Otros').trim();
+  const n = (nota || '').trim();
+  return n ? `${cat} — ${n}` : cat;
+}
+
+function mapGastoDesdeBd(g: Record<string, unknown>): Gasto {
+  const det = String(g?.detalle ?? '').trim();
+  const cat = String(g?.categoria ?? '').trim();
+  const notaDb = String(g?.nota ?? '').trim();
+  let categoria = cat || 'Otros';
+  let nota = notaDb;
+  if (!cat && det) {
+    const sep = det.indexOf(' — ');
+    if (sep >= 0) {
+      categoria = det.slice(0, sep).trim() || 'Otros';
+      nota = notaDb || det.slice(sep + 3).trim();
+    } else {
+      categoria = det || 'Otros';
+    }
+  }
+  return {
+    id: String(g?.id ?? genId()),
+    fecha: String(g?.fecha ?? hoy()).slice(0, 10),
+    categoria,
+    monto: redondearPesos(Number(g?.monto ?? 0)),
+    nota,
+    userId: String(g?.cobrador_id ?? g?.user_id ?? g?.userId ?? ''),
+    sync: true as const,
+    timestamp: Number(g?.timestamp ?? new Date(String(g?.created_at ?? Date.now())).getTime()),
+  };
+}
+
 /** ID estable para guardar en pagos/gastos (prioriza UUID de auth). */
 function cobradorIdCanonicoDesdeSesionActiva(
   authUserId: string | null | undefined,
@@ -4062,16 +4096,7 @@ export default function App() {
       setCreditos(creditosNormalizados);
       setNotificaciones(Array.isArray(notiDb) ? (notiDb as Notificacion[]) : []);
       if (Array.isArray(gastosDb) && !gastosErr) {
-        const fromDb = (gastosDb as any[]).map(g => ({
-          id: String(g?.id ?? genId()),
-          fecha: String(g?.fecha ?? hoy()).slice(0, 10),
-          categoria: String(g?.categoria ?? 'Otros'),
-          monto: redondearPesos(Number(g?.monto ?? 0)),
-          nota: String(g?.nota ?? ''),
-          userId: String(g?.cobrador_id ?? g?.user_id ?? g?.userId ?? ''),
-          sync: true as const,
-          timestamp: Number(g?.timestamp ?? new Date(g?.created_at ?? Date.now()).getTime()),
-        })) as Gasto[];
+        const fromDb = (gastosDb as Record<string, unknown>[]).map(mapGastoDesdeBd);
         setGastos(prev => {
           const pendientes = (Array.isArray(prev) ? prev : []).filter(x => x && !x.sync);
           const idsDb = new Set(fromDb.map(x => x.id));
@@ -7405,11 +7430,13 @@ export default function App() {
       sync: false,
       timestamp: Date.now(),
     };
+    const detalle = detalleGastoParaBd(nuevo.categoria, nuevo.nota);
     const rowGasto: Record<string, unknown> = {
       fecha: nuevo.fecha,
       categoria: nuevo.categoria,
       monto: montoG,
       nota: nuevo.nota || null,
+      detalle,
       cobrador_id: cobradorGastoId,
     };
     let ins = await supabase.from('gastos').insert(rowGasto).select('id').single();
